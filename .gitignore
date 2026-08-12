@@ -84,3 +84,7 @@ localcanon_state5_run.err.log
 
 # Splash artwork: excluded pending provenance confirmation (see LEGAL.md)
 gssplash.jpg
+
+# Stray build logs
+lto_build.log
+*_build.log
