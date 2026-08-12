@@ -59,25 +59,95 @@ taken under the now-paused line of work — not a target to keep chasing):
 
 Focus has moved to emulator performance. The user's actual reported symptom
 — slow/dragging audio during normal play — occurs with native audio
-**disabled**, i.e. on the canonical path, and traces to the whole emulator
-running below real-time, not to any native-audio gap:
+**disabled** (native MP2K stays paused/off per the section above), i.e. on
+the canonical path. Root cause was never audio: the whole emulator ran below
+real-time. Five fixes landed this session, in order, each measured:
 
-- `build/gs011` had an empty `CMAKE_BUILD_TYPE`, so the shipping binary was
-  built with no `-O2`/`-O3`/`-DNDEBUG`. Fixed; `README.md` and
-  `scripts/gs.ps1` both taught the build without a build type and were both
-  corrected.
-- Speed went from ~59% to ~87-89% of real-time at 1800 frames after that fix.
-- Two further fixes landed: `runtime_idle_backedge` was added to the overlay
-  ABI (version 3 -> 4), unstranding PC `0x030001E8` from the interpreter
-  (`failed` 1 -> 0); and a relocatable-identity cache now skips ~97% of
-  per-dispatch SHA-1 rehashes.
-- Current frame-phase split at 1800 frames: `guest_us` 38.5%, `pacer_us`
-  58.5%, `render_us` 2.9%. The pacer idles deliberately (the emulator is
-  ahead of real-time on most frames), so the average is likely dragged down
-  by spike frames rather than sustained overload.
-- Target: solid 100% of real-time with correct audio, plus an optional turbo
-  mode giving a many-times boost. Game logic stays locked to ~59.73 Hz —
-  render/guest decoupling is explicitly not wanted.
+1. **Build type.** `build/gs011` had an empty `CMAKE_BUILD_TYPE`, so the
+   shipping binary had no `-O2`/`-O3`/`-DNDEBUG`. `README.md`,
+   `scripts/gs.ps1`, and `.claude/agents/gsrecomp-worker.md` all taught the
+   build without a build type; all three fixed. Effect: ~59% -> ~87% of
+   real-time.
+2. **Overlay ABI gap.** `runtime_idle_backedge` was emitted by codegen into
+   self-heal overlay shards but never declared in `GbaOverlayCallbacks`, so
+   shard `0x030001E8` failed to compile every session and stayed pinned to
+   the interpreter. Added to the ABI (version 3 -> 4) with its inline shim
+   and function pointer. Effect: `failed` 1 -> 0; `ram_smc_fallbacks` down
+   ~65%.
+3. **Relocatable-identity cache.** `relocatable_resident_at` re-read the
+   whole image byte-by-byte and re-ran a full SHA-1 on every dispatch. Now
+   epoch- and local-word-guarded with a bulk-read fast path. Effect: ~97% of
+   dispatches skip the SHA-1 (`hashes=40, cache_hits=1295` over 1800 frames).
+4. **Multi-variant healed-code cache — the big one.** `overlay_try_dispatch`
+   keyed `(pc, thumb) -> ONE HealedEntry`. Golden Sun's RAM code pool
+   assembles code in place, so an address alternates among a small recurring
+   variant set (`0x03000820` toggles among exactly 3, all already compiled
+   on disk). Every toggle was a CRC mismatch -> dispatch miss -> synchronous
+   full-subtree interpretation. Now: incumbent checked first (hot path
+   unchanged), then up to 7 alternates, LRU-evicted at
+   `kMaxVariantsPerKey=8`; every candidate still passes the same
+   unconditional CRC32 over the same byte range before entry. Effect: bridge
+   share of guest time 59.3% -> 16.3%; `sum(guest_us)` 12236ms -> 6116ms;
+   interpreted instructions 4,104,012 -> 542,259 (-86.8%); frames over
+   budget 164 -> 8; `guest_us` p99 28.0ms -> 7.5ms; uncapped headroom 2.23x
+   -> 3.81x real-time.
+5. **Background warm-load + multi-variant preload.** `warm_load_cache_dir`
+   ran synchronously before the frame loop, LoadLibrary'ing every cached DLL
+   (~1.7s startup, scaling with accumulated cache size) while installing
+   only one variant per key. Now runs on a background thread publishing
+   through the existing `s_ready` queue; RAM-backed keys are collected from
+   cache filenames plus the `.c` sidecar's recorded end address (hint only —
+   per-dispatch CRC32 remains the sole authority); up to 8 variants per key,
+   most-recently-modified first. Effect: startup (`--frames 1`, 122-file
+   cache) 2.38s -> 0.60s; 1800 frames windowed 33.35s -> 31.11s;
+   `warm_loaded` 5 -> ~183; `guest_us` max 318ms -> 92ms.
+
+**Current state:** 1800 frames windowed = 31.11s against a 30.14s real-time
+target = **96.9% of real-time**. Uncapped headless headroom 3.81x. Audio DRC
+clean: `bridge_underrun=0`, `overflow_drops=0`, `stretch=0`.
+
+**Ruled OUT by measurement this session — do not re-investigate:**
+
+- The frame pacer. Measured accurate to ~2.2us/frame across 1663 steady
+  frames; uses a high-resolution waitable timer plus a 1.2ms spin tail and
+  advances `next_ += period_`, so it does not drift or oversleep.
+- vsync/refresh mismatch. Display measured at 120.055Hz, not a multiple of
+  59.7275Hz, but the cost sits inside `render_us` at 0.38ms/frame and is
+  immaterial. `GBARECOMP_NO_VSYNC=1` exists if an A/B is ever wanted.
+- Trace-ring events. A/B with `GBARECOMP_TRACE=0` showed no measurable
+  difference despite ~1.89M events per 300 frames.
+- Synchronous compilation. `overlay_game_thread_compile_ns()` returns 0 by
+  design; gcc and tcc both run on a worker thread. Compilation was never on
+  the game thread.
+
+**Remaining gap — this is the next step:** cold-discovery compile storms.
+First-sighting RAM code still bridges synchronously through the single-step
+interpreter before its overlay installs — one observed event bridged 1532
+instructions (`bridge_us=331585` in an earlier run; `sum(bridge_us)=90197`
+for a single storm in the latest). These drop presented frames. This is the
+only known remaining source of the ~1s gap to real-time and of the surviving
+over-budget frames. Next agent should investigate whether first-sighting
+bridging can be bounded or made incremental, rather than interpreting an
+entire call subtree synchronously. Do not re-chase the pacer, vsync, trace
+ring, or synchronous compilation — all four are ruled out above.
+
+**User's targets:** solid 100% of real-time with correct audio; a turbo
+mode giving a many-times boost (turbo already exists — Tab key /
+fast-forward, plus an "uncapped" setting in the config menu's Speed tab);
+game logic stays locked to ~59.73Hz — do NOT propose decoupling render from
+the guest tick.
+
+**Repo state:** the repo now has commits. Top-level `main` has an initial
+commit (246 files, 5MB; ROM/BIOS/build artifacts/debug logs excluded,
+`gssplash.jpg` excluded pending provenance confirmation). `gbarecomp/` is on
+branch `perf/selfheal-multivariant-cache` with two commits. `gbarecomp/` is
+currently an embedded git repo rather than a registered submodule —
+`.gitmodules.example` exists but no `.gitmodules`; worth resolving.
+
+**Known open items:** `warm_load_cache_dir`'s ROM/BIOS path still does a
+live-byte recompute (safe, immutable, but unoptimized). `s_failed` still
+gates by `(pc,thumb)` regardless of content variant. `ram_heal_tests` now
+runs ~23s (was ~5.6s) because of added real-compile tests.
 
 Validation commands:
 
