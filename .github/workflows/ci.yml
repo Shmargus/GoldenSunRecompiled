@@ -1,0 +1,31 @@
+name: Public CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  public-scaffold:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Inspect environment
+        run: python tools/inspect_environment.py
+      - name: Audit public repository
+        run: python tools/audit_public_repo.py
+      - name: Configure
+        run: cmake -S . -B build
+      - name: Build
+        run: cmake --build build --parallel
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+      - name: Guard against protected extensions
+        shell: bash
+        run: |
+          if git ls-files | grep -Ei '\.(gba|bin|rom|sav|srm|state|trace|dump|bios|wav|sf2|mid)$'; then
+            echo "Protected/private file extension found in Git index" >&2
+            exit 1
+          fi

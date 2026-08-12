@@ -1,0 +1,94 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://goldensunrecomp.invalid/schemas/symbol-corpus-v1.json",
+  "title": "GoldenSunRecomp symbol corpus",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "symbols"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "symbols": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/symbol"
+      }
+    }
+  },
+  "$defs": {
+    "address": {
+      "type": "string",
+      "pattern": "^0x[0-9a-f]{8}$"
+    },
+    "symbol": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "binary_id",
+        "overlay_id",
+        "name",
+        "runtime_address",
+        "source_address",
+        "size",
+        "mode",
+        "section",
+        "evidence_source",
+        "evidence_revision",
+        "confidence"
+      ],
+      "properties": {
+        "binary_id": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[a-z0-9][a-z0-9._-]*$"
+        },
+        "overlay_id": {
+          "type": "string",
+          "pattern": "^[a-z0-9._-]*$"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "runtime_address": {
+          "$ref": "#/$defs/address"
+        },
+        "source_address": {
+          "$ref": "#/$defs/address"
+        },
+        "size": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "mode": {
+          "enum": [
+            "arm",
+            "thumb"
+          ]
+        },
+        "section": {
+          "type": "string",
+          "minLength": 1
+        },
+        "evidence_source": {
+          "type": "string",
+          "minLength": 1
+        },
+        "evidence_revision": {
+          "type": "string",
+          "minLength": 1
+        },
+        "confidence": {
+          "enum": [
+            "proven",
+            "unresolved"
+          ]
+        }
+      }
+    }
+  }
+}

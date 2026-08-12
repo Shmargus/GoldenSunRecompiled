@@ -1,0 +1,93 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://goldensunrecomp.invalid/schemas/overlay-manifest-v1.json",
+  "title": "GoldenSunRecomp overlay manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "rom_sha1",
+    "binary_id",
+    "evidence_revision",
+    "overlays"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "rom_sha1": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "binary_id": { "type": "string", "minLength": 1 },
+    "evidence_revision": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "overlays": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/overlay" }
+    }
+  },
+  "$defs": {
+    "address": { "type": "string", "pattern": "^0x[0-9a-f]{8}$" },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "overlay": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "overlay_id",
+        "evidence_source",
+        "source",
+        "runtime",
+        "symbols"
+      ],
+      "properties": {
+        "overlay_id": { "type": "string", "pattern": "^rom_[0-9a-f]{6}$" },
+        "evidence_source": { "type": "string", "minLength": 1 },
+        "source": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "rom_offset",
+            "rom_start",
+            "compressed_size",
+            "compressed_sha256",
+            "decompressed_size",
+            "decompressed_sha256"
+          ],
+          "properties": {
+            "rom_offset": { "$ref": "#/$defs/address" },
+            "rom_start": { "$ref": "#/$defs/address" },
+            "compressed_size": { "type": "integer", "minimum": 1 },
+            "compressed_sha256": { "$ref": "#/$defs/sha256" },
+            "decompressed_size": { "type": "integer", "minimum": 1 },
+            "decompressed_sha256": { "$ref": "#/$defs/sha256" }
+          }
+        },
+        "runtime": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["start", "loaded_size", "memory_size"],
+          "properties": {
+            "start": { "$ref": "#/$defs/address" },
+            "loaded_size": { "type": "integer", "minimum": 1 },
+            "memory_size": { "type": "integer", "minimum": 1 }
+          }
+        },
+        "symbols": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "count",
+            "arm_count",
+            "thumb_count",
+            "proven_count",
+            "unresolved_confidence_count",
+            "excluded_count"
+          ],
+          "properties": {
+            "count": { "type": "integer", "minimum": 0 },
+            "arm_count": { "type": "integer", "minimum": 0 },
+            "thumb_count": { "type": "integer", "minimum": 0 },
+            "proven_count": { "type": "integer", "minimum": 0 },
+            "unresolved_confidence_count": { "type": "integer", "minimum": 0 },
+            "excluded_count": { "type": "integer", "minimum": 0 }
+          }
+        }
+      }
+    }
+  }
+}

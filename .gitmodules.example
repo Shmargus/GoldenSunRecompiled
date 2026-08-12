@@ -1,0 +1,9 @@
+# Review UPSTREAM.md and licenses, then rename this file to .gitmodules only
+# after intentionally selecting exact submodule revisions.
+
+[submodule "gbarecomp"]
+    path = gbarecomp
+    url = https://github.com/mstan/gbarecomp.git
+
+# Do not automatically vendor the unlicensed Golden Sun disassembly.
+# Keep it as a separate local sibling checkout unless permission/licensing changes.

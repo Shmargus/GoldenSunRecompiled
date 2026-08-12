@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "overlay_id": "rom_779188",
+  "decompressed_sha256": "04c088fb9abf9da498ace094ddf2fe635841b26fdeb10fc9a4c3b2eb1efbae7e",
+  "entries": [
+    { "addr": "0x02008030", "mode": "thumb", "evidence": "GS-011 self-heal observed this exact THUMB dispatch target in the identity-matched overlay" },
+    { "addr": "0x0200803c", "mode": "thumb", "evidence": "GS-011 self-heal observed this exact THUMB dispatch target in the identity-matched overlay" },
+    { "addr": "0x02008044", "mode": "thumb", "evidence": "GS-011 self-heal observed this exact THUMB dispatch target in the identity-matched overlay" },
+    { "addr": "0x0200804c", "mode": "thumb", "evidence": "GS-011 strict-static reached this exact THUMB dispatch target in the identity-matched overlay" },
+    { "addr": "0x02008054", "mode": "thumb", "evidence": "GS-011 self-heal observed this exact THUMB dispatch target in the identity-matched overlay" },
+    { "addr": "0x020083cc", "mode": "thumb", "resume": true, "evidence": "GS-011 self-heal observed this THUMB interior resume inside ELF-bounded OvlFunc_2e8" }
+  ]
+}

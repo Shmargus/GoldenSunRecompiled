@@ -1,0 +1,40 @@
+name: Research task
+about: Track an evidence-driven reverse-engineering question
+labels: [research]
+body:
+  - type: input
+    id: question
+    attributes:
+      label: Exact question
+      placeholder: Which overlay is active when runtime PC ... executes?
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Existing evidence
+      description: Revisions, ELF/map paths, trace events, and known facts.
+    validations:
+      required: true
+  - type: textarea
+    id: method
+    attributes:
+      label: Proposed method
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: State what would prove the question resolved.
+    validations:
+      required: true
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Data safety
+      options:
+        - label: No protected game/BIOS data will be uploaded.
+          required: true
+        - label: Unknown values will remain unresolved rather than guessed.
+          required: true

@@ -1,0 +1,46 @@
+name: Native behavior bug
+about: Report a reproducible divergence without uploading protected data
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not attach ROMs, BIOS files, save states, extracted assets, or full memory dumps.
+  - type: input
+    id: commit
+    attributes:
+      label: GoldenSunRecomp commit
+    validations:
+      required: true
+  - type: input
+    id: core
+    attributes:
+      label: gbarecomp commit
+    validations:
+      required: true
+  - type: dropdown
+    id: rom
+    attributes:
+      label: ROM verification
+      options:
+        - Exact supported SHA-1 verified
+        - ROM not involved
+        - Unknown
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+      description: Use input sequences/checkpoint descriptions without sharing protected files.
+    validations:
+      required: true
+  - type: textarea
+    id: divergence
+    attributes:
+      label: First known divergence
+      description: Event, PC, overlay ID, register, or memory write if known.
+  - type: textarea
+    id: coverage
+    attributes:
+      label: Coverage/miss summary

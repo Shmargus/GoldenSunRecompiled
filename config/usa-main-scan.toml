@@ -1,0 +1,14 @@
+# Conservative GS-006 discovery baseline. This config contains only measured
+# cartridge identity/layout and the entry target decoded by the pinned gba_scan.
+
+[program]
+name = "Golden Sun (USA/Europe) cartridge scan"
+id = "golden_sun_usa_main_scan"
+load_address = 0x08000000
+size = 0x00800000
+entry_pc = 0x080003c0
+speculative_literal_harvest = false
+codegen_shards = 32
+
+[identity]
+sha1 = "5c4695205413df7db52b9a184815a07783999971"

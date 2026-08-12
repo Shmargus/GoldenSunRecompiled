@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "symbols": [
+    {
+      "binary_id": "synthetic_main",
+      "overlay_id": "",
+      "name": "synthetic_unknown_mode",
+      "runtime_address": "0x08000000",
+      "source_address": "0x08000000",
+      "size": 4,
+      "mode": "unknown",
+      "section": ".text",
+      "evidence_source": "synthetic/main.elf:symbol-table",
+      "evidence_revision": "synthetic-fixture-v1",
+      "confidence": "unresolved"
+    }
+  ]
+}

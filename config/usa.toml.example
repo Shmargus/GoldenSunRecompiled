@@ -1,0 +1,23 @@
+# Project-level target identity; not necessarily the exact runtime schema.
+# Convert to the pinned upstream runner format only after inspecting its current API.
+
+[target]
+id = "golden_sun_usa_europe"
+title = "Golden Sun"
+region = "USA/Europe"
+rom_sha1 = "5c4695205413df7db52b9a184815a07783999971"
+rom_size = 8388608
+rom_load_address = 0x08000000
+
+[host]
+initial_platform = "windows-x86_64"
+faithful_width = 240
+faithful_height = 160
+
+[save]
+# TODO-EVIDENCE: detect and verify protocol/type/size before filling this.
+type = "unverified"
+
+[metadata]
+main_symbols = "symbols/main.tsv"
+overlay_manifest = "symbols/overlay_manifest.json"

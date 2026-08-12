@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "symbols": [
+    {
+      "binary_id": "synthetic_overlay_001",
+      "overlay_id": "001",
+      "name": "synthetic_duplicate_a",
+      "runtime_address": "0x02000000",
+      "source_address": "0x08100000",
+      "size": 4,
+      "mode": "arm",
+      "section": ".overlay.text",
+      "evidence_source": "synthetic/overlay_001.elf:symbol-table",
+      "evidence_revision": "synthetic-fixture-v1",
+      "confidence": "proven"
+    },
+    {
+      "binary_id": "synthetic_overlay_001",
+      "overlay_id": "001",
+      "name": "synthetic_duplicate_b",
+      "runtime_address": "0x02000000",
+      "source_address": "0x08100004",
+      "size": 4,
+      "mode": "arm",
+      "section": ".overlay.text",
+      "evidence_source": "synthetic/overlay_001.elf:symbol-table",
+      "evidence_revision": "synthetic-fixture-v1",
+      "confidence": "proven"
+    }
+  ]
+}
