@@ -61,7 +61,7 @@ Focus has moved to emulator performance. The user's actual reported symptom
 — slow/dragging audio during normal play — occurs with native audio
 **disabled** (native MP2K stays paused/off per the section above), i.e. on
 the canonical path. Root cause was never audio: the whole emulator ran below
-real-time. Five fixes landed this session, in order, each measured:
+real-time. Seven fixes have landed this session, in order, each measured:
 
 1. **Build type.** `build/gs011` had an empty `CMAKE_BUILD_TYPE`, so the
    shipping binary had no `-O2`/`-O3`/`-DNDEBUG`. `README.md`,
@@ -101,10 +101,53 @@ real-time. Five fixes landed this session, in order, each measured:
    most-recently-modified first. Effect: startup (`--frames 1`, 122-file
    cache) 2.38s -> 0.60s; 1800 frames windowed 33.35s -> 31.11s;
    `warm_loaded` 5 -> ~183; `guest_us` max 318ms -> 92ms.
+6. **Bridge-to-native handoff at call boundaries.**
+   `runtime_bridge_interpret` consulted `overlay_try_dispatch` only at its
+   entry PC. Every `BL`/`BL_suffix`/`BLX_reg` was single-stepped into the
+   callee even when that callee already had compiled native code, so one
+   first-sighting miss could interpret an entire warm subtree — measured: a
+   single dispatch miss at frame 294 interpreted 159,503 instructions and
+   blocked the game thread 233ms. The bridge now checks
+   `runtime_has_static_entry` and `overlay_query` at each call boundary and
+   hands off via `runtime_call_push_return` + `runtime_dispatch`, the same
+   idiom `arm_codegen.cpp`'s indirect-BL lowering uses, so entry still goes
+   through the existing CRC32-verified path. On return-site mismatch it calls
+   `runtime_call_cancel_return` and breaks. (An earlier revision continued
+   interpreting instead and leaked a `g_call_return_stack` frame per
+   mismatch, overflowing in real gameplay within ~22s; a regression test
+   covers this.) Effect: interpreted instructions ~470k -> ~170k; windowed
+   1800 frames 31.32s -> 30.95s. The worst single storm was NOT helped — an
+   all-new subtree has no warm callees to hand off to.
+7. **Env-gated headless cost probe.** `GBARECOMP_FRAME_PHASE` only records
+   from two call sites gated on `args.window`, so headless runs produce an
+   empty ring. Added `GBARECOMP_COST_PROBE`, off by default and verified
+   free when off.
 
-**Current state:** 1800 frames windowed = 31.11s against a 30.14s real-time
-target = **96.9% of real-time**. Uncapped headless headroom 3.81x. Audio DRC
-clean: `bridge_underrun=0`, `overflow_drops=0`, `stretch=0`.
+**Current state (measured):**
+
+- Windowed 1800 frames: ~30.95s vs 30.14s target = **~97.4% of real-time**.
+  About 0.6s of that is fixed startup cost that does not scale with play
+  length, so steady-state gameplay is effectively at real-time.
+- **Uncapped headless headroom: 5.73x real-time** (11 warm runs, mean 5258ms
+  per 1800 frames, min 5100 / max 5575, 9.0% spread, no outliers). Was 2.23x
+  at the start of the session.
+- Audio DRC clean: `bridge_underrun=0`, `overflow_drops=0`, `stretch=0`.
+
+**The cost breakdown — this is the map for future work.** 1800 frames
+headless, 5566ms wall, via `GBARECOMP_COST_PROBE=1`:
+
+| bucket | ms | % of wall | calls |
+|---|---|---|---|
+| halt/idle pump loop (WaitForVBlank) | 4152.2 | 74.6% | 1,709 halts / 1,349,926 iterations |
+| `runtime_dispatch` (active guest execution) | 1224.5 | 22.0% | 4,961 |
+| PPU per-scanline render (overlaps both above) | 1633.0 | 29.3% | 288,008 scanlines |
+| timers tick | 243.7 | 4.4% | 2,382,734 |
+| audio tick | 206.0 | 3.7% | 2,382,734 |
+| bus slow path (MMIO/VRAM/OAM/PAL) | 122.0 | 2.2% | 650,967 (~187ns each) |
+| DMA | 13.4 | 0.2% | 289,808 |
+
+Dispatch and halt-pump are containers that include their own share of the
+subsystem rows, so the rows do not sum to 100%.
 
 **Ruled OUT by measurement this session — do not re-investigate:**
 
@@ -119,17 +162,49 @@ clean: `bridge_underrun=0`, `overflow_drops=0`, `stretch=0`.
 - Synchronous compilation. `overlay_game_thread_compile_ns()` returns 0 by
   design; gcc and tcc both run on a worker thread. Compilation was never on
   the game thread.
+- The bus slow path. Previously flagged in an architecture review as a
+  plausible-but-unquantified cost; now measured at 2.2% of wall across
+  650,967 calls (see cost table above). It is minor; do not pursue it.
 
-**Remaining gap — this is the next step:** cold-discovery compile storms.
-First-sighting RAM code still bridges synchronously through the single-step
-interpreter before its overlay installs — one observed event bridged 1532
-instructions (`bridge_us=331585` in an earlier run; `sum(bridge_us)=90197`
-for a single storm in the latest). These drop presented frames. This is the
-only known remaining source of the ~1s gap to real-time and of the surviving
-over-budget frames. Next agent should investigate whether first-sighting
-bridging can be bounded or made incremental, rather than interpreting an
-entire call subtree synchronously. Do not re-chase the pacer, vsync, trace
-ring, or synchronous compilation — all four are ruled out above.
+**NEXT STEP — state this as THE next step: the halt/idle pump loop, at
+74.6% of headless wall time.** ~790 loop iterations per halt period, 1.35M
+iterations across only 1,709 halts. When the guest halts waiting for VBlank
+the runtime advances in small chunks rather than jumping directly to the
+next scheduled event. Making the halt path compute the time to the next
+event and skip straight to it should recover most of this. It is by far the
+biggest remaining lever and nothing else is close. **Not yet attempted.** Do
+not re-chase the pacer, vsync, trace ring, synchronous compilation, or the
+bus slow path — all five are ruled out above.
+
+**User-reported symptom, unresolved.** From real play on 2026-08-13
+(canonical audio, native MP2K off): **battle lags, specifically on attacks
+and VFX spawns, and it is ALWAYS slow, not just the first time.** "Always"
+rules out cold-discovery self-heal, which only costs once per variant. A
+recurring cost implies the executed code is new every time — consistent
+with Golden Sun's sprite blitter pool, which assembles blit code from
+per-effect parameters rather than copying a fixed body (see
+`src/runner_main.cpp` ~1121-1136). Under that pattern the healed-code cache
+cannot help: each variant is compiled, used once, and never seen again, so
+both the compile and the interpreter bridge are paid.
+
+Agreed candidate fix, on the list but **NOT started**: a native sprite
+blitter — work out the builder's rules and implement one native
+parameterized blitter covering all cases, instead of compiling endless
+one-shot variants. Cheaper alternative: detect high-variant-churn addresses
+and stop attempting to compile them.
+
+**This is unproven.** No measurement of an actual battle attack has been
+taken. Before building anything, capture a battle-attack frame and confirm
+the burn is the blitter pool rather than PPU/sprite load, DMA, or sheer
+sprite count.
+
+Possibly related, found while fixing a flaky test: `s_inflight` in
+`overlay_request_compile` is keyed by `(pc, thumb)` only, so a second
+variant's compile request for the same PC is dropped while the first is
+still in flight. Self-correcting in production because
+`runtime_mutable_ram_code_miss` re-requests on every dispatch, but it may
+serialise compiles at addresses that churn through many variants quickly —
+exactly the battle/VFX case. Worth checking.
 
 **User's targets:** solid 100% of real-time with correct audio; a turbo
 mode giving a many-times boost (turbo already exists — Tab key /
@@ -139,15 +214,36 @@ the guest tick.
 
 **Repo state:** the repo now has commits. Top-level `main` has an initial
 commit (246 files, 5MB; ROM/BIOS/build artifacts/debug logs excluded,
-`gssplash.jpg` excluded pending provenance confirmation). `gbarecomp/` is on
-branch `perf/selfheal-multivariant-cache` with two commits. `gbarecomp/` is
-currently an embedded git repo rather than a registered submodule —
+`gssplash.jpg` excluded pending provenance confirmation) plus a docs commit.
+`gbarecomp/` is on branch `perf/selfheal-multivariant-cache` with commits
+covering: multi-variant healed-code cache + overlay ABI fix; background
+warm-load + multi-variant preload; bridge call-boundary handoff; headless
+cost probe; deterministic warm-load cap test. `gbarecomp/` is currently an
+embedded git repo rather than a registered submodule —
 `.gitmodules.example` exists but no `.gitmodules`; worth resolving.
 
-**Known open items:** `warm_load_cache_dir`'s ROM/BIOS path still does a
-live-byte recompute (safe, immutable, but unoptimized). `s_failed` still
-gates by `(pc,thumb)` regardless of content variant. `ram_heal_tests` now
-runs ~23s (was ~5.6s) because of added real-compile tests.
+**Known open items:**
+
+- The 25-run standalone confirmation loop and the ctest parallel-contention
+  pass for the newly-deterministic `ram_heal_tests` had NOT finished when it
+  was committed. Re-run before trusting it.
+- LTO (`CMAKE_INTERPROCEDURAL_OPTIMIZATION=ON`) configures cleanly on this
+  MinGW/gcc 16.1.0 toolchain in ~11s and puts `-flto=auto` in the ninja
+  file, but a full LTO build was never completed (~20+ min, link never
+  produced a non-zero exe). Unassessed. A partial scratch dir
+  `build/gs011_lto_probe` was left behind (gitignored, 0-byte exe).
+- `warm_load_cache_dir`'s ROM/BIOS path still does a live-byte recompute —
+  safe (immutable) but unoptimised.
+- `s_failed` still gates by `(pc,thumb)` regardless of content variant.
+- `ram_heal_tests` now runs ~23s (was ~5.6s) because of added real-compile
+  tests.
+- `gbarecomp/` is an embedded git repo, not a registered submodule.
+  `.gitmodules.example` exists, no `.gitmodules`.
+- A user-mentioned "new toml file" could not be located: no `game.toml`
+  anywhere, `config/usa/main.toml` unchanged since Aug 9, no toml modified
+  on Aug 13. Ask before assuming.
+- `gssplash.jpg` is excluded from git pending provenance confirmation (may
+  be ROM-derived artwork).
 
 Validation commands:
 
