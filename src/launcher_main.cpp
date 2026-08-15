@@ -8,12 +8,18 @@
 #include <commdlg.h>
 #include <gdiplus.h>
 
+#include "crash_handler.h"
+
 #include <algorithm>
+#include <cstdio>
+#include <cwchar>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -227,10 +233,151 @@ std::wstring choose_rom(const fs::path& root) {
     }
 }
 
+// ── Session log capture ────────────────────────────────────────────────
+// The game (build/gs011/GoldenSunRecomp.exe) is a console-subsystem exe.
+// Launched from this WIN32-subsystem launcher (which has no console of its
+// own) without redirected handles, Windows auto-allocates it a fresh console
+// window that is destroyed the instant the child exits — so a crash, a
+// freeze the user kills from Task Manager, or even a clean quit all lose
+// the scrollback. This captures the child's stdout/stderr into a
+// timestamped file under logs/ instead, durably: each line is flushed to
+// disk (FILE_FLAG_WRITE_THROUGH + an explicit FlushFileBuffers) the moment
+// it is read from the pipe, so a kill mid-freeze still leaves everything
+// produced up to that point on disk.
+//
+// stdout and stderr are interleaved into ONE file, each line tagged
+// "[OUT] "/"[ERR] ", rather than written to two separate files: a single
+// chronological, greppable log is easier for the user to hand over than two
+// files they'd have to interleave by eye, and the tag keeps the streams
+// distinguishable.
+constexpr int kKeepLogCount = 20;  // recent sessions kept; older ones pruned
+
+std::wstring make_session_log_path(const fs::path& logs_dir) {
+    SYSTEMTIME st{};
+    GetLocalTime(&st);
+    wchar_t name[64];
+    swprintf(name, std::size(name), L"session_%04u%02u%02u_%02u%02u%02u.log",
+             st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+    return (logs_dir / name).wstring();
+}
+
+// Keeps the newest (kKeepLogCount - 1) existing logs so this session's new
+// file brings the total back up to kKeepLogCount. session_YYYYMMDD_HHMMSS
+// sorts lexicographically in chronological order, so no parsing is needed.
+void prune_old_logs(const fs::path& logs_dir) {
+    std::error_code ec;
+    std::vector<fs::path> logs;
+    for (const auto& entry : fs::directory_iterator(logs_dir, ec)) {
+        if (!entry.is_regular_file(ec)) continue;
+        const std::wstring name = entry.path().filename().wstring();
+        if (name.rfind(L"session_", 0) == 0 &&
+            name.size() > 4 && name.compare(name.size() - 4, 4, L".log") == 0) {
+            logs.push_back(entry.path());
+        }
+    }
+    if (logs.size() < static_cast<std::size_t>(kKeepLogCount)) return;
+    std::sort(logs.begin(), logs.end());
+    const std::size_t remove_count =
+        logs.size() - (static_cast<std::size_t>(kKeepLogCount) - 1);
+    for (std::size_t i = 0; i < remove_count; ++i) {
+        fs::path events = logs[i];
+        fs::path phase = logs[i];
+        events.replace_extension(L".events.csv");
+        phase.replace_extension(L".phase.csv");
+        const fs::path misses = events.wstring() + L".misses.csv";
+        fs::remove(logs[i], ec);
+        fs::remove(events, ec);
+        fs::remove(misses, ec);
+        fs::remove(phase, ec);
+    }
+}
+
+// Thread-safe sink for the two pipe-reader threads below. One HANDLE, one
+// mutex — writes from either stream serialize through write_line so tagged
+// lines never interleave mid-line in the file.
+class SessionLogWriter {
+public:
+    explicit SessionLogWriter(HANDLE file) : file_(file) {}
+
+    void write_line(const char* tag, const char* data, std::size_t len) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        DWORD written = 0;
+        WriteFile(file_, tag, 6, &written, nullptr);
+        if (len > 0) {
+            WriteFile(file_, data, static_cast<DWORD>(len), &written, nullptr);
+        }
+        WriteFile(file_, "\r\n", 2, &written, nullptr);
+        // Belt-and-suspenders alongside FILE_FLAG_WRITE_THROUGH on the file
+        // handle: guarantees this line is durable before the reader thread
+        // goes back to blocking on the next ReadFile, which is exactly the
+        // window a Task-Manager kill can land in.
+        FlushFileBuffers(file_);
+    }
+
+private:
+    HANDLE file_;
+    std::mutex mutex_;
+};
+
+// Drains one child pipe handle on its own thread until EOF (the child
+// closing its end, which happens when it exits), tagging and forwarding
+// complete lines to `writer` as they arrive. A dedicated thread per pipe
+// (rather than one polling loop over both, or overlapped I/O) is the
+// simplest correct fix for the classic "child blocks writing to a full pipe
+// buffer nobody is draining" deadlock: ReadFile here returns as soon as ANY
+// bytes are available, so each thread is either blocked *waiting for data*
+// (never blocking the child) or immediately draining what arrived, and it
+// never waits on anything the child itself is blocked on — no circular
+// wait, so no deadlock is reachable by construction.
+void pump_pipe_to_log(HANDLE pipe_read, const char* tag,
+                      SessionLogWriter* writer) {
+    std::string pending;
+    char buffer[4096];
+    for (;;) {
+        DWORD read = 0;
+        const BOOL ok = ReadFile(pipe_read, buffer, sizeof(buffer), &read,
+                                 nullptr);
+        if (!ok || read == 0) break;  // child exited (EOF) or pipe error
+        pending.append(buffer, read);
+        std::size_t start = 0;
+        for (;;) {
+            const std::size_t newline = pending.find('\n', start);
+            if (newline == std::string::npos) break;
+            std::size_t line_len = newline - start;
+            if (line_len > 0 && pending[start + line_len - 1] == '\r') {
+                --line_len;  // tolerate the child's own CRLF too
+            }
+            writer->write_line(tag, pending.data() + start, line_len);
+            start = newline + 1;
+        }
+        pending.erase(0, start);
+    }
+    if (!pending.empty()) {
+        // A final message with no trailing newline (e.g. an abort() print
+        // right before the process dies) must not be dropped.
+        writer->write_line(tag, pending.data(), pending.size());
+    }
+    CloseHandle(pipe_read);
+}
+
 int run_game(const fs::path& root, const std::wstring& rom,
-             const std::wstring& bios) {
-    const fs::path game = root / L"build" / L"gs011" /
-                          L"GoldenSunRecomp.exe";
+             const std::wstring& bios, HWND window) {
+    // Prefer gs011_opt: it is configured WITH SDL2 (the host window), so the
+    // game actually presents a frame. build/gs011_rel is the same tree at
+    // Release -O3 but was configured without SDL2 (verified 2026-08-15:
+    // SDL2_INCLUDE_DIR/SDL2_LIBRARY both NOT-FOUND in its CMakeCache), so
+    // host_window stubs out and it exits after presenting nothing. build/gs011
+    // was configured Debug with no -O flag at all (verified 2026-08-14: zero
+    // -O matches in its build.ninja against 685 -g), which measured ~3.7x
+    // slower headless — 9.2s vs 2.5s over 600 frames. Fall back to gs011_rel,
+    // then gs011, so a checkout without the current build still runs.
+    fs::path game = root / L"build" / L"gs011_opt" / L"GoldenSunRecomp.exe";
+    if (!fs::is_regular_file(game)) {
+        game = root / L"build" / L"gs011_rel" / L"GoldenSunRecomp.exe";
+    }
+    if (!fs::is_regular_file(game)) {
+        game = root / L"build" / L"gs011" / L"GoldenSunRecomp.exe";
+    }
     if (!fs::is_regular_file(game)) {
         MessageBoxW(nullptr,
                     L"GoldenSunRecomp.exe was not found. Run the build first.",
@@ -260,6 +407,53 @@ int run_game(const fs::path& root, const std::wstring& rom,
     SetEnvironmentVariableW(L"GBARECOMP_HEAL_CACHE",
                             (root / L"recomp_cache").c_str());
 
+    const fs::path logs_dir = root / L"logs";
+    std::error_code dir_ec;
+    fs::create_directories(logs_dir, dir_ec);
+    HANDLE log_file = INVALID_HANDLE_VALUE;
+    std::wstring log_path;
+    if (!dir_ec) {
+        prune_old_logs(logs_dir);
+        log_path = make_session_log_path(logs_dir);
+        // FILE_FLAG_WRITE_THROUGH: every WriteFile below is committed to
+        // disk before it returns, not left sitting in the OS cache — the
+        // crash/freeze durability requirement, satisfied at the handle
+        // level rather than relying solely on the FlushFileBuffers calls.
+        log_file = CreateFileW(log_path.c_str(), GENERIC_WRITE, FILE_SHARE_READ,
+                               nullptr, CREATE_ALWAYS,
+                               FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH,
+                               nullptr);
+    }
+    // A log that can't be opened (full disk, permissions) must not block
+    // play: fall back to the pre-existing unredirected behavior below.
+    const bool logging = (log_file != INVALID_HANDLE_VALUE);
+
+    // Discoverability without a console: stray console windows stealing
+    // focus are exactly what this feature must not introduce, so the
+    // session path is never printed anywhere — it is written into a fixed,
+    // overwritten-every-launch file instead. logs/latest.txt is a stable
+    // path anyone (the user, a bug report, a second tool) can read to find
+    // the current/most recent session log without parsing timestamps.
+    if (logging) {
+        std::ofstream latest(logs_dir / L"latest.txt", std::ios::binary | std::ios::trunc);
+        if (latest) latest << wide_to_utf8(log_path) << '\n';
+
+        // Keep battle-stutter evidence beside the ordinary session log. These
+        // switches only dump existing bounded timing rings at clean shutdown;
+        // they do not capture ROM, save, or framebuffer bytes. Respect an
+        // explicit developer override.
+        fs::path events_path = log_path;
+        fs::path phase_path = log_path;
+        events_path.replace_extension(L".events.csv");
+        phase_path.replace_extension(L".phase.csv");
+        if (GetEnvironmentVariableW(L"GBARECOMP_FRAME_EVENTS", nullptr, 0) == 0)
+            SetEnvironmentVariableW(L"GBARECOMP_FRAME_EVENTS",
+                                    events_path.c_str());
+        if (GetEnvironmentVariableW(L"GBARECOMP_FRAME_PHASE", nullptr, 0) == 0)
+            SetEnvironmentVariableW(L"GBARECOMP_FRAME_PHASE",
+                                    phase_path.c_str());
+    }
+
     std::wstring command = L"\"" + game.wstring() + L"\" --bios \"" +
                            bios + L"\" --rom \"" + rom + L"\"";
     std::vector<wchar_t> mutable_command(command.begin(), command.end());
@@ -267,14 +461,77 @@ int run_game(const fs::path& root, const std::wstring& rom,
 
     STARTUPINFOW startup{};
     startup.cb = sizeof(startup);
+    HANDLE out_read = nullptr, out_write = nullptr;
+    HANDLE err_read = nullptr, err_write = nullptr;
+    BOOL inherit_handles = FALSE;
+    if (logging) {
+        SECURITY_ATTRIBUTES pipe_sa{};
+        pipe_sa.nLength = sizeof(pipe_sa);
+        pipe_sa.bInheritHandle = TRUE;
+        if (CreatePipe(&out_read, &out_write, &pipe_sa, 0) &&
+            CreatePipe(&err_read, &err_write, &pipe_sa, 0)) {
+            // Only the write ends should be inherited by the child; the
+            // parent's read ends must stay private or the child's own copy
+            // (inherited from CreateProcessW's snapshot) would keep the
+            // pipe open even after the real write end closes, so the
+            // reader thread would never see EOF.
+            SetHandleInformation(out_read, HANDLE_FLAG_INHERIT, 0);
+            SetHandleInformation(err_read, HANDLE_FLAG_INHERIT, 0);
+            startup.dwFlags |= STARTF_USESTDHANDLES;
+            startup.hStdOutput = out_write;
+            startup.hStdError = err_write;
+            startup.hStdInput = nullptr;
+            inherit_handles = TRUE;
+        } else {
+            if (out_read) CloseHandle(out_read);
+            if (out_write) CloseHandle(out_write);
+            if (err_read) CloseHandle(err_read);
+            if (err_write) CloseHandle(err_write);
+            out_read = out_write = err_read = err_write = nullptr;
+        }
+    }
+
     PROCESS_INFORMATION process{};
     if (!CreateProcessW(game.c_str(), mutable_command.data(), nullptr, nullptr,
-                        FALSE, 0, nullptr, root.c_str(), &startup, &process)) {
+                        inherit_handles, 0, nullptr, root.c_str(), &startup,
+                        &process)) {
+        if (out_read) CloseHandle(out_read);
+        if (out_write) CloseHandle(out_write);
+        if (err_read) CloseHandle(err_read);
+        if (err_write) CloseHandle(err_write);
+        if (log_file != INVALID_HANDLE_VALUE) CloseHandle(log_file);
         MessageBoxW(nullptr, L"Windows could not start the recompiled game.",
                     L"Golden Sun Recompiled", MB_OK | MB_ICONERROR);
         return 1;
     }
     CloseHandle(process.hThread);
+
+    // The splash window has nothing left to do once the game has actually
+    // started; destroying it now (rather than after the wait below) avoids
+    // Windows flagging it "Not Responding" for the whole play session,
+    // since capturing the log means this call now blocks until the game
+    // exits instead of returning immediately.
+    if (window) DestroyWindow(window);
+
+    if (out_write && err_write) {
+        // The parent's copies of the write ends MUST close before the
+        // reader threads are started: as long as ANY write-end handle is
+        // open (ours or the child's inherited copy), ReadFile on the read
+        // end blocks instead of returning EOF, even after the child exits.
+        CloseHandle(out_write);
+        CloseHandle(err_write);
+        SessionLogWriter writer(log_file);
+        std::thread out_thread(pump_pipe_to_log, out_read, "[OUT] ", &writer);
+        std::thread err_thread(pump_pipe_to_log, err_read, "[ERR] ", &writer);
+        // Joining blocks until both pipes hit EOF, which only happens once
+        // the child has exited (cleanly, crashed, or been killed) and
+        // released its inherited handles — so this doubles as the wait for
+        // the child, with everything it ever wrote already durably logged
+        // by the time these return.
+        out_thread.join();
+        err_thread.join();
+    }
+    if (log_file != INVALID_HANDLE_VALUE) CloseHandle(log_file);
     CloseHandle(process.hProcess);
     return 0;
 }
@@ -403,8 +660,9 @@ LRESULT CALLBACK launcher_window_proc(HWND window, UINT message,
         }
         if (LOWORD(w_param) == kPickRomButton) {
             const std::wstring rom = choose_rom(g_launcher_root);
-            if (!rom.empty() && run_game(g_launcher_root, rom, g_launcher_bios) == 0) {
-                DestroyWindow(window);
+            if (!rom.empty() &&
+                run_game(g_launcher_root, rom, g_launcher_bios, window) == 0) {
+                DestroyWindow(window);  // no-op if run_game already destroyed it
             }
             return 0;
         }
@@ -494,6 +752,10 @@ int show_launcher(const fs::path& root, const std::wstring& bios) {
 }  // namespace
 
 int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
+    // Must be the FIRST thing in WinMain, before any other subsystem.
+    // nullptr = default to the directory this executable lives in.
+    gbarecomp::crash_handler_install(nullptr);
+
     const fs::path root = module_dir();
     const std::wstring bios = read_json_string(root / L"config" / L"local.json",
                                                "bios");
@@ -501,8 +763,11 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         MessageBoxW(nullptr,
                     L"No BIOS path is configured in config\\local.json.",
                     L"Golden Sun Recompiled", MB_OK | MB_ICONERROR);
+        gbarecomp::crash_handler_mark_clean_exit();
         return 1;
     }
     SetProcessDPIAware();
-    return show_launcher(root, bios);
+    const int result = show_launcher(root, bios);
+    gbarecomp::crash_handler_mark_clean_exit();
+    return result;
 }

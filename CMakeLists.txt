@@ -23,6 +23,13 @@ endif()
 enable_testing()
 add_test(NAME bootstrap_help COMMAND gsr_bootstrap --help)
 
+add_executable(gsr_blitter_shadow_observer_test
+    tests/cpp/blitter_shadow_observer_test.cpp)
+target_include_directories(gsr_blitter_shadow_observer_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/src)
+add_test(NAME blitter_shadow_observer_test
+         COMMAND gsr_blitter_shadow_observer_test)
+
 find_package(Python3 3.10 COMPONENTS Interpreter REQUIRED)
 add_test(
     NAME symbol_corpus_validation
@@ -317,6 +324,8 @@ if(GSR_BUILD_LOCAL_RUNNER)
     endforeach()
 
     add_subdirectory("${GBARECOMP_ROOT}" gbarecomp_build EXCLUDE_FROM_ALL)
+    target_compile_definitions(gbarecomp_runtime PRIVATE
+        GBARECOMP_WINDOW_TITLE="Golden Sun Recompiled")
     file(GLOB GSR_GENERATED_SOURCES CONFIGURE_DEPENDS
         "${GSR_GENERATED_DIR}/recompiled_*.cpp"
         "${GSR_GENERATED_DIR}/dispatch_table.cpp"
@@ -474,7 +483,6 @@ if(GSR_BUILD_LOCAL_RUNNER)
         "${CMAKE_SOURCE_DIR}/config/usa")
     target_compile_definitions(GoldenSunRecomp PRIVATE
         GBARECOMP_DEFAULT_DEBUG_PORT=19843
-        GBARECOMP_WINDOW_TITLE="GoldenSunRecomp"
         GBARECOMP_DEFAULT_GAME_CONFIG="game.toml")
 
     if(MSVC)
@@ -496,7 +504,11 @@ if(GSR_BUILD_LOCAL_RUNNER)
     add_test(NAME runner_help COMMAND GoldenSunRecomp --help)
 
     if(WIN32)
-        add_executable(GoldenSunLauncher WIN32 src/launcher_main.cpp)
+        add_executable(GoldenSunLauncher WIN32
+            src/launcher_main.cpp
+            "${GBARECOMP_ROOT}/src/runtime/crash_handler.cpp")
+        target_include_directories(GoldenSunLauncher PRIVATE
+            "${GBARECOMP_ROOT}/src/runtime")
         target_compile_definitions(GoldenSunLauncher PRIVATE
             UNICODE _UNICODE NOMINMAX)
         target_link_libraries(GoldenSunLauncher PRIVATE bcrypt comdlg32 gdiplus)

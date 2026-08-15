@@ -1,5 +1,24 @@
 # Technical handoff — state as of 2026-08-09
 
+## 2026-08-13 normal-speed presentation pacing fix
+
+Unstable visible FPS was not throughput, VSync, or Enhanced Timing. On the
+launcher's `GBARECOMP_PRESENT_IN_PLACE=0` path, `SDL_RenderPresent` ran before
+the pacer wait. Callback exits were regular, but guest/render variation moved
+the actual picture within each period. The 1x loop now waits immediately before
+the visible present; cycles, audio, target rates, Turbo, 2x interpolation, and
+the PIP/IRQ path are unchanged.
+
+State-9, faithful timing, 1800 windowed frames on the 120 Hz display:
+
+- present-gap standard deviation: 678.24 us -> 16.61 us;
+- p1/p99: 14.571/18.627 ms -> 16.715/16.766 ms;
+- gaps over 18 ms: 65 -> 0;
+- mean stayed 16.7422 ms (59.7275 Hz); DWM refresh delta stayed 1.
+
+Enhanced Timing, 600 frames: mean 16.6662 ms, standard deviation 18.48 us.
+`frame_timing_tests` passes. Measurement CSVs remain local-only under `local/`.
+
 ## Current audio handoff — 2026-08-12
 
 **Native MP2K work is PAUSED.** Full detail, corrected inferences, and the
@@ -197,6 +216,35 @@ and stop attempting to compile them.
 taken. Before building anything, capture a battle-attack frame and confirm
 the burn is the blitter pool rather than PPU/sprite load, DMA, or sheer
 sprite count.
+
+**2026-08-13 measured follow-up and partial fix.** A real 9,307-frame play
+session recorded 60 misses, 63 successful heals, 3,031,694 interpreted
+instructions, and 2,876 bridge entries. 76% of bridge entries came from the
+generated `0x03006000..0x03006fff` battle-code pool. PPU cost averaged 1.276
+ms/frame; interpolation and Enhanced Timing were off. Identical
+`(mode,length,CRC)` bodies appeared at 14, 6, 5, 3, and 2 distinct PCs.
+
+Upstream self-heal ABI v5 now emits RAM overlays position-independently. A
+completed body may bind at another RAM address only after same mode, proven
+extent, CRC, and exact bytes match. Native calls set the live image base and
+restore the prior base afterward. Mutation, wrong-mode, and wrong-length cases
+fail closed. Candidate matching does no finder, emitter, or compiler work on
+the game thread. ARM/THUMB relocation, nested base restoration, stale mutation,
+and automatic exact-copy reuse are synthetic-tested. `ram_heal_tests` passes
+in 25.6 s; relocatable-image, bus, DMA, PPU, frame-timing, and all 86 public
+Python tests pass.
+
+ABI v5 deliberately invalidates ABI v4 overlay DLLs, so old RAM cache entries
+rebuild once. Known slots 1..7 were prewarmed. New ABI-v5 RAM compiles now
+atomically persist an ignored local `.pic` sidecar containing schema/ABI/mode/
+extent/CRC plus the exact function bytes. Warm loading validates every field,
+bounds, alignment, CRC, and exact EOF before retaining those bytes, enabling
+the same exact cross-address reuse after restart. Missing, corrupt, oversized,
+truncated, or trailing metadata is ignored; the address-keyed cache still
+works. Cache bytes remain local protected material and must never be committed,
+packaged, logged, or uploaded. Truly new content may still compile once; a
+native parameterized blitter remains a future option if another measured
+battle still churns.
 
 Possibly related, found while fixing a flaky test: `s_inflight` in
 `overlay_request_compile` is keyed by `(pc, thumb)` only, so a second
@@ -985,11 +1033,14 @@ Golden Sun runner. F1 → Enhancements offers a default-off experimental 2x mode
 on displays reporting at least 119 Hz. Guest logic, audio, timers and input stay
 at 59.7275 Hz; the host presents at 119.455 Hz.
 
-The midpoint interpolates BG0..3 scroll and BG2/BG3 affine state. OAM/sprites
-stay at the current canonical position. Each frame-end snapshot is taken at
-VBlank before VBlank DMA/IRQ mutation. Before any midpoint is shown, a complete
-render of the captured current endpoint must byte-match the faithful per-line
-latch; otherwise the runtime logs `DEGRADED` and duplicates the canonical frame.
+The midpoint interpolates BG0..3 scroll and BG2/BG3 affine state from the
+captured state of each scanline. Stable non-affine sprites also interpolate for
+short moves when their OAM slot, tile, palette, mode, and shape are unchanged.
+Large jumps, affine/OBJ-window sprites, and content transitions stay at the
+newer endpoint. Each frame-end snapshot is taken at VBlank before VBlank
+DMA/IRQ mutation. Before any midpoint is shown, a complete render of the
+captured current endpoint must byte-match the faithful per-line latch;
+otherwise the runtime logs `DEGRADED` and duplicates the canonical frame.
 VRAM/palette or structural display changes also fall back.
 
 Measured windowed smoke on the 120 Hz reference display: 120 guest frames,
@@ -997,6 +1048,14 @@ Measured windowed smoke on the 120 Hz reference display: 120 guest frames,
 suite passes. Golden Sun rebuilt, and campaign-5400, noinput-5400 and
 campaign-10800 remain FULLY_STATIC with semantic invariants unchanged while the
 enhancement is off. Strict-static runs force the menu option unavailable.
+
+The 2026-08-13 raster-aware revision changed the slot-7 battle sample from
+0/120 to 65/120 midpoints. Slot-6 world map remains 0/120 because its
+mid-scanout memory changes cannot yet be reconstructed; all 120 frames fall
+back exactly. Battle presentation cost measured about 1.35 ms per guest frame
+on a 120.001920 Hz display. Two faithful-OFF slot-7 runs produced the same
+frame-dump hash. Focused PPU/interpolation/timing tests and all 86 public Python
+tests pass.
 
 ### 5.7 Exact 60/120 Hz host pacing
 
@@ -1121,6 +1180,98 @@ the stable frame-boundary unwind path and canonical audio by default.
 ---
 
 ## 7. Where to go from here
+
+### 2026-08-13 battle-stutter status
+
+The latest real fight (`session_20260813_170322.log`) ruled out presentation
+cost: optional render/interpolation/timing modes were off and canonical PPU
+work averaged 1.098 ms/frame. The run instead entered the interpreter bridge
+12,596 times (6,000,449 instructions), chiefly mutable low RAM (7,676 calls)
+and Golden Sun's generated battle-sprite code pool (4,521 calls).
+
+RAM self-heal requests are now keyed by exact immutable content snapshots, so
+changed variants at one PC no longer suppress or poison one another. At every
+dispatch miss the game thread also nonblocking-drains completed worker results
+and retries exact verified native dispatch before interpreting; this removes
+the former once-per-frame installation delay. The launcher automatically emits
+matching `.events.csv`, `.events.csv.misses.csv`, and `.phase.csv` sidecars for
+cleanly closed sessions. Focused self-heal/PPU/interpolation/timing tests and all
+86 Python tests pass. Next evidence gate: repeat one Attack and one Psynergy
+three times each, then correlate per-miss bridge cost with the following phase
+frame. Persistent sprite-pool stalls justify a fail-closed shadow/native version
+of the measured `Func_ed408` generated blitter; do not substitute it before
+exact write/register/cycle comparison passes.
+
+The longer post-bandit session (`session_20260813_172202`) settled the timing
+question. Enhanced Timing did **not** remove CPU lag: its Enhanced-only battle
+window contained the worst burst, 7.90 seconds of bridge work over six frames
+(all exact variants still queued/inflight). The later no-enhancement field
+window had only three bridges over 19,956 frames. Enhanced Timing's real visible
+benefit is cadence: on the measured 120.006240 Hz panel, faithful 59.7275 Hz
+creates an uneven refresh about every 1.8 seconds; exact 60 Hz pushes that to
+about every 160 seconds. D3D11 reported VSync active, so the reported “tearing”
+currently fits judder/shimmer better than an unsynchronized swap.
+
+The next progression session (`session_20260813_182110`, Enhanced Timing on
+throughout) recorded 599 bridge events, 4.140 s of bridge wall time, and 2.839 M
+interpreted instructions. Generated battle RAM accounted for 3.936 s. One exact
+variant at `0x03006340` bridged 207 times for 1.842 s while its compile request
+was in flight. The compiler finished, but an already-running outer interpreter
+bridge could keep calling that callee without returning to the dispatch/frame
+boundary that installed ready results. The bridge now nonblocking-drains only
+completed worker results at its existing BL/BLX handoff boundary before the
+verified native query. A synthetic regression holds a completed callee
+undrained and proves the bridge hands it to native (five caller instructions
+interpreted, not seven including the callee). `ram_heal_tests` passes in 28.3 s
+and GoldenSunRecomp was rebuilt. This removes post-compile repeats inside one
+large bridge; the first asynchronous compile/bridge cost remains.
+
+The compile worker now promotes repeatedly-hit exact RAM variants ahead of cold
+one-shot jobs, with a three-hot-job burst limit so FIFO work cannot starve. The
+game thread still never compiles or waits. The same route exposed 98 ROM PCs;
+48 whole functions were proven against the pinned ELF's sized STT_FUNC/$t data,
+added to the reviewed resume corpus, regenerated, and rebuilt. Three unsafe
+addresses were rejected. Ordinary-play unknown-transient reporting is concise;
+strict mode or `GSR_TRANSIENT_VERBOSE=1` retains the full candidate dump.
+
+Interpolation produced only 2,885 midpoints and 6,233 safe duplicate fallbacks
+(31.6% useful) in that mixed session. Its changing fallback reasons also caused
+1,998 synchronously flushed launcher log lines; progress logging is now
+power-of-two rate-limited while exact per-reason totals print at shutdown. World
+map remains fail-closed. F1 Video exposes a default-off whole-image soft filter
+as `Reduce shimmer (soft filtering, experimental)`; it is presentation-only and
+may look blurry. Speed now persists `Mute audio while Turbo is held`, raises the
+slider ceiling from 16x to 32x, flushes audio on press/release, and leaves
+Uncapped as the true host maximum. See `docs/ACTIVE_ISSUES.md`.
+
+The next user session (`session_20260813_182110`) confirmed the improvements but
+left bounded battle stalls: 599 bridges, 4.14 s total, and 2.84 M interpreted
+instructions; 449 bridge calls/3.00 s came from `0x03006000` battle code. The
+worst single bridge fell from 909 ms to 139 ms. Hot-queue telemetry recorded 90
+requests, 48 promoted jobs, and 26 fairness selections. One exact body at
+`0x03006340` still bridged 207 times while its compile was in flight. The active
+interpreter bridge now nonblocking-drains completed overlays at each safe
+BL/BLX boundary before deciding whether to interpret a callee; a synthetic
+regression proves an already-ready callee immediately hands off to native.
+
+Turbo was separately capped by presentation: with VSync at 120 Hz it presented
+every 60 Hz guest frame, limiting observed speed to about 2x even when Uncapped
+was selected (which intentionally ignores the 32x slider). Turbo now skips
+intermediate render/VSync work while still pumping input, draining audio, and
+refreshing the display within 16.7 ms; release immediately presents the current
+canonical frame. Current measured compute headroom is about 4x, so 32x remains
+a ceiling rather than a promise. Enhanced Timing remains globally default-off,
+but its saved `[Enhancements] EnhancedTiming` preference now persists; explicit
+environment overrides still win and strict/frame-capture routes force it off.
+
+An observer-only foundation is available behind `GSR_BLITTER_SHADOW=1`. It is
+installed only after the loaded ROM matches the built-in USA/Europe SHA-1.
+Exact THUMB entries `Func_ed408` (`0x080ED408`) and allocator `Func_48b0`
+(`0x080048B0`) capture the five-word builder descriptor and allocator slot/size;
+the measured slot table is `0x03001E50`. Later ARM RAM dispatches correlate to
+the live slot range. Exit telemetry is bounded and reports only counts, sizes,
+and one-way fingerprints, never code bytes. The canonical guest always runs;
+there is no native substitution.
 
 **1. Run a broader player progression sweep.** Missing-overlay freezes should
 now be prevented. Stop at the first remaining loud dispatch miss or divergence

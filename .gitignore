@@ -82,9 +82,20 @@ delay_sweep.err
 localcanon_state5_run.out.log
 localcanon_state5_run.err.log
 
+# GoldenSunLauncher per-session stdout/stderr capture (local only, never
+# committed — see src/launcher_main.cpp SessionLogWriter).
+logs/
+
 # Splash artwork: excluded pending provenance confirmation (see LEGAL.md)
 gssplash.jpg
 
 # Stray build logs
 lto_build.log
 *_build.log
+
+# Runtime debug artifacts from ad-hoc probe scripts (local only)
+battle_log_*.txt
+battle_probe_*.txt
+crash_err.txt
+crash_out.txt
+run_state.txt

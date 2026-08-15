@@ -84,13 +84,25 @@ Update this file only when an acceptance gate has evidence.
 
 Blocked until strict baseline is healthy.
 
-- [x] Experimental 2x scene interpolation (default off; faithful fallback).
+- [x] Raster-aware 2x scene interpolation (default off; faithful fallback;
+  battle 65/120 midpoint frames, world map still safely falls back).
 - [x] Enhanced Timing: default-off exact 60/120 Hz host pacing.
 - [x] Enhanced Timing: audio resampling ([plan](docs/ENHANCED_TIMING_PLAN.md)).
 - [ ] Enhanced Timing: measured dynamic CPU headroom
-  ([plan](docs/ENHANCED_TIMING_PLAN.md)).
-- [ ] Display scaling/profile work.
-- [ ] Widescreen research.
+  ([plan](docs/ENHANCED_TIMING_PLAN.md)) — distinct from the manual overclock
+  below; not yet built.
+- [x] Guest CPU overclock (manual 1x/2x/4x/8x, default-off, live-toggleable):
+  scales only per-instruction execution cost, never halt/idle time or
+  DMA/IRQ-added cycles. 1x verified bit-exact across 8.4M fingerprint records
+  (20 fields). User-confirmed smooth at 2x/4x in battle; throughput gain not
+  yet instrumented (needs a CPU-bound savestate — see
+  `docs/SESSION_2026-08-13B.md`). See `docs/CODEX_HANDOFF.md`.
+- [x] Display scaling/profile work (faithful raw default; live color profiles;
+  verified integer layout).
+- [x] Widescreen research ([scope](docs/VISUAL_ENHANCEMENTS_2026-08-13.md));
+  Golden Sun implementation remains disabled pending scene evidence.
+- [x] Native scene supersampling with faithful per-frame fallback; battle is
+  mostly supported, world-map raster effects currently fall back.
 - [ ] Enhanced audio shadow path.
 - [ ] Mod hook policy.
 - [ ] Additional ROM regions.

@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <cstdio>
@@ -8,10 +9,14 @@
 #include <unordered_map>
 #include <vector>
 
+#include "crc32.h"
+#include "blitter_shadow_observer.h"
+#include "crash_handler.h"
 #include "recompiled.h"
 #include "relocatable_identity.h"
 #include "runtime.h"
 #include "runtime_arm.h"
+#include "self_heal.h"
 #include "sha1.h"
 
 struct DispatchEntry {
@@ -756,10 +761,17 @@ std::uint64_t g_relocatable_profile_active_samples = 0;
 std::uint64_t g_relocatable_profile_active_sum = 0;
 std::uint32_t g_relocatable_profile_active_max = 0;
 
+// GBARECOMP_RELOCATABLE_PROFILE, if explicitly set, wins outright. Otherwise
+// falls back to the config UI's "Additional debug logging" toggle (default
+// OFF) — see runtime_arm.h. First call happens from live dispatch, well
+// after the config UI has loaded config.ini, so this reflects a saved
+// preference from the very first relocatable dispatch of the session
+// (cached after that, matching the existing once-per-run idiom).
 bool relocatable_profile_enabled() {
     static const bool enabled = [] {
         const char* env = std::getenv("GBARECOMP_RELOCATABLE_PROFILE");
-        return env != nullptr && env[0] != '\0' && env[0] != '0';
+        return env ? (env[0] != '\0' && env[0] != '0')
+                   : (gsr_additional_debug_logging() != 0);
     }();
     return enabled;
 }
@@ -830,10 +842,13 @@ void report_relocatable_profile() {
 // which bases a run actually used — and the only honest way to claim the
 // mechanism replaced a set of per-base registrations rather than skipping
 // them. Off by default; one getenv at startup, no per-dispatch cost.
+// Same env-wins/toggle-fallback precedence as relocatable_profile_enabled
+// above.
 bool relocatable_log_enabled() {
     static const bool enabled = [] {
         const char* env = std::getenv("GBARECOMP_RELOCATABLE_LOG");
-        return env != nullptr && env[0] != '\0' && env[0] != '0';
+        return env ? (env[0] != '\0' && env[0] != '0')
+                   : (gsr_additional_debug_logging() != 0);
     }();
     return enabled;
 }
@@ -1262,6 +1277,86 @@ void dump_recent_trace() {
 extern "C" int overlay_try_dispatch(std::uint32_t pc, int thumb);
 extern "C" void runtime_dispatch_miss(std::uint32_t target_pc);
 
+gsr::blitter_shadow::Observer g_blitter_shadow;
+
+// GSR_BLITTER_SHADOW, if explicitly set, wins outright. Otherwise falls back
+// to the config UI's "Additional debug logging" toggle (default OFF).
+bool blitter_shadow_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("GSR_BLITTER_SHADOW");
+        return e ? (e[0] != '\0' && e[0] != '0')
+                 : (gsr_additional_debug_logging() != 0);
+    }();
+    return on;
+}
+
+void report_blitter_shadow() {
+    if (!blitter_shadow_on()) return;
+    std::fprintf(stderr,
+        "GoldenSunRecomp: [blitter-shadow] observer_only=1 "
+        "canonical_guest_always_runs=1 "
+        "evictions=%llu\n",
+        static_cast<unsigned long long>(g_blitter_shadow.evictions()));
+    for (const auto& s : g_blitter_shadow.slots()) {
+        if (!s.used) continue;
+        std::fprintf(stderr,
+            "  slot=%u builders=%llu allocator_calls=%llu bytes=%u "
+            "descriptor_changes=%llu arm_dispatches=%llu variants=%zu "
+            "variant_overflow=%llu wrong_mode=%llu entry_changes=%llu\n",
+            s.slot, static_cast<unsigned long long>(s.builder_calls),
+            static_cast<unsigned long long>(s.allocator_calls),
+            s.requested_bytes,
+            static_cast<unsigned long long>(s.descriptor_changes),
+            static_cast<unsigned long long>(s.arm_dispatches),
+            s.fingerprint_count,
+            static_cast<unsigned long long>(s.fingerprint_overflow),
+            static_cast<unsigned long long>(s.wrong_mode_dispatches),
+            static_cast<unsigned long long>(s.entry_changes));
+    }
+}
+
+void blitter_function_entry(std::uint32_t entry_pc) {
+    if (!blitter_shadow_on()) return;
+    static bool report_armed = false;
+    if (!report_armed) {
+        report_armed = true;
+        std::atexit(report_blitter_shadow);
+    }
+    if (entry_pc == gsr::blitter_shadow::kBuilderEntry) {
+        g_blitter_shadow.builder_entry(
+            g_cpu.R[0], g_cpu.R[1], g_cpu.R[2], g_cpu.R[3],
+            bus_read_u32(g_cpu.R[13]));
+    } else if (entry_pc == gsr::blitter_shadow::kAllocatorEntry) {
+        g_blitter_shadow.allocator_entry(g_cpu.R[0], g_cpu.R[1]);
+    }
+}
+
+void blitter_shadow_dispatch(std::uint32_t pc, int thumb) {
+    if (!blitter_shadow_on()) return;
+    for (const auto& s : g_blitter_shadow.slots()) {
+        if (!s.used || s.requested_bytes == 0 ||
+            s.requested_bytes > 0x2000u) continue;
+        std::uint32_t slot_addr = 0;
+        if (!gsr::blitter_shadow::Observer::slot_address(s.slot, &slot_addr))
+            continue;
+        const std::uint32_t entry = bus_read_u32(slot_addr) & ~1u;
+        if (entry < 0x03000000u || entry >= 0x03008000u ||
+            static_cast<std::uint64_t>(entry) + s.requested_bytes >
+                0x03008000ull ||
+            pc < entry || static_cast<std::uint64_t>(pc) >=
+                static_cast<std::uint64_t>(entry) + s.requested_bytes) {
+            continue;
+        }
+        std::uint32_t hash = 2166136261u;
+        for (std::uint32_t i = 0; i < s.requested_bytes; ++i) {
+            hash = (hash ^ bus_read_u8(entry + i)) * 16777619u;
+        }
+        g_blitter_shadow.generated_dispatch(pc, thumb != 0, entry, hash,
+                                             s.slot);
+        return;
+    }
+}
+
 bool strict_static_run() {
     static const bool strict = [] {
         const char* env = std::getenv("GBARECOMP_STRICT_STATIC");
@@ -1505,11 +1600,163 @@ bool dynamic_ram_pc_reported(std::uint32_t pc) {
     return false;
 }
 
+// ── TEMPORARY dynamic-RAM-code cost/version probe (GSR_DYNAMIC_RAM_PROBE=1) ──
+// Battle-lag investigation: the ~44 IWRAM PCs the runtime reports as
+// "DYNAMIC RAM CODE" (no registered identity — almost certainly Golden Sun's
+// own runtime-generated sprite-blit unrolls, see docs/OVERLAYS.md and
+// BATTLE SLOW.txt) always fall through dispatch_dynamic_ram. The open
+// question this probe answers: is the live code at each such PC reused
+// across a battle (a small, bounded set of byte-versions per PC — a
+// hash-keyed native cache would close it) or effectively unique per call
+// (only a pattern-recognizing blitter would help)? Off by default: one
+// getenv() + one bool check per dispatch_dynamic_ram() call when disabled,
+// matching the existing GBARECOMP_COST_PROBE idiom (see
+// gbarecomp/src/runtime/runtime_bus_bridge.cpp). Diagnostic-only; intended
+// for removal once the investigation report is written.
+// GSR_DYNAMIC_RAM_PROBE, if explicitly set, wins outright. Otherwise falls
+// back to the config UI's "Additional debug logging" toggle (default OFF).
+bool dynamic_ram_probe_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("GSR_DYNAMIC_RAM_PROBE");
+        return e ? !(e[0] == '0' && e[1] == '\0')
+                 : (gsr_additional_debug_logging() != 0);
+    }();
+    return on;
+}
+
+// Bytes hashed per PC to fingerprint the live code version. This is a
+// diagnostic fingerprint window, NOT a proven function boundary — these PCs
+// are exactly the ones with no registered identity/size in
+// kTransientCodeImages, so there is no reviewed size to hash instead.
+// Clamped to the containing 32 KiB IWRAM / 256 KiB EWRAM region so a PC near
+// the end of RAM never reads past the region. Override with
+// GSR_DYNAMIC_RAM_PROBE_WINDOW (bytes) if 64 hides or blends distinct
+// versions.
+std::uint32_t dynamic_ram_probe_window() {
+    static const std::uint32_t window = [] {
+        std::uint32_t w = 64u;
+        if (const char* e = std::getenv("GSR_DYNAMIC_RAM_PROBE_WINDOW")) {
+            const unsigned long parsed = std::strtoul(e, nullptr, 0);
+            if (parsed > 0) w = static_cast<std::uint32_t>(parsed);
+        }
+        return w;
+    }();
+    return window;
+}
+
+struct DynamicRamProbeEntry {
+    std::uint64_t executions = 0;      // times dispatch_dynamic_ram(pc) ran
+    std::uint64_t overlay_hits = 0;    // of those, served natively by overlay_try_dispatch
+    std::uint64_t interp_insns = 0;    // guest instructions interpreted for pc
+    std::uint64_t interp_ns = 0;       // wall time inside runtime_dispatch_miss
+    std::uint64_t total_ns = 0;        // wall time for the whole dispatch call
+    std::vector<std::uint32_t> distinct_hashes;  // CRC32s of the live window seen
+};
+std::unordered_map<std::uint32_t, DynamicRamProbeEntry> g_dynamic_ram_probe;
+
+void report_dynamic_ram_probe() {
+    if (g_dynamic_ram_probe.empty()) return;
+    std::vector<std::pair<std::uint32_t, const DynamicRamProbeEntry*>> rows;
+    rows.reserve(g_dynamic_ram_probe.size());
+    for (const auto& kv : g_dynamic_ram_probe) rows.emplace_back(kv.first, &kv.second);
+    std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) {
+        return a.second->total_ns > b.second->total_ns;
+    });
+    unsigned long long total_exec = 0, total_insns = 0, total_overlay_hits = 0;
+    unsigned long long total_ns = 0, total_interp_ns = 0;
+    for (const auto& r : rows) {
+        total_exec += r.second->executions;
+        total_overlay_hits += r.second->overlay_hits;
+        total_insns += r.second->interp_insns;
+        total_ns += r.second->total_ns;
+        total_interp_ns += r.second->interp_ns;
+    }
+    std::fprintf(stderr,
+        "GoldenSunRecomp: [dynamic-ram-probe] window=%u bytes pcs=%zu "
+        "total_executions=%llu overlay_native_hits=%llu (%.1f%%) "
+        "total_interp_insns=%llu total_ms=%.3f interp_ms=%.3f "
+        "interpreter_throughput=%.1f Kinsn/s\n",
+        dynamic_ram_probe_window(), rows.size(), total_exec, total_overlay_hits,
+        total_exec > 0 ? (100.0 * total_overlay_hits) / total_exec : 0.0,
+        total_insns, total_ns / 1e6, total_interp_ns / 1e6,
+        total_interp_ns > 0
+            ? (static_cast<double>(total_insns) * 1e6) /
+                  static_cast<double>(total_interp_ns)
+            : 0.0);
+    std::fprintf(stderr, "  %-10s %8s %12s %14s %14s %10s\n",
+        "pc", "hashes", "executions", "overlay_hits", "interp_insns", "ms");
+    for (const auto& r : rows) {
+        std::fprintf(stderr, "  0x%08X %8zu %12llu %14llu %14llu %10.3f\n",
+            r.first, r.second->distinct_hashes.size(),
+            static_cast<unsigned long long>(r.second->executions),
+            static_cast<unsigned long long>(r.second->overlay_hits),
+            static_cast<unsigned long long>(r.second->interp_insns),
+            r.second->total_ns / 1e6);
+    }
+}
+
+void dynamic_ram_probe_record(std::uint32_t pc, std::uint64_t total_ns,
+                              std::uint64_t interp_ns,
+                              std::uint64_t interp_insns,
+                              bool overlay_hit) {
+    // IWRAM (0x03xxxxxx) is 32 KiB; EWRAM (0x02xxxxxx) is 256 KiB. Region
+    // boundaries per GBA hardware memory map (docs/OVERLAYS.md), same
+    // boundary math kTransientCodeImages/runtime_dispatch already use.
+    const std::uint32_t region_end = (pc & 0xFF000000u) +
+        ((pc >> 24) == 0x03u ? 0x00008000u : 0x00040000u);
+    std::uint32_t len = dynamic_ram_probe_window();
+    if (pc + len > region_end) len = region_end - pc;
+    std::uint8_t buf[256];
+    if (len > sizeof(buf)) len = sizeof(buf);
+    for (std::uint32_t i = 0; i < len; ++i) buf[i] = bus_read_u8(pc + i);
+    const std::uint32_t hash = gba::crc32(buf, len);
+
+    static bool atexit_armed = false;
+    if (!atexit_armed) {
+        atexit_armed = true;
+        std::atexit(report_dynamic_ram_probe);
+    }
+
+    DynamicRamProbeEntry& e = g_dynamic_ram_probe[pc];
+    ++e.executions;
+    if (overlay_hit) ++e.overlay_hits;
+    e.interp_insns += interp_insns;
+    e.interp_ns += interp_ns;
+    e.total_ns += total_ns;
+    if (std::find(e.distinct_hashes.begin(), e.distinct_hashes.end(), hash) ==
+        e.distinct_hashes.end()) {
+        e.distinct_hashes.push_back(hash);
+    }
+}
+
 // Run an unexplained RAM PC: healed native first, else the interpreter
 // bridge (which also enqueues the heal keyed by the live bytes' CRC).
 int dispatch_dynamic_ram(std::uint32_t pc, int thumb) {
-    if (overlay_try_dispatch(pc, thumb)) return 1;
+    blitter_shadow_dispatch(pc, thumb);
+    if (!dynamic_ram_probe_on()) {
+        if (overlay_try_dispatch(pc, thumb)) return 1;
+        runtime_dispatch_miss(pc | (thumb ? 1u : 0u));
+        return 1;
+    }
+    const auto call_t0 = std::chrono::steady_clock::now();
+    if (overlay_try_dispatch(pc, thumb)) {
+        const auto call_t1 = std::chrono::steady_clock::now();
+        dynamic_ram_probe_record(pc,
+            static_cast<std::uint64_t>(std::chrono::duration_cast<
+                std::chrono::nanoseconds>(call_t1 - call_t0).count()),
+            /*interp_ns=*/0, /*interp_insns=*/0, /*overlay_hit=*/true);
+        return 1;
+    }
+    const std::uint64_t insns_before = gbarecomp::self_heal_interpreted_insns();
+    const auto interp_t0 = std::chrono::steady_clock::now();
     runtime_dispatch_miss(pc | (thumb ? 1u : 0u));
+    const auto interp_t1 = std::chrono::steady_clock::now();
+    const std::uint64_t insns_after = gbarecomp::self_heal_interpreted_insns();
+    const std::uint64_t interp_ns = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            interp_t1 - interp_t0).count());
+    dynamic_ram_probe_record(pc, interp_ns, interp_ns,
+                             insns_after - insns_before, /*overlay_hit=*/false);
     return 1;
 }
 
@@ -1550,6 +1797,60 @@ bool allow_dynamic_ram_pc(const char* reason, std::uint32_t pc, int thumb) {
     return true;
 }
 
+// Bounds nested verified-RAM native dispatch on this thread. A cached
+// native entry that re-dispatches its own pc before returning (a
+// generated-code bug, not ordinary nested guest calls) would otherwise
+// recurse through runtime_dispatch -> verified_ram_dispatch -> fn()
+// forever and blow the host stack. A fixed-capacity array plus a linear
+// scan is used instead of a std::set: this path is hit ~100,000 times per
+// fight, and per-dispatch hashing/allocation was measured to make that
+// crawl (see the comment above verified_ram_dispatch).
+constexpr std::size_t kVerifiedRamActiveCapacity = 64;
+thread_local std::array<std::uint64_t, kVerifiedRamActiveCapacity>
+    g_verified_ram_active_keys{};
+thread_local std::size_t g_verified_ram_active_depth = 0;
+thread_local std::vector<std::uint32_t> g_verified_ram_self_dispatch_reported;
+thread_local std::vector<std::uint32_t> g_verified_ram_depth_cap_reported;
+
+bool verified_ram_pc_in(const std::vector<std::uint32_t>& reported,
+                        std::uint32_t pc) {
+    for (std::uint32_t seen : reported) {
+        if (seen == pc) return true;
+    }
+    return false;
+}
+
+// RAII guard tracking which verified-RAM keys are currently being invoked
+// on this thread, so a native fn that re-dispatches its own pc (or a
+// A->B->A cycle) can be detected and bypassed instead of recursing without
+// bound. The guarded key is always removed on exit, including on an
+// exception unwind out of the native fn.
+struct VerifiedRamActiveGuard {
+    bool pushed = false;
+    bool self_dispatch = false;
+    bool depth_exceeded = false;
+
+    explicit VerifiedRamActiveGuard(std::uint64_t key) {
+        for (std::size_t i = 0; i < g_verified_ram_active_depth; ++i) {
+            if (g_verified_ram_active_keys[i] == key) {
+                self_dispatch = true;
+                return;
+            }
+        }
+        if (g_verified_ram_active_depth >= kVerifiedRamActiveCapacity) {
+            depth_exceeded = true;
+            return;
+        }
+        g_verified_ram_active_keys[g_verified_ram_active_depth++] = key;
+        pushed = true;
+    }
+    ~VerifiedRamActiveGuard() {
+        if (pushed) --g_verified_ram_active_depth;
+    }
+    VerifiedRamActiveGuard(const VerifiedRamActiveGuard&) = delete;
+    VerifiedRamActiveGuard& operator=(const VerifiedRamActiveGuard&) = delete;
+};
+
 int verified_ram_dispatch(std::uint32_t pc, int thumb) {
     // A PC already classified as generated code short-circuits everything
     // below. This must come FIRST: the identity scan re-hashes the whole
@@ -1561,6 +1862,50 @@ int verified_ram_dispatch(std::uint32_t pc, int thumb) {
     if (dynamic_ram_pc_repeat(pc)) return dispatch_dynamic_ram(pc, thumb);
 
     const std::uint64_t key = verified_ram_key(pc, thumb);
+
+    VerifiedRamActiveGuard active_guard(key);
+    if (active_guard.self_dispatch) {
+        // A verified-RAM native entry called back into runtime_dispatch for
+        // the exact same pc/thumb it is currently executing, before
+        // returning. Left alone this recurses through
+        // runtime_dispatch -> verified_ram_dispatch -> fn() without bound
+        // and overflows the host stack (this is the fix for that crash).
+        // Evict the cache entry and fall through to the ordinary
+        // static/overlay/interpreter path instead.
+        const auto self_cached = g_verified_ram_cache.find(key);
+        if (!verified_ram_pc_in(g_verified_ram_self_dispatch_reported, pc)) {
+            g_verified_ram_self_dispatch_reported.push_back(pc);
+            std::fprintf(stderr,
+                "GoldenSunRecomp: SELF-DISPATCH RECURSION at 0x%08X (%s) "
+                "identity_index=%zu — a verified-RAM native entry "
+                "re-dispatched its own pc before returning. Bypassing this "
+                "entry once and falling through to the ordinary dispatch "
+                "path instead of recursing without bound.\n",
+                pc, thumb ? "thumb" : "arm",
+                self_cached != g_verified_ram_cache.end()
+                    ? self_cached->second.identity_index
+                    : kNoVerifiedIdentity);
+        }
+        if (self_cached != g_verified_ram_cache.end())
+            g_verified_ram_cache.erase(self_cached);
+        return 0;
+    }
+    if (active_guard.depth_exceeded) {
+        // Not a same-pc self-dispatch, but this thread's nested
+        // verified-RAM native dispatch depth ran past the cap — e.g. an
+        // A->B->A cycle across distinct pcs. Refuse to recurse further and
+        // fall through to the ordinary dispatch path.
+        if (!verified_ram_pc_in(g_verified_ram_depth_cap_reported, pc)) {
+            g_verified_ram_depth_cap_reported.push_back(pc);
+            std::fprintf(stderr,
+                "GoldenSunRecomp: VERIFIED-RAM DISPATCH DEPTH CAP (%zu) hit "
+                "at pc=0x%08X (%s) — refusing to nest further and falling "
+                "through to the ordinary dispatch path.\n",
+                kVerifiedRamActiveCapacity, pc, thumb ? "thumb" : "arm");
+        }
+        return 0;
+    }
+
     const auto cached = g_verified_ram_cache.find(key);
     if (cached != g_verified_ram_cache.end()) {
         const bool local_words_current =
@@ -1760,14 +2105,25 @@ int verified_ram_dispatch(std::uint32_t pc, int thumb) {
                 dump_path);
         }
     }
-    // The candidate-by-candidate byte report is the evidence a strict-static
-    // abort needs, and it is worth printing once so the first occurrence is
-    // fully documented. Printing it again for every further generated routine
-    // buries the console: one fight produced 26 distinct PCs at ~40 lines
-    // each, none of which said anything the first report had not.
+    // The candidate-by-candidate byte report is evidence for a strict-static
+    // abort, but the shared EWRAM overlay slot currently has scores of
+    // candidates. Printing all of them during ordinary self-heal caused a
+    // 200-line synchronous stderr burst on the first unknown identity. Keep
+    // normal play concise; diagnostics can opt back into the full report.
+    // GSR_TRANSIENT_VERBOSE, if explicitly set (even to an empty string,
+    // matching prior behavior), wins outright. Otherwise falls back to the
+    // config UI's "Additional debug logging" toggle (default OFF).
     const bool verbose_identity_report =
-        strict_static_run() || g_dynamic_ram_pcs.empty() ||
-        std::getenv("GSR_TRANSIENT_VERBOSE") != nullptr;
+        strict_static_run() ||
+        (std::getenv("GSR_TRANSIENT_VERBOSE") != nullptr
+             ? true
+             : gsr_additional_debug_logging() != 0);
+    if (!verbose_identity_report && g_dynamic_ram_pcs.empty()) {
+        std::fprintf(stderr,
+            "  identity details suppressed for normal play (%zu fixed, %zu "
+            "relocatable candidates); set GSR_TRANSIENT_VERBOSE=1 to dump\n",
+            observed_indices.size(), kRelocatableCodeImages.size());
+    }
     for (std::size_t candidate_index = 0;
          verbose_identity_report &&
          candidate_index < kTransientCodeImages.size(); ++candidate_index) {
@@ -1843,6 +2199,11 @@ void print_usage() {
 }  // namespace
 
 int main(int argc, char** argv) {
+    // Must be the FIRST thing in main, before SDL init or any other
+    // subsystem, so as much of the run as possible is covered. nullptr =
+    // default to the directory this executable lives in.
+    gbarecomp::crash_handler_install(nullptr);
+
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--help") == 0 ||
             std::strcmp(argv[i], "-h") == 0) {
@@ -1854,6 +2215,7 @@ int main(int argc, char** argv) {
     gbarecomp::RunOptions options;
     options.builtin_game_name = "Golden Sun";
     options.builtin_rom_sha1 = kRomSha1;
+    options.function_entry_observer = blitter_function_entry;
     options.max_view_width = 240;
     options.frame_interpolation_available = true;
     options.enhanced_timing_available = true;
@@ -1892,5 +2254,6 @@ int main(int argc, char** argv) {
             "relocatable_cache_stats hashes=%llu cache_hits=%llu\n",
             g_relocatable_identity_hashes, g_relocatable_identity_cache_hits);
     }
+    gbarecomp::crash_handler_mark_clean_exit();
     return result;
 }

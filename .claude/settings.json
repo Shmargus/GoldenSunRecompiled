@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(Select-String *)",
+      "PowerShell(Get-Process)",
+      "PowerShell(Get-Process *)",
+      "PowerShell(Get-ChildItem *)",
+      "PowerShell(Get-Content *)",
+      "PowerShell(Get-Item *)",
+      "PowerShell(Test-Path *)",
+      "Bash(arm-none-eabi-readelf *)",
+      "Bash(arm-none-eabi-nm *)",
+      "Bash(arm-none-eabi-objdump *)",
+      "Bash(arm-none-eabi-addr2line *)",
+      "Bash(tasklist)",
+      "Bash(tasklist *)"
+    ]
+  }
+}
