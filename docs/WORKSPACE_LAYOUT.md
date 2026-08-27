@@ -1,26 +1,37 @@
-# Workspace Layout
+# Workspace layout
 
-Recommended Windows layout:
+Keep the repository root focused on source, build entry points, and routed
+documentation:
 
 ```text
-C:\Dev\GoldenSunWorkspace\
-├─ GoldenSunRecomp\
-├─ gbarecomp\
-├─ goldensun-disasm\
-└─ private\
-   ├─ goldensun.gba
-   ├─ gba_bios.bin
-   ├─ saves\
-   └─ traces\
+Golden Sun Recompiled\
+├─ src\                 launcher and project runtime
+├─ gbarecomp\           upstream recompilation engine
+├─ generated\           generated code; never hand-edit
+├─ assets\ symbols\    project assets and symbol data
+├─ tests\ tools\       tests and developer utilities
+├─ config\ scripts\    build configuration and developer scripts
+├─ docs\
+│  ├─ STATUS.md         current milestone/build only
+│  ├─ NEXT_TASK.md      one immediate acceptance task
+│  ├─ ACTIVE_ISSUES.md  short linked issue index
+│  ├─ issues\           one canonical file per active issue
+│  ├─ features\         widescreen, MP2K, timing, and cheats
+│  ├─ BACKLOG.md        wishlist/future enhancements
+│  ├─ PARKED.md         deferred work and resume conditions
+│  └─ history\          closed evidence; never current guidance
+├─ build\               ignored build output
+├─ local\ logs\        ignored machine-local data and runtime logs
+└─ private\ roms\      user-supplied ROM, BIOS, saves, and states
 ```
 
-Set optional environment variables:
+New session: read `AGENTS.md`, then `STATUS.md`, `NEXT_TASK.md`, and
+`ACTIVE_ISSUES.md`. Route to exactly one relevant issue or feature file. Do
+not load unrelated tracks or use `docs/history\` as current state.
 
-```powershell
-$env:GSR_ROM = "C:\Dev\GoldenSunWorkspace\private\goldensun.gba"
-$env:GSR_BIOS = "C:\Dev\GoldenSunWorkspace\private\gba_bios.bin"
-$env:GBARECOMP_ROOT = "C:\Dev\GoldenSunWorkspace\gbarecomp"
-$env:GSR_DISASM_ROOT = "C:\Dev\GoldenSunWorkspace\goldensun-disasm"
-```
+Run the playable build through the repository-root `GoldenSunLauncher.exe`.
+Keep ROMs, BIOS files, saves, traces, and extracted assets under `private\` or
+`roms\`; never commit them.
 
-Never write scripts that default to copying private inputs into the repository.
+Compatibility stubs remain at the former MP2K, Widescreen, and Enhanced Timing
+filenames. Canonical content is under `docs/features\`.

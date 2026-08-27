@@ -3,7 +3,11 @@
 ## Before opening a change
 
 - Read `AGENTS.md`.
-- Select one task from `TASKS.md` or document a narrowly scoped research question.
+- Read `docs/STATUS.md` for where the project is.
+- Read `docs/NEXT_TASK.md` and `docs/ACTIVE_ISSUES.md`, then select one linked
+  detail file under `docs/issues/` or `docs/features/`. Use `BACKLOG.md` or
+  `PARKED.md` only for planning/deferred work.
+- Do not use `docs/history/` as current guidance.
 - Reproduce the current baseline.
 - Never include ROM, BIOS, save-state, extracted asset, or private trace data.
 

@@ -99,3 +99,20 @@ battle_probe_*.txt
 crash_err.txt
 crash_out.txt
 run_state.txt
+
+# Ad-hoc disassembly/symbol dumps from debugging sessions (local only,
+# regenerable from the built exe with objdump/nm)
+dis_*.txt
+text_syms*.txt
+syms*.txt
+err*.txt
+e[0-9].txt
+
+# Local convenience scripts that hardcode private ROM/BIOS/savestate paths.
+# Kept on disk, never committed — see SECURITY.md.
+CATCH BATTLE LOG.ps1
+RUN BATTLE PROBE.ps1
+
+# Local trace launcher (see WIDE-05); regenerable, not committed
+TRACE MAP.ps1
+logs/mmio_map_*.csv

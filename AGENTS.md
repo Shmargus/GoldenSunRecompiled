@@ -4,6 +4,40 @@
 
 Build a faithful native x86-64 static recompilation of the USA/Europe release of **Golden Sun** for GBA using `gbarecomp`.
 
+## New-session map
+
+Read only these first, in order:
+
+1. `AGENTS.md` — rules and safety boundaries.
+2. `docs/STATUS.md` — current milestone and build.
+3. `docs/NEXT_TASK.md` — one immediate acceptance task.
+4. `docs/ACTIVE_ISSUES.md` — short open-issue index.
+
+Then load exactly the linked detail file needed for the task:
+
+- Crash/dispatch/RAM miss → `docs/issues/CRASH-*.md`,
+  `docs/issues/PERF-08.md`, or `docs/issues/COV-01.md`; add
+  `docs/OVERLAYS.md` for overlay/RAM work.
+- Widescreen/culling/presentation → `docs/issues/WIDE-01.md` and
+  `docs/features/WIDESCREEN.md`.
+- MP2K/audio → `docs/issues/AUD-03.md`, `PERF-03.md`, or `AUD-01.md`, then
+  `docs/features/MP2K.md`.
+- Performance/timing → matching `docs/issues/PERF-*.md` or `PRES-*.md`, then
+  `docs/features/ENHANCED_TIMING.md` when timing is involved.
+- Planning/wishlist → `docs/BACKLOG.md`; deferred work → `docs/PARKED.md`.
+- Cheats → `docs/features/CHEATS.md`.
+- Closed evidence → `docs/history/` only when explicitly auditing history.
+
+Do not load unrelated issue or feature files. Compatibility stubs retain old
+paths for links; canonical content is under `docs/issues/` and
+`docs/features/`.
+
+`docs/history/` is closed evidence, not current guidance; never use it as a
+task plan. `local/` and `logs/` hold machine-local notes and runtime logs;
+`build/` holds generated output.
+For gameplay, launch only the root `GoldenSunLauncher.exe`; the user performs
+manual tests.
+
 Work in this order:
 
 1. Reach a correct, reproducible, fully playable baseline with original timing and 240x160 output.
@@ -14,18 +48,38 @@ Enhancements are real project goals, but they must not hide regressions or repla
 
 ## Read before substantial work
 
-Read:
+After routing, read only the selected task file plus these general references
+when relevant:
 
-1. `TECHNICAL_HANDOFF.md` for the current state, commands, measurements, failed approaches, and recommended next work.
-2. `README.md`, `PROJECT_PLAN.md`, `ARCHITECTURE.md`, `TESTING.md`, and `LEGAL.md`.
-3. `docs/OVERLAYS.md` when work touches RAM code or overlays.
-4. The pinned upstream `gbarecomp/PRINCIPLES.md`, `DEBUG.md`, `TCP.md`, and TOML schema when relevant.
+1. `README.md`, `PROJECT_PLAN.md`, `ARCHITECTURE.md`, `TESTING.md`, and `LEGAL.md` for broad work.
+2. `docs/OVERLAYS.md` and `docs/GS011_TRANSIENT_IMAGES.md` for RAM/overlay work.
+3. The pinned upstream `gbarecomp/PRINCIPLES.md`, `DEBUG.md`, `TCP.md`, and TOML schema when relevant.
 
-Stricter upstream rules win. Prefer current code and measured results over stale notes, then update the handoff.
+Stricter upstream rules win. Prefer current code and measured results over stale notes, then update the docs.
+
+`docs/history/` holds closed milestones and past sessions. It is kept for the
+evidence behind decisions already made. Do not act on anything in it, and do
+not cite it as current state.
 
 ## Agent orchestration
 
 **Sol orchestrates; Sol is not the normal worker.**
+
+### User session defaults
+
+These are repository-scoped defaults for future sessions:
+
+- Keep replies maximally concise: only essential facts, fewest possible words,
+  no preamble, repetition, optional detail, or fluff.
+- Always use Luna xHigh subagents for task work; Sol only orchestrates, compares
+  evidence, integrates, and reports.
+- Ask the user when a material choice is ambiguous; do not guess their intent.
+- The user performs all gameplay and other manual testing.
+- Always launch the playable build through the repository-root
+  `GoldenSunLauncher.exe`, never by launching a child executable directly.
+- Run only one build or other CPU-heavy job at a time. Avoid process fan-out that
+  could push total CPU or memory usage above 90%; reduce build parallelism or
+  pause work when either approaches that limit.
 
 Sol should do only the work that requires global context:
 
@@ -68,7 +122,7 @@ Before ROM-dependent work, verify SHA-1 `5c4695205413df7db52b9a184815a0778399997
 
 ## Build and test workflow
 
-Use the exact commands and deterministic reference route in `TECHNICAL_HANDOFF.md`. Prefer normal non-LTO builds for iteration unless LTO is the subject being measured.
+Build and run the build named in `docs/STATUS.md`; it explains which binary is the playable one and why. Prefer normal non-LTO builds for iteration — LTO is off deliberately and has failed here twice.
 
 1. Confirm whether the change belongs in `GoldenSunRecomp` or upstream `gbarecomp`.
 2. Reproduce the current baseline.
@@ -76,7 +130,7 @@ Use the exact commands and deterministic reference route in `TECHNICAL_HANDOFF.m
 4. Run focused tests, then the milestone acceptance scenario.
 5. Check semantic invariants, dispatch misses, static coverage, and relevant performance numbers.
 6. Rebuild GoldenSunRecomp after upstream changes and confirm which binary ran.
-7. Update `TECHNICAL_HANDOFF.md`, `ROADMAP.md`, or supporting docs when durable evidence changes.
+7. Update `docs/STATUS.md`, `docs/ACTIVE_ISSUES.md`, `ROADMAP.md`, or supporting docs when durable evidence changes.
 
 Public checks must use no protected data. Typical commands are:
 
@@ -94,4 +148,6 @@ Preserve unrelated user changes. Keep commits to one research conclusion or root
 
 Implementation PRs must state the milestone, root cause or question, changed subsystem, exact commands, before/after evidence, static coverage, remaining divergence, and confirmation that no protected material was added.
 
-Keep `TECHNICAL_HANDOFF.md` compact and durable: conclusions, measurements, changes, failed approaches worth avoiding, unresolved issues, and the exact next step. Do not turn it into a chat log.
+Keep `docs/STATUS.md` short and current: where the project is, which build to run, and what is in flight. Keep `docs/ACTIVE_ISSUES.md` as a short index — one link per open issue to its canonical file under `docs/issues/`, with feature, wishlist, and parked links routed to their canonical files.
+
+When an issue closes, remove its open-index entry and record only durable closure evidence in the canonical issue file or `docs/history/` when it is closed evidence. Neither file is a chat log; session-by-session accounts belong in `docs/history/` or nowhere.
