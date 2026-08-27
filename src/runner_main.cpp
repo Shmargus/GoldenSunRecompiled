@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -12,12 +13,23 @@
 #include "crc32.h"
 #include "blitter_shadow_observer.h"
 #include "crash_handler.h"
+#include "gba_bus.h"
+#include "gba_ppu.h"
+#include "gba_vram_trace.h"
 #include "recompiled.h"
 #include "relocatable_identity.h"
+#include "player_speed_cheat.h"
 #include "runtime.h"
+#include "runtime_bus_bridge.h"
 #include "runtime_arm.h"
+#include "overlay_loader.h"
 #include "self_heal.h"
 #include "sha1.h"
+#include "widescreen_literal_trace.h"
+#include "widescreen_policy.h"
+
+extern "C" unsigned g_ws_active;
+extern "C" unsigned long long runtime_current_frame();
 
 struct DispatchEntry {
     std::uint32_t addr;
@@ -156,10 +168,1770 @@ extern "C" const unsigned gsr_overlay_rom_780898_kDispatchTableLen;
 #include "overlay-registry.inc"
 #undef GSR_OVERLAY
 
+namespace gbarecomp {
+extern "C" RuntimeGuestFn overlay_resolve(std::uint32_t pc, int thumb);
+}
+
 namespace {
 
 constexpr const char* kRomSha1 =
     "5c4695205413df7db52b9a184815a07783999971";
+
+constexpr const char* kGoldenSunAspectLabels[] = {
+    "Native 240x160",
+    "Widescreen 288x160",
+    "Expanded Widescreen 360x240",
+};
+constexpr std::uint16_t kGoldenSunAspectWidths[] = {240u, 288u, 360u};
+constexpr std::uint16_t kGoldenSunAspectHeights[] = {160u, 160u, 240u};
+
+std::uint32_t g_golden_sun_wide_extra_left = 0;
+std::uint32_t g_golden_sun_wide_extra_right = 0;
+std::uint32_t g_golden_sun_wide_extra_top = 0;
+std::uint32_t g_golden_sun_wide_extra_bottom = 0;
+bool g_golden_sun_mode0_field = false;
+bool g_golden_sun_mode0_split_scroll = false;
+gsr::widescreen::GoldenSunFieldAuthoredMap g_golden_sun_field_authored;
+// Edge-detected so the bitmap only clears once per "left the authenticated
+// field" transition, not every scanline the classifier reports the field
+// is inactive (menus/dialogue can hold that state for many frames).
+bool g_golden_sun_field_authored_reset_done = true;
+bool g_golden_sun_expanded_obj_scene = false;
+gsr::widescreen::GoldenSunMode0SplitScrollFrame
+    g_golden_sun_mode0_split_scroll_frame;
+struct GoldenSunObjYProvenance {
+    bool valid = false;
+    std::uint8_t raw_y = 0;
+    std::uint64_t frame = UINT64_MAX;
+    std::uint64_t auth_epoch = 0;
+};
+std::array<GoldenSunObjYProvenance,
+           gsr::widescreen::kGoldenSunOamShadowSlotCount>
+    g_golden_sun_obj_y_provenance{};
+std::array<std::uint8_t, 0x20> g_golden_sun_wide_line_io{};
+bool g_golden_sun_wide_line_io_valid = false;
+std::uint16_t g_golden_sun_wide_line_dispcnt = 0;
+std::vector<std::uint64_t> g_golden_sun_wide_scene_signatures;
+
+constexpr std::size_t kGoldenSunFieldMapOffset = 0x10000u;
+constexpr std::size_t kGoldenSunFieldMapBytes = 128u * 128u * 4u;
+constexpr std::size_t kGoldenSunFieldRawOffset = 0x20000u;
+constexpr std::size_t kGoldenSunFieldRawBytes = 4096u * 8u;
+constexpr std::uint32_t kGoldenSunFieldMapAddress = 0x02010000u;
+constexpr std::uint32_t kGoldenSunFieldRawAddress = 0x02020000u;
+constexpr unsigned kGoldenSunWidePolicyTransitionLimit = 16u;
+constexpr unsigned kGoldenSunWidePolicySampleLimit = 16u;
+constexpr unsigned kGoldenSunFieldTableCpuLogLimitPerEpoch = 64u;
+constexpr unsigned kGoldenSunFieldTableDmaLogLimitPerEpoch = 32u;
+
+void begin_golden_sun_field_auth_epoch();
+
+// GBARECOMP_VRAM_MAP_TRACE is the existing explicit kill switch for this
+// payload-free map investigation. The default is deliberately off in main().
+bool golden_sun_wide_diagnostics_enabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("GBARECOMP_VRAM_MAP_TRACE");
+        return env != nullptr && env[0] != '\0' && env[0] != '0';
+    }();
+    return enabled;
+}
+
+struct GoldenSunFieldMapCensus {
+    std::uint64_t auth_epoch = 0;
+    std::uint32_t map_crc = 0;
+    std::uint32_t raw_crc = 0;
+};
+std::vector<GoldenSunFieldMapCensus> g_golden_sun_wide_field_map_census;
+std::uint64_t g_golden_sun_wide_field_map_trace_frame = UINT64_MAX;
+std::uint64_t g_golden_sun_field_auth_epoch = 0;
+using GoldenSunWidePolicyReason = gsr::widescreen::GoldenSunWidePolicyReason;
+
+// Payload-free provider accounting separates a missing/invalid atlas source
+// from a successful replacement. The existing map census proves which table
+// image was resident, while these counters prove what the PPU actually did
+// with margin requests; neither path retains or prints guest tile bytes.
+struct GoldenSunFieldProviderTrace {
+    std::uint64_t calls = 0;
+    std::uint64_t equal_scroll_calls = 0;
+    std::uint64_t split_scroll_calls = 0;
+    std::uint64_t replacements = 0;
+    std::uint64_t unavailable = 0;
+    std::uint64_t precondition_rejects = 0;
+    std::uint64_t boundary_rejects = 0;
+    std::uint64_t raw_unavailable = 0;
+    std::uint64_t lookup_misses = 0;
+    std::int32_t min_x = INT32_MAX;
+    std::int32_t max_x = INT32_MIN;
+    std::int32_t min_y = INT32_MAX;
+    std::int32_t max_y = INT32_MIN;
+};
+std::array<GoldenSunFieldProviderTrace, 4>
+    g_golden_sun_field_provider_trace{};
+GoldenSunWidePolicyReason g_golden_sun_wide_policy_last_reason =
+    GoldenSunWidePolicyReason::UnsupportedMode;
+bool g_golden_sun_wide_policy_seen = false;
+std::uint64_t g_golden_sun_wide_policy_transition_count = 0;
+std::uint64_t g_golden_sun_wide_policy_logged_transitions = 0;
+std::uint64_t g_golden_sun_wide_policy_sample_count = 0;
+unsigned g_golden_sun_wide_policy_last_flags =
+    gsr::widescreen::kPillarboxAll;
+std::uint64_t g_golden_sun_wide_policy_sample_frame = UINT64_MAX;
+std::uint64_t g_golden_sun_wide_policy_sample_end_frame = UINT64_MAX;
+std::uint64_t g_golden_sun_wide_policy_sample_transition = 0;
+unsigned g_golden_sun_wide_policy_samples_in_window = 0;
+
+// The PPU-side margin observer reports only counters and layer/source
+// categories. Keep a cumulative copy for the bounded exit summary while also
+// emitting a sparse per-frame line that can identify the side of a seam.
+std::uint64_t g_golden_sun_margin_diagnostic_callbacks = 0;
+std::uint64_t g_golden_sun_margin_diagnostic_logged = 0;
+std::uint64_t g_golden_sun_margin_diagnostic_last_log_frame = UINT64_MAX;
+gba::WsMarginDiagnostics g_golden_sun_margin_diagnostic_total{};
+gba::WsMarginDiagnostics g_golden_sun_margin_diagnostic_last{};
+
+void accumulate_golden_sun_margin_diagnostics(
+    gba::WsMarginDiagnostics& total, const gba::WsMarginDiagnostics& sample) {
+    total.margin_pixels += sample.margin_pixels;
+    total.left_margin_pixels += sample.left_margin_pixels;
+    total.right_margin_pixels += sample.right_margin_pixels;
+    total.top_margin_pixels += sample.top_margin_pixels;
+    total.bottom_margin_pixels += sample.bottom_margin_pixels;
+    for (std::size_t bg = 0; bg < total.provider_results.size(); ++bg) {
+        for (std::size_t result = 0;
+             result < total.provider_results[bg].size(); ++result) {
+            total.provider_results[bg][result] +=
+                sample.provider_results[bg][result];
+        }
+    }
+    for (std::size_t layer = 0;
+         layer < total.final_selected.size(); ++layer) {
+        for (std::size_t source = 0;
+             source < total.final_selected[layer].size(); ++source) {
+            total.final_selected[layer][source] +=
+                sample.final_selected[layer][source];
+        }
+    }
+    for (std::size_t side = 0;
+         side < total.horizontal_final_selected.size(); ++side) {
+        for (std::size_t layer = 0;
+             layer < total.horizontal_final_selected[side].size(); ++layer) {
+            for (std::size_t source = 0;
+                 source < total.horizontal_final_selected[side][layer].size();
+                 ++source) {
+                total.horizontal_final_selected[side][layer][source] +=
+                    sample.horizontal_final_selected[side][layer][source];
+            }
+        }
+    }
+}
+
+const char* golden_sun_wide_policy_reason_name(
+    GoldenSunWidePolicyReason reason) {
+    switch (reason) {
+        case GoldenSunWidePolicyReason::AuthorizedMode2:
+            return "authorized-mode2";
+        case GoldenSunWidePolicyReason::AuthorizedMode0:
+            return "authorized-mode0";
+        case GoldenSunWidePolicyReason::AuthorizedMode0SplitScroll:
+            return "authorized-mode0-split-scroll";
+        case GoldenSunWidePolicyReason::MissingIo:
+            return "missing-io";
+        case GoldenSunWidePolicyReason::ForcedBlank:
+            return "forced-blank";
+        case GoldenSunWidePolicyReason::WindowControl:
+            return "window-control";
+        case GoldenSunWidePolicyReason::UnsupportedMode:
+            return "unsupported-mode";
+        case GoldenSunWidePolicyReason::Mode2Layers:
+            return "mode2-layers";
+        case GoldenSunWidePolicyReason::Mode2Geometry:
+            return "mode2-geometry";
+        case GoldenSunWidePolicyReason::Mode0Layers:
+            return "mode0-layers";
+        case GoldenSunWidePolicyReason::Mode0Geometry:
+            return "mode0-geometry";
+        case GoldenSunWidePolicyReason::Mode0ScrollMismatch:
+            return "mode0-scroll-mismatch";
+        case GoldenSunWidePolicyReason::Mode0SplitLayers:
+            return "mode0-split-layers";
+        case GoldenSunWidePolicyReason::Mode0SplitGeometry:
+            return "mode0-split-geometry";
+        case GoldenSunWidePolicyReason::Mode0SplitScrollMismatch:
+            return "mode0-split-scroll-mismatch";
+    }
+    return "unknown";
+}
+
+void report_golden_sun_margin_diagnostic_sample(
+    std::uint64_t frame, const char* reason,
+    const gba::WsMarginDiagnostics& sample) {
+    const auto final = [&](std::size_t layer, std::size_t source) {
+        return sample.final_selected[layer][source];
+    };
+    const auto horizontal = [&](std::size_t side, std::size_t layer,
+                                std::size_t source) {
+        return sample.horizontal_final_selected[side][layer][source];
+    };
+    const auto provider = [&](std::size_t bg, std::size_t result) {
+        return sample.provider_results[bg][result];
+    };
+    const auto u64 = [](std::uint64_t value) {
+        return static_cast<unsigned long long>(value);
+    };
+    std::fprintf(
+        stderr,
+        "[wide-margin] frame=%llu auth_epoch=%llu reason=%s "
+        "pixels=%llu left=%llu right=%llu top=%llu bottom=%llu "
+        "provider=bg0:%llu/%llu/%llu,bg1:%llu/%llu/%llu,bg2:%llu/%llu/%llu,bg3:%llu/%llu/%llu "
+        "final_bg0=%llu/%llu/%llu final_bg1=%llu/%llu/%llu "
+        "final_bg2=%llu/%llu/%llu final_bg3=%llu/%llu/%llu "
+        "final_obj=%llu final_backdrop=%llu final_pillarbox=%llu "
+        "final_forced_blank=%llu "
+        "left_bg0=%llu/%llu/%llu left_bg1=%llu/%llu/%llu "
+        "left_bg2=%llu/%llu/%llu left_bg3=%llu/%llu/%llu "
+        "right_bg0=%llu/%llu/%llu right_bg1=%llu/%llu/%llu "
+        "right_bg2=%llu/%llu/%llu right_bg3=%llu/%llu/%llu "
+        "right_obj=%llu right_backdrop=%llu right_pillarbox=%llu\n",
+        u64(frame), u64(g_golden_sun_field_auth_epoch), reason,
+        u64(sample.margin_pixels), u64(sample.left_margin_pixels),
+        u64(sample.right_margin_pixels), u64(sample.top_margin_pixels),
+        u64(sample.bottom_margin_pixels),
+        u64(provider(0, gba::kWsMarginProviderReplace)),
+        u64(provider(0, gba::kWsMarginProviderKeepWrapped)),
+        u64(provider(0, gba::kWsMarginProviderUnavailable)),
+        u64(provider(1, gba::kWsMarginProviderReplace)),
+        u64(provider(1, gba::kWsMarginProviderKeepWrapped)),
+        u64(provider(1, gba::kWsMarginProviderUnavailable)),
+        u64(provider(2, gba::kWsMarginProviderReplace)),
+        u64(provider(2, gba::kWsMarginProviderKeepWrapped)),
+        u64(provider(2, gba::kWsMarginProviderUnavailable)),
+        u64(provider(3, gba::kWsMarginProviderReplace)),
+        u64(provider(3, gba::kWsMarginProviderKeepWrapped)),
+        u64(provider(3, gba::kWsMarginProviderUnavailable)),
+        u64(final(gba::kWsMarginTraceBg0, gba::kWsMarginSourceWrapped)),
+        u64(final(gba::kWsMarginTraceBg0,
+                  gba::kWsMarginSourceProviderReplace)),
+        u64(final(gba::kWsMarginTraceBg0,
+                  gba::kWsMarginSourceProviderKeepWrapped)),
+        u64(final(gba::kWsMarginTraceBg1, gba::kWsMarginSourceWrapped)),
+        u64(final(gba::kWsMarginTraceBg1,
+                  gba::kWsMarginSourceProviderReplace)),
+        u64(final(gba::kWsMarginTraceBg1,
+                  gba::kWsMarginSourceProviderKeepWrapped)),
+        u64(final(gba::kWsMarginTraceBg2, gba::kWsMarginSourceWrapped)),
+        u64(final(gba::kWsMarginTraceBg2,
+                  gba::kWsMarginSourceProviderReplace)),
+        u64(final(gba::kWsMarginTraceBg2,
+                  gba::kWsMarginSourceProviderKeepWrapped)),
+        u64(final(gba::kWsMarginTraceBg3, gba::kWsMarginSourceWrapped)),
+        u64(final(gba::kWsMarginTraceBg3,
+                  gba::kWsMarginSourceProviderReplace)),
+        u64(final(gba::kWsMarginTraceBg3,
+                  gba::kWsMarginSourceProviderKeepWrapped)),
+        u64(final(gba::kWsMarginTraceObj, gba::kWsMarginSourceObj)),
+        u64(final(gba::kWsMarginTraceBackdrop, gba::kWsMarginSourceBackdrop)),
+        u64(final(gba::kWsMarginTracePillarbox,
+                  gba::kWsMarginSourcePillarbox)),
+        u64(final(gba::kWsMarginTraceForcedBlank,
+                  gba::kWsMarginSourceForcedBlank)),
+        u64(horizontal(0, gba::kWsMarginTraceBg0,
+                        gba::kWsMarginSourceWrapped)),
+        u64(horizontal(0, gba::kWsMarginTraceBg0,
+                        gba::kWsMarginSourceProviderReplace)),
+        u64(horizontal(0, gba::kWsMarginTraceBg0,
+                        gba::kWsMarginSourceProviderKeepWrapped)),
+        u64(horizontal(0, gba::kWsMarginTraceBg1,
+                        gba::kWsMarginSourceWrapped)),
+        u64(horizontal(0, gba::kWsMarginTraceBg1,
+                        gba::kWsMarginSourceProviderReplace)),
+        u64(horizontal(0, gba::kWsMarginTraceBg1,
+                        gba::kWsMarginSourceProviderKeepWrapped)),
+        u64(horizontal(0, gba::kWsMarginTraceBg2,
+                        gba::kWsMarginSourceWrapped)),
+        u64(horizontal(0, gba::kWsMarginTraceBg2,
+                        gba::kWsMarginSourceProviderReplace)),
+        u64(horizontal(0, gba::kWsMarginTraceBg2,
+                        gba::kWsMarginSourceProviderKeepWrapped)),
+        u64(horizontal(0, gba::kWsMarginTraceBg3,
+                        gba::kWsMarginSourceWrapped)),
+        u64(horizontal(0, gba::kWsMarginTraceBg3,
+                        gba::kWsMarginSourceProviderReplace)),
+        u64(horizontal(0, gba::kWsMarginTraceBg3,
+                        gba::kWsMarginSourceProviderKeepWrapped)),
+        u64(horizontal(1, gba::kWsMarginTraceBg0,
+                        gba::kWsMarginSourceWrapped)),
+        u64(horizontal(1, gba::kWsMarginTraceBg0,
+                        gba::kWsMarginSourceProviderReplace)),
+        u64(horizontal(1, gba::kWsMarginTraceBg0,
+                        gba::kWsMarginSourceProviderKeepWrapped)),
+        u64(horizontal(1, gba::kWsMarginTraceBg1,
+                        gba::kWsMarginSourceWrapped)),
+        u64(horizontal(1, gba::kWsMarginTraceBg1,
+                        gba::kWsMarginSourceProviderReplace)),
+        u64(horizontal(1, gba::kWsMarginTraceBg1,
+                        gba::kWsMarginSourceProviderKeepWrapped)),
+        u64(horizontal(1, gba::kWsMarginTraceBg2,
+                        gba::kWsMarginSourceWrapped)),
+        u64(horizontal(1, gba::kWsMarginTraceBg2,
+                        gba::kWsMarginSourceProviderReplace)),
+        u64(horizontal(1, gba::kWsMarginTraceBg2,
+                        gba::kWsMarginSourceProviderKeepWrapped)),
+        u64(horizontal(1, gba::kWsMarginTraceBg3,
+                        gba::kWsMarginSourceWrapped)),
+        u64(horizontal(1, gba::kWsMarginTraceBg3,
+                        gba::kWsMarginSourceProviderReplace)),
+        u64(horizontal(1, gba::kWsMarginTraceBg3,
+                        gba::kWsMarginSourceProviderKeepWrapped)),
+        u64(horizontal(1, gba::kWsMarginTraceObj, gba::kWsMarginSourceObj)),
+        u64(horizontal(1, gba::kWsMarginTraceBackdrop,
+                        gba::kWsMarginSourceBackdrop)),
+        u64(horizontal(1, gba::kWsMarginTracePillarbox,
+                        gba::kWsMarginSourcePillarbox)));
+}
+
+void golden_sun_wide_margin_diagnostics_callback(
+    const gba::WsMarginDiagnostics& sample) {
+    if (!golden_sun_wide_diagnostics_enabled()) return;
+    ++g_golden_sun_margin_diagnostic_callbacks;
+    g_golden_sun_margin_diagnostic_last = sample;
+    accumulate_golden_sun_margin_diagnostics(
+        g_golden_sun_margin_diagnostic_total, sample);
+    const std::uint64_t frame = runtime_current_frame();
+    if (g_golden_sun_margin_diagnostic_logged >= 32u ||
+        (g_golden_sun_margin_diagnostic_last_log_frame != UINT64_MAX &&
+         frame < g_golden_sun_margin_diagnostic_last_log_frame + 120u)) {
+        return;
+    }
+    ++g_golden_sun_margin_diagnostic_logged;
+    g_golden_sun_margin_diagnostic_last_log_frame = frame;
+    report_golden_sun_margin_diagnostic_sample(frame, "frame", sample);
+}
+
+struct GoldenSunFieldTableStats {
+    std::uint64_t writes = 0;
+    std::uint64_t bytes = 0;
+    std::uint64_t first_frame = UINT64_MAX;
+    std::uint64_t last_frame = UINT64_MAX;
+    std::uint32_t first_pc = 0;
+    std::uint32_t last_pc = 0;
+};
+GoldenSunFieldTableStats g_golden_sun_field_map_writes;
+GoldenSunFieldTableStats g_golden_sun_field_raw_writes;
+GoldenSunFieldTableStats g_golden_sun_field_map_dma_writes;
+GoldenSunFieldTableStats g_golden_sun_field_raw_dma_writes;
+
+// The detailed per-store trace is intentionally capped at 64 records per
+// authentication epoch. That cap hid raw-table producers when map stores
+// arrived first, so keep a separate payload-free histogram/range summary keyed
+// by writer PC. It is bounded, reset per epoch, and diagnostics-only.
+constexpr std::size_t kGoldenSunFieldProducerLimit = 32u;
+struct GoldenSunFieldProducerStats {
+    bool used = false;
+    std::uint32_t pc = 0;
+    std::uint64_t writes = 0;
+    std::uint64_t bytes = 0;
+    std::uint64_t first_frame = UINT64_MAX;
+    std::uint64_t last_frame = UINT64_MAX;
+    std::uint32_t min_address = UINT32_MAX;
+    std::uint32_t max_end = 0;
+};
+std::array<GoldenSunFieldProducerStats, kGoldenSunFieldProducerLimit>
+    g_golden_sun_field_map_producers{};
+std::array<GoldenSunFieldProducerStats, kGoldenSunFieldProducerLimit>
+    g_golden_sun_field_raw_producers{};
+unsigned g_golden_sun_field_map_producer_overflow = 0;
+unsigned g_golden_sun_field_raw_producer_overflow = 0;
+
+void reset_golden_sun_field_producers() {
+    g_golden_sun_field_map_producers = {};
+    g_golden_sun_field_raw_producers = {};
+    g_golden_sun_field_map_producer_overflow = 0;
+    g_golden_sun_field_raw_producer_overflow = 0;
+}
+
+void record_golden_sun_field_producer(
+    std::array<GoldenSunFieldProducerStats, kGoldenSunFieldProducerLimit>&
+        producers,
+    unsigned* overflow, std::uint32_t pc, std::uint32_t address,
+    std::uint32_t size, std::uint64_t bytes, std::uint64_t frame) {
+    if (!overflow || size == 0u || bytes == 0u) return;
+    GoldenSunFieldProducerStats* producer = nullptr;
+    for (auto& candidate : producers) {
+        if (candidate.used && candidate.pc == pc) {
+            producer = &candidate;
+            break;
+        }
+    }
+    if (!producer) {
+        for (auto& candidate : producers) {
+            if (!candidate.used) {
+                candidate = {};
+                candidate.used = true;
+                candidate.pc = pc;
+                producer = &candidate;
+                break;
+            }
+        }
+    }
+    if (!producer) {
+        ++*overflow;
+        return;
+    }
+    const std::uint64_t end = static_cast<std::uint64_t>(address) + size;
+    ++producer->writes;
+    producer->bytes += bytes;
+    producer->first_frame = std::min(producer->first_frame, frame);
+    producer->last_frame = producer->writes == 1u
+        ? frame : std::max(producer->last_frame, frame);
+    producer->min_address = std::min(producer->min_address, address);
+    producer->max_end = static_cast<std::uint32_t>(std::min<std::uint64_t>(
+        end, UINT32_MAX));
+}
+
+void report_golden_sun_field_producers(const char* reason) {
+    if (!golden_sun_wide_diagnostics_enabled() || !reason) return;
+    const auto report = [&](const char* table,
+                            const auto& producers, unsigned overflow) {
+        for (const auto& producer : producers) {
+            if (!producer.used) continue;
+            std::fprintf(
+                stderr,
+                "[wide-field-producer] auth_epoch=%llu reason=%s "
+                "table=%s writer_pc=0x%08x writes=%llu bytes=%llu "
+                "addr=0x%08x..0x%08x frames=%llu..%llu\n",
+                static_cast<unsigned long long>(g_golden_sun_field_auth_epoch),
+                reason, table, producer.pc,
+                static_cast<unsigned long long>(producer.writes),
+                static_cast<unsigned long long>(producer.bytes),
+                producer.min_address, producer.max_end,
+                static_cast<unsigned long long>(producer.first_frame),
+                static_cast<unsigned long long>(producer.last_frame));
+        }
+        if (overflow != 0u) {
+            std::fprintf(stderr,
+                         "[wide-field-producer-overflow] auth_epoch=%llu "
+                         "reason=%s table=%s producers=%u\n",
+                         static_cast<unsigned long long>(
+                             g_golden_sun_field_auth_epoch),
+                         reason, table, overflow);
+        }
+    };
+    report("map", g_golden_sun_field_map_producers,
+           g_golden_sun_field_map_producer_overflow);
+    report("raw", g_golden_sun_field_raw_producers,
+           g_golden_sun_field_raw_producer_overflow);
+}
+
+std::uint64_t g_golden_sun_field_epoch_map_writes = 0;
+std::uint64_t g_golden_sun_field_epoch_raw_writes = 0;
+std::uint64_t g_golden_sun_field_epoch_map_dma_writes = 0;
+std::uint64_t g_golden_sun_field_epoch_raw_dma_writes = 0;
+unsigned g_golden_sun_field_table_cpu_logs_in_epoch = 0;
+unsigned g_golden_sun_field_table_dma_logs_in_epoch = 0;
+
+bool golden_sun_field_table_overlap(std::uint32_t address,
+                                    std::uint32_t size,
+                                    std::uint32_t table_start,
+                                    std::uint32_t table_end,
+                                    std::uint64_t* out_bytes) {
+    if (size == 0u || !out_bytes) return false;
+    const std::uint64_t first = address;
+    const std::uint64_t last = first + size;
+    const std::uint64_t lo = std::max<std::uint64_t>(first, table_start);
+    const std::uint64_t hi = std::min<std::uint64_t>(last, table_end);
+    if (hi <= lo) return false;
+    *out_bytes = hi - lo;
+    return true;
+}
+
+void record_golden_sun_field_table_write(std::uint32_t address,
+                                         std::uint32_t size) {
+    if (!golden_sun_wide_diagnostics_enabled() || size == 0u) return;
+    const std::uint64_t frame = runtime_current_frame();
+    const std::uint32_t pc = runtime_current_pc();
+    const auto record = [&](const char* table_name,
+                            std::uint32_t table_start,
+                            std::uint32_t table_end,
+                            GoldenSunFieldTableStats* stats,
+                            std::uint64_t* epoch_writes) {
+        std::uint64_t bytes = 0;
+        if (!golden_sun_field_table_overlap(
+                address, size, table_start, table_end, &bytes)) {
+            return;
+        }
+        ++stats->writes;
+        stats->bytes += bytes;
+        if (stats->first_frame == UINT64_MAX) {
+            stats->first_frame = frame;
+            stats->first_pc = pc;
+        }
+        stats->last_frame = frame;
+        stats->last_pc = pc;
+        ++*epoch_writes;
+        if (table_start == kGoldenSunFieldMapAddress) {
+            record_golden_sun_field_producer(
+                g_golden_sun_field_map_producers,
+                &g_golden_sun_field_map_producer_overflow, pc, address,
+                size, bytes, frame);
+        } else {
+            record_golden_sun_field_producer(
+                g_golden_sun_field_raw_producers,
+                &g_golden_sun_field_raw_producer_overflow, pc, address,
+                size, bytes, frame);
+        }
+        if (g_golden_sun_field_table_cpu_logs_in_epoch >=
+                kGoldenSunFieldTableCpuLogLimitPerEpoch) {
+            return;
+        }
+        ++g_golden_sun_field_table_cpu_logs_in_epoch;
+        std::fprintf(
+            stderr,
+            "[wide-field-table] frame=%llu auth_epoch=%llu table=%s "
+            "writer_pc=0x%08x addr=0x%08x size=%u overlap=%llu reason=%s\n",
+            static_cast<unsigned long long>(frame),
+            static_cast<unsigned long long>(g_golden_sun_field_auth_epoch),
+            table_name, pc, address, size,
+            static_cast<unsigned long long>(bytes),
+            golden_sun_wide_policy_reason_name(
+                g_golden_sun_wide_policy_last_reason));
+    };
+    record("map", kGoldenSunFieldMapAddress,
+           kGoldenSunFieldMapAddress + 0x10000u,
+           &g_golden_sun_field_map_writes, &g_golden_sun_field_epoch_map_writes);
+    record("raw", kGoldenSunFieldRawAddress,
+           kGoldenSunFieldRawAddress + 0x8000u,
+           &g_golden_sun_field_raw_writes, &g_golden_sun_field_epoch_raw_writes);
+}
+
+bool golden_sun_dma_destination_bounds(std::uint32_t destination,
+                                       std::uint32_t bytes,
+                                       std::uint16_t control,
+                                       std::uint32_t* out_first,
+                                       std::uint32_t* out_size) {
+    if (!out_first || !out_size || bytes == 0u) return false;
+    const std::uint32_t step = (control & 0x0400u) != 0u ? 4u : 2u;
+    if (bytes < step || (bytes % step) != 0u) return false;
+    const std::uint32_t dest_control = (control >> 5) & 3u;
+    const std::uint64_t first = dest_control == 1u
+        ? (destination >= bytes - step
+              ? static_cast<std::uint64_t>(destination) - (bytes - step)
+              : 0u)
+        : destination;
+    const std::uint64_t last = dest_control == 2u
+        ? static_cast<std::uint64_t>(destination) + step
+        : (dest_control == 1u
+              ? static_cast<std::uint64_t>(destination) + step
+              : static_cast<std::uint64_t>(destination) + bytes);
+    if (last <= first || last > 0x100000000ull) return false;
+    *out_first = static_cast<std::uint32_t>(first);
+    *out_size = static_cast<std::uint32_t>(last - first);
+    return true;
+}
+
+void golden_sun_wide_dma_descriptor_observer(
+    int channel, std::uint32_t pc, std::uint32_t source,
+    std::uint32_t destination, std::uint32_t bytes, std::uint16_t control,
+    int start_mode) {
+    if (!golden_sun_wide_diagnostics_enabled()) return;
+    std::uint32_t first = 0;
+    std::uint32_t span = 0;
+    if (!golden_sun_dma_destination_bounds(
+            destination, bytes, control, &first, &span)) return;
+    const std::uint64_t frame = runtime_current_frame();
+    const auto record = [&](const char* table_name,
+                            std::uint32_t table_start,
+                            std::uint32_t table_end,
+                            GoldenSunFieldTableStats* stats,
+                            std::uint64_t* epoch_writes) {
+        std::uint64_t overlap = 0;
+        if (!golden_sun_field_table_overlap(
+                first, span, table_start, table_end, &overlap)) return;
+        ++stats->writes;
+        stats->bytes += overlap;
+        if (stats->first_frame == UINT64_MAX) {
+            stats->first_frame = frame;
+            stats->first_pc = pc;
+        }
+        stats->last_frame = frame;
+        stats->last_pc = pc;
+        ++*epoch_writes;
+        if (g_golden_sun_field_table_dma_logs_in_epoch >=
+                kGoldenSunFieldTableDmaLogLimitPerEpoch) return;
+        ++g_golden_sun_field_table_dma_logs_in_epoch;
+        std::fprintf(
+            stderr,
+            "[wide-field-table-dma] frame=%llu auth_epoch=%llu table=%s "
+            "writer_pc=0x%08x src=0x%08x dst=0x%08x size=%u "
+            "overlap=%llu channel=%d start_mode=%d cnt_h=0x%04x "
+            "reason=%s authored_cells=%u\n",
+            static_cast<unsigned long long>(frame),
+            static_cast<unsigned long long>(g_golden_sun_field_auth_epoch),
+            table_name, pc, source, destination, bytes,
+            static_cast<unsigned long long>(overlap), channel, start_mode,
+            control, golden_sun_wide_policy_reason_name(
+                         g_golden_sun_wide_policy_last_reason),
+            g_golden_sun_field_authored.authored_count());
+    };
+    record("map", kGoldenSunFieldMapAddress,
+           kGoldenSunFieldMapAddress + 0x10000u,
+           &g_golden_sun_field_map_dma_writes,
+           &g_golden_sun_field_epoch_map_dma_writes);
+    record("raw", kGoldenSunFieldRawAddress,
+           kGoldenSunFieldRawAddress + 0x8000u,
+           &g_golden_sun_field_raw_dma_writes,
+           &g_golden_sun_field_epoch_raw_dma_writes);
+}
+
+std::uint32_t golden_sun_field_table_crc(const std::uint8_t* ewram,
+                                         std::size_t offset,
+                                         std::size_t bytes) {
+    return ewram ? gba::crc32(ewram + offset, bytes) : 0u;
+}
+
+void trace_golden_sun_field_map(const std::uint8_t* ewram) {
+    if (!golden_sun_wide_diagnostics_enabled() ||
+        !ewram || g_golden_sun_wide_field_map_census.size() >= 16u) return;
+    const std::uint64_t frame = runtime_current_frame();
+    if (g_golden_sun_wide_field_map_trace_frame == frame) return;
+    g_golden_sun_wide_field_map_trace_frame = frame;
+    const std::uint32_t map_crc = golden_sun_field_table_crc(
+        ewram, kGoldenSunFieldMapOffset, kGoldenSunFieldMapBytes);
+    const std::uint32_t raw_crc = golden_sun_field_table_crc(
+        ewram, kGoldenSunFieldRawOffset, kGoldenSunFieldRawBytes);
+    for (const auto& census : g_golden_sun_wide_field_map_census) {
+        if (census.auth_epoch == g_golden_sun_field_auth_epoch &&
+            census.map_crc == map_crc && census.raw_crc == raw_crc) {
+            return;
+        }
+    }
+    g_golden_sun_wide_field_map_census.push_back(
+        {g_golden_sun_field_auth_epoch, map_crc, raw_crc});
+    std::array<std::uint16_t, 4096> counts{};
+    for (std::size_t i = 0; i < 128u * 128u; ++i) {
+        const std::size_t off = kGoldenSunFieldMapOffset + i * 4u;
+        const std::uint16_t id = static_cast<std::uint16_t>(
+            (static_cast<std::uint16_t>(ewram[off]) |
+             static_cast<std::uint16_t>(ewram[off + 1u] << 8)) & 0x0FFFu);
+        ++counts[id];
+    }
+    std::array<std::uint16_t, 4> top_ids{};
+    for (std::uint16_t id = 0; id < counts.size(); ++id) {
+        for (std::size_t rank = 0; rank < top_ids.size(); ++rank) {
+            if (counts[id] > counts[top_ids[rank]]) {
+                for (std::size_t j = top_ids.size() - 1u; j > rank; --j)
+                    top_ids[j] = top_ids[j - 1u];
+                top_ids[rank] = id;
+                break;
+            }
+        }
+    }
+    std::fprintf(stderr,
+        "[wide-field-map] frame=%llu auth_epoch=%llu auth_cells=%u "
+        "map_crc=%08x raw_crc=%08x top=%03x:%u,%03x:%u,%03x:%u,%03x:%u\n",
+        frame, static_cast<unsigned long long>(g_golden_sun_field_auth_epoch),
+        g_golden_sun_field_authored.authored_count(), map_crc, raw_crc,
+        top_ids[0], counts[top_ids[0]], top_ids[1], counts[top_ids[1]],
+        top_ids[2], counts[top_ids[2]], top_ids[3], counts[top_ids[3]]);
+}
+
+void trace_golden_sun_wide_scene(std::uint16_t dispcnt,
+                                 const std::uint8_t* io,
+                                 unsigned flags) {
+    if (!golden_sun_wide_diagnostics_enabled() || !g_ws_active || !io ||
+        g_golden_sun_wide_scene_signatures.size() >= 64u)
+        return;
+    std::uint64_t hash = 1469598103934665603ull;
+    const auto mix = [&](std::uint16_t value) {
+        hash ^= value;
+        hash *= 1099511628211ull;
+    };
+    // Deduplicate scene evidence by raster configuration and coarse camera
+    // position. Raw scroll values change every frame while walking and used
+    // to consume the entire 64-entry bound before a later scene was reached.
+    mix(dispcnt);
+    mix(static_cast<std::uint16_t>(flags));
+    for (std::size_t off = 0x08u; off <= 0x0Eu; off += 2u)
+        mix(gsr::widescreen::read_io16(io, off));
+    for (std::size_t off = 0x14u; off <= 0x1Eu; off += 2u)
+        mix(static_cast<std::uint16_t>(
+            gsr::widescreen::read_io16(io, off) & ~0x001Fu));
+    if (std::find(g_golden_sun_wide_scene_signatures.begin(),
+                  g_golden_sun_wide_scene_signatures.end(), hash) !=
+        g_golden_sun_wide_scene_signatures.end()) {
+        return;
+    }
+    g_golden_sun_wide_scene_signatures.push_back(hash);
+    std::fprintf(stderr,
+        "[wide-scene] frame=%llu dispcnt=%04x flags=%x "
+        "bgcnt=%04x/%04x/%04x/%04x scroll=%04x,%04x/%04x,%04x/%04x,%04x\n",
+        runtime_current_frame(), dispcnt, flags,
+        gsr::widescreen::read_io16(io, 0x08u),
+        gsr::widescreen::read_io16(io, 0x0Au),
+        gsr::widescreen::read_io16(io, 0x0Cu),
+        gsr::widescreen::read_io16(io, 0x0Eu),
+        gsr::widescreen::read_io16(io, 0x14u),
+        gsr::widescreen::read_io16(io, 0x16u),
+        gsr::widescreen::read_io16(io, 0x18u),
+        gsr::widescreen::read_io16(io, 0x1Au),
+        gsr::widescreen::read_io16(io, 0x1Cu),
+        gsr::widescreen::read_io16(io, 0x1Eu));
+}
+
+void trace_golden_sun_wide_policy_sample(
+    std::uint64_t frame, std::uint16_t dispcnt, const std::uint8_t* io,
+    unsigned flags, GoldenSunWidePolicyReason reason) {
+    if (!golden_sun_wide_diagnostics_enabled() ||
+        g_golden_sun_wide_policy_sample_end_frame == UINT64_MAX ||
+        frame > g_golden_sun_wide_policy_sample_end_frame ||
+        g_golden_sun_wide_policy_samples_in_window >=
+            kGoldenSunWidePolicySampleLimit ||
+        g_golden_sun_wide_policy_sample_frame == frame) {
+        return;
+    }
+    g_golden_sun_wide_policy_sample_frame = frame;
+    ++g_golden_sun_wide_policy_samples_in_window;
+    ++g_golden_sun_wide_policy_sample_count;
+    const auto read = [&](std::size_t offset) -> std::uint16_t {
+        return io ? gsr::widescreen::read_io16(io, offset) : 0u;
+    };
+    const std::uint16_t bg1_hofs = read(0x14u);
+    const std::uint16_t bg1_vofs = read(0x16u);
+    const std::uint16_t bg2_hofs = read(0x18u);
+    const std::uint16_t bg2_vofs = read(0x1Au);
+    const std::uint16_t bg3_hofs = read(0x1Cu);
+    const std::uint16_t bg3_vofs = read(0x1Eu);
+    std::uint32_t map_crc = 0;
+    std::uint32_t raw_crc = 0;
+    if (const gba::GbaBus* bus = gbarecomp::active_bus()) {
+        const std::uint8_t* ewram = bus->ewram_ptr();
+        map_crc = golden_sun_field_table_crc(
+            ewram, kGoldenSunFieldMapOffset, kGoldenSunFieldMapBytes);
+        raw_crc = golden_sun_field_table_crc(
+            ewram, kGoldenSunFieldRawOffset, kGoldenSunFieldRawBytes);
+        // Reuse the existing bounded census/top-ID trace. It records no map
+        // bytes and deduplicates by auth epoch plus both table CRCs.
+        trace_golden_sun_field_map(ewram);
+    }
+    std::fprintf(
+        stderr,
+        "[wide-policy-sample] frame=%llu transition=%llu sample=%u "
+        "reason=%s flags=%x dispcnt=%04x "
+        "bgcnt=%04x/%04x/%04x/%04x "
+        "raw_scroll=%04x,%04x/%04x,%04x/%04x,%04x "
+        "effective_scroll=%03x,%03x/%03x,%03x/%03x,%03x "
+        "auth_epoch=%llu auth_cells=%u map_crc=%08x raw_crc=%08x "
+        "map_writes=%llu raw_writes=%llu epoch_map_writes=%llu "
+        "epoch_raw_writes=%llu epoch_map_dma=%llu epoch_raw_dma=%llu\n",
+        static_cast<unsigned long long>(frame),
+        static_cast<unsigned long long>(g_golden_sun_wide_policy_sample_transition),
+        g_golden_sun_wide_policy_samples_in_window,
+        golden_sun_wide_policy_reason_name(reason), flags, dispcnt,
+        read(0x08u), read(0x0Au), read(0x0Cu), read(0x0Eu),
+        bg1_hofs, bg1_vofs, bg2_hofs, bg2_vofs, bg3_hofs, bg3_vofs,
+        bg1_hofs & 0x01FFu, bg1_vofs & 0x01FFu,
+        bg2_hofs & 0x01FFu, bg2_vofs & 0x01FFu,
+        bg3_hofs & 0x01FFu, bg3_vofs & 0x01FFu,
+        static_cast<unsigned long long>(g_golden_sun_field_auth_epoch),
+        g_golden_sun_field_authored.authored_count(), map_crc, raw_crc,
+        static_cast<unsigned long long>(g_golden_sun_field_map_writes.writes),
+        static_cast<unsigned long long>(g_golden_sun_field_raw_writes.writes),
+        static_cast<unsigned long long>(g_golden_sun_field_epoch_map_writes),
+        static_cast<unsigned long long>(g_golden_sun_field_epoch_raw_writes),
+        static_cast<unsigned long long>(
+            g_golden_sun_field_epoch_map_dma_writes),
+        static_cast<unsigned long long>(
+            g_golden_sun_field_epoch_raw_dma_writes));
+}
+
+void trace_golden_sun_wide_policy(std::uint16_t dispcnt,
+                                  const std::uint8_t* io,
+                                  unsigned flags,
+                                  GoldenSunWidePolicyReason reason) {
+    if (!golden_sun_wide_diagnostics_enabled()) return;
+    const std::uint64_t frame = runtime_current_frame();
+    const bool changed = !g_golden_sun_wide_policy_seen ||
+        g_golden_sun_wide_policy_last_flags != flags ||
+        g_golden_sun_wide_policy_last_reason != reason;
+    if (changed) {
+        const char* previous = g_golden_sun_wide_policy_seen
+            ? golden_sun_wide_policy_reason_name(
+                  g_golden_sun_wide_policy_last_reason)
+            : "none";
+        ++g_golden_sun_wide_policy_transition_count;
+        g_golden_sun_wide_policy_last_flags = flags;
+        g_golden_sun_wide_policy_last_reason = reason;
+        g_golden_sun_wide_policy_seen = true;
+        if (g_golden_sun_wide_policy_logged_transitions <
+                kGoldenSunWidePolicyTransitionLimit) {
+            ++g_golden_sun_wide_policy_logged_transitions;
+            g_golden_sun_wide_policy_sample_transition =
+                g_golden_sun_wide_policy_transition_count;
+            g_golden_sun_wide_policy_sample_frame = UINT64_MAX;
+            g_golden_sun_wide_policy_samples_in_window = 0;
+            g_golden_sun_wide_policy_sample_end_frame =
+                frame + kGoldenSunWidePolicySampleLimit - 1u;
+            const auto read = [&](std::size_t offset) -> std::uint16_t {
+                return io ? gsr::widescreen::read_io16(io, offset) : 0u;
+            };
+            std::fprintf(
+                stderr,
+                "[wide-policy] frame=%llu transition=%llu from=%s to=%s "
+                "flags=%x dispcnt=%04x bgcnt=%04x/%04x/%04x/%04x "
+                "raw_scroll=%04x,%04x/%04x,%04x/%04x,%04x "
+                "effective_scroll=%03x,%03x/%03x,%03x/%03x,%03x "
+                "auth_epoch=%llu\n",
+                static_cast<unsigned long long>(frame),
+                static_cast<unsigned long long>(
+                    g_golden_sun_wide_policy_transition_count), previous,
+                golden_sun_wide_policy_reason_name(reason), flags, dispcnt,
+                read(0x08u), read(0x0Au), read(0x0Cu), read(0x0Eu),
+                read(0x14u), read(0x16u), read(0x18u), read(0x1Au),
+                read(0x1Cu), read(0x1Eu), read(0x14u) & 0x01FFu,
+                read(0x16u) & 0x01FFu, read(0x18u) & 0x01FFu,
+                read(0x1Au) & 0x01FFu, read(0x1Cu) & 0x01FFu,
+                read(0x1Eu) & 0x01FFu,
+                static_cast<unsigned long long>(g_golden_sun_field_auth_epoch));
+        } else {
+            g_golden_sun_wide_policy_sample_end_frame = UINT64_MAX;
+        }
+    }
+    trace_golden_sun_wide_policy_sample(
+        frame, dispcnt, io, flags, reason);
+}
+
+void report_golden_sun_field_provider_trace(std::uint64_t frame,
+                                            const char* reason);
+
+using GoldenSunLiteralTrace = gsr::widescreen::GoldenSunLiteralTraceStats;
+
+std::array<GoldenSunLiteralTrace, 2> g_golden_sun_literal_trace{{
+    {gsr::widescreen::kFieldListXUpperLiteralPc},
+    {gsr::widescreen::kFieldListYLowerLiteralPc},
+}};
+
+void report_golden_sun_literal_trace(std::uint64_t frame,
+                                     const char* reason) {
+    if (!golden_sun_wide_diagnostics_enabled() || !reason) return;
+    for (const auto& stat : g_golden_sun_literal_trace) {
+        const std::uint32_t min_original = stat.calls != 0u
+            ? stat.min_original : 0u;
+        std::fprintf(
+            stderr,
+            "[wide-literal] frame=%llu auth_epoch=%llu reason=%s "
+            "pc=0x%08x calls=%llu overrides=%llu gate_rejects=%llu "
+            "compare_rejects=%llu original=0x%08x..0x%08x\n",
+            static_cast<unsigned long long>(frame),
+            static_cast<unsigned long long>(g_golden_sun_field_auth_epoch),
+            reason, stat.pc, static_cast<unsigned long long>(stat.calls),
+            static_cast<unsigned long long>(stat.overrides),
+            static_cast<unsigned long long>(stat.gate_rejects),
+            static_cast<unsigned long long>(stat.compare_rejects),
+            min_original, stat.calls != 0u ? stat.max_original : 0u);
+    }
+}
+
+void report_golden_sun_wide_diagnostics_at_exit() {
+    if (!golden_sun_wide_diagnostics_enabled()) return;
+    if (g_golden_sun_margin_diagnostic_callbacks != 0u) {
+        std::fprintf(
+            stderr,
+            "[wide-margin-summary] callbacks=%llu logged=%llu\n",
+            static_cast<unsigned long long>(
+                g_golden_sun_margin_diagnostic_callbacks),
+            static_cast<unsigned long long>(g_golden_sun_margin_diagnostic_logged));
+        report_golden_sun_margin_diagnostic_sample(
+            runtime_current_frame(), "summary", g_golden_sun_margin_diagnostic_total);
+    }
+    gba::vram_trace::OamShadowTraceStats oam_shadow{};
+    gba::vram_trace::OamDmaTraceStats oam_dma{};
+    gba::vram_trace::get_oam_shadow_trace_stats(&oam_shadow);
+    gba::vram_trace::get_oam_dma_trace_stats(&oam_dma);
+    std::fprintf(
+        stderr,
+        "[oam-shadow-summary] writes=%llu bytes=%llu slot_events=%llu "
+        "dma_writes=%llu dma_bytes=%llu "
+        "slot_overwrites=%llu unique_slots=%llu overwritten_slots=%llu "
+        "records_dropped=%llu\n",
+        static_cast<unsigned long long>(oam_shadow.write_calls),
+        static_cast<unsigned long long>(oam_shadow.bytes),
+        static_cast<unsigned long long>(oam_shadow.slot_write_events),
+        static_cast<unsigned long long>(oam_shadow.dma_write_calls),
+        static_cast<unsigned long long>(oam_shadow.dma_bytes),
+        static_cast<unsigned long long>(oam_shadow.slot_overwrite_events),
+        static_cast<unsigned long long>(oam_shadow.unique_slots),
+        static_cast<unsigned long long>(oam_shadow.overwritten_slots),
+        static_cast<unsigned long long>(oam_shadow.records_dropped));
+    std::fprintf(
+        stderr,
+        "[oam-dma-summary] transfers=%llu bytes=%llu used_slots=%llu "
+        "visible_slots=%llu nonzero_slots=%llu records_dropped=%llu "
+        "last_src=0x%08x last_dst=0x%08x last_size=%u last_used=%u "
+        "last_visible=%u last_nonzero=%u last_raw_x_ge_240=%u "
+        "last_raw_y_ge_160=%u\n",
+        static_cast<unsigned long long>(oam_dma.transfers),
+        static_cast<unsigned long long>(oam_dma.bytes),
+        static_cast<unsigned long long>(oam_dma.used_slot_total),
+        static_cast<unsigned long long>(oam_dma.visible_slot_total),
+        static_cast<unsigned long long>(oam_dma.nonzero_slot_total),
+        static_cast<unsigned long long>(oam_dma.records_dropped),
+        oam_dma.last_source, oam_dma.last_destination, oam_dma.last_size,
+        oam_dma.last_used_slots, oam_dma.last_visible_slots,
+        oam_dma.last_nonzero_slots, oam_dma.last_raw_x_ge_240,
+        oam_dma.last_raw_y_ge_160);
+    std::fprintf(
+        stderr,
+        "[wide-policy-summary] frame=%llu transitions=%llu logged=%llu "
+        "samples=%llu auth_epoch=%llu final_reason=%s final_flags=%x\n",
+        static_cast<unsigned long long>(runtime_current_frame()),
+        static_cast<unsigned long long>(g_golden_sun_wide_policy_transition_count),
+        static_cast<unsigned long long>(g_golden_sun_wide_policy_logged_transitions),
+        static_cast<unsigned long long>(g_golden_sun_wide_policy_sample_count),
+        static_cast<unsigned long long>(g_golden_sun_field_auth_epoch),
+        golden_sun_wide_policy_reason_name(g_golden_sun_wide_policy_last_reason),
+        g_golden_sun_wide_policy_last_flags);
+    report_golden_sun_field_provider_trace(runtime_current_frame(), "exit");
+    report_golden_sun_field_producers("exit");
+    report_golden_sun_literal_trace(runtime_current_frame(), "exit");
+    std::fprintf(
+        stderr,
+        "[wide-field-table-summary] map_writes=%llu map_bytes=%llu "
+        "map_first_frame=%llu map_first_pc=0x%08x map_last_frame=%llu "
+        "map_last_pc=0x%08x raw_writes=%llu raw_bytes=%llu "
+        "raw_first_frame=%llu raw_first_pc=0x%08x raw_last_frame=%llu "
+        "raw_last_pc=0x%08x auth_cells=%u\n",
+        static_cast<unsigned long long>(g_golden_sun_field_map_writes.writes),
+        static_cast<unsigned long long>(g_golden_sun_field_map_writes.bytes),
+        static_cast<unsigned long long>(g_golden_sun_field_map_writes.first_frame),
+        g_golden_sun_field_map_writes.first_pc,
+        static_cast<unsigned long long>(g_golden_sun_field_map_writes.last_frame),
+        g_golden_sun_field_map_writes.last_pc,
+        static_cast<unsigned long long>(g_golden_sun_field_raw_writes.writes),
+        static_cast<unsigned long long>(g_golden_sun_field_raw_writes.bytes),
+        static_cast<unsigned long long>(g_golden_sun_field_raw_writes.first_frame),
+        g_golden_sun_field_raw_writes.first_pc,
+        static_cast<unsigned long long>(g_golden_sun_field_raw_writes.last_frame),
+        g_golden_sun_field_raw_writes.last_pc,
+        g_golden_sun_field_authored.authored_count());
+    std::fprintf(
+        stderr,
+        "[wide-field-table-dma-summary] map_writes=%llu map_bytes=%llu "
+        "raw_writes=%llu raw_bytes=%llu epoch_map_writes=%llu "
+        "epoch_raw_writes=%llu authored_cells=%u\n",
+        static_cast<unsigned long long>(
+            g_golden_sun_field_map_dma_writes.writes),
+        static_cast<unsigned long long>(
+            g_golden_sun_field_map_dma_writes.bytes),
+        static_cast<unsigned long long>(
+            g_golden_sun_field_raw_dma_writes.writes),
+        static_cast<unsigned long long>(
+            g_golden_sun_field_raw_dma_writes.bytes),
+        static_cast<unsigned long long>(
+            g_golden_sun_field_epoch_map_dma_writes),
+        static_cast<unsigned long long>(
+            g_golden_sun_field_epoch_raw_dma_writes),
+        g_golden_sun_field_authored.authored_count());
+}
+
+void report_golden_sun_field_provider_trace(std::uint64_t frame,
+                                            const char* reason) {
+    if (!golden_sun_wide_diagnostics_enabled()) return;
+    for (std::size_t bg = 0; bg < g_golden_sun_field_provider_trace.size();
+         ++bg) {
+        const GoldenSunFieldProviderTrace& stat =
+            g_golden_sun_field_provider_trace[bg];
+        const std::int32_t min_x = stat.calls != 0u ? stat.min_x : 0;
+        const std::int32_t max_x = stat.calls != 0u ? stat.max_x : 0;
+        const std::int32_t min_y = stat.calls != 0u ? stat.min_y : 0;
+        const std::int32_t max_y = stat.calls != 0u ? stat.max_y : 0;
+        std::fprintf(
+            stderr,
+            "[wide-field-provider] frame=%llu auth_epoch=%llu reason=%s "
+            "bg=%zu calls=%llu equal=%llu split=%llu replacements=%llu "
+            "unavailable=%llu precondition=%llu boundary=%llu raw=%llu "
+            "lookup_miss=%llu coord=%d..%d,%d..%d\n",
+            static_cast<unsigned long long>(frame),
+            static_cast<unsigned long long>(g_golden_sun_field_auth_epoch),
+            reason, bg, static_cast<unsigned long long>(stat.calls),
+            static_cast<unsigned long long>(stat.equal_scroll_calls),
+            static_cast<unsigned long long>(stat.split_scroll_calls),
+            static_cast<unsigned long long>(stat.replacements),
+            static_cast<unsigned long long>(stat.unavailable),
+            static_cast<unsigned long long>(stat.precondition_rejects),
+            static_cast<unsigned long long>(stat.boundary_rejects),
+            static_cast<unsigned long long>(stat.raw_unavailable),
+            static_cast<unsigned long long>(stat.lookup_misses), min_x,
+            max_x, min_y, max_y);
+    }
+}
+
+void maybe_report_golden_sun_cull_trace();
+
+unsigned golden_sun_wide_margin_policy_callback(
+    std::uint16_t dispcnt, const std::uint8_t* io) {
+    maybe_report_golden_sun_cull_trace();
+    const GoldenSunWidePolicyReason reason =
+        gsr::widescreen::golden_sun_wide_margin_policy_reason(dispcnt, io);
+    const GoldenSunWidePolicyReason split_reason =
+        gsr::widescreen::golden_sun_mode0_split_scroll_policy_reason(
+            dispcnt, io);
+    const unsigned generic_flags =
+        gsr::widescreen::golden_sun_wide_margin_policy(
+        dispcnt, io);
+    const bool split_row = split_reason ==
+        GoldenSunWidePolicyReason::AuthorizedMode0SplitScroll;
+    // The runtime calls this policy once for each authentic visible raster
+    // line. Signed top/bottom rows are synthesized later from the latched
+    // edge state and must not make a clean guest frame impossible to complete.
+    const std::uint32_t expected_rows = gsr::widescreen::kNativeHeight;
+    const bool split_frame_authorized =
+        g_golden_sun_mode0_split_scroll_frame.observe(
+            runtime_current_frame(), split_row, expected_rows);
+    const unsigned flags = split_frame_authorized ? 0u : generic_flags;
+    trace_golden_sun_wide_scene(dispcnt, io, flags);
+    if (io) {
+        std::memcpy(g_golden_sun_wide_line_io.data(), io,
+                    g_golden_sun_wide_line_io.size());
+        g_golden_sun_wide_line_io_valid = true;
+        g_golden_sun_wide_line_dispcnt = dispcnt;
+    } else {
+        g_golden_sun_wide_line_io_valid = false;
+        g_golden_sun_wide_line_dispcnt = 0;
+    }
+    // The BG X-provider has no IO arguments. Publish this per-scanline scene
+    // bit immediately before the PPU invokes it; invalid/transition frames
+    // therefore cannot inherit Mode 0 cutoff behavior.
+    // Equal-scroll field/object authorization remains separate from the
+    // complete-frame Palace split-scroll authorization. In particular, a
+    // split-scroll frame must not inherit the equal-scroll object's culls.
+    g_golden_sun_mode0_field =
+        reason == GoldenSunWidePolicyReason::AuthorizedMode0;
+    g_golden_sun_mode0_split_scroll = split_frame_authorized;
+    // The metatile table's "authored" bitmap is keyed to this exact scene
+    // signal: every area entry passes through a non-field frame (loading,
+    // fade, or a differently-classified scene), so clearing here on the way
+    // out reliably invalidates stale content before the new area's row/
+    // column writers repopulate it. Edge-detected so the (2KiB) clear runs
+    // once per transition, not every non-field scanline.
+    if (!g_golden_sun_mode0_field) {
+        if (!g_golden_sun_field_authored_reset_done) {
+            g_golden_sun_field_authored.reset();
+            begin_golden_sun_field_auth_epoch();
+            g_golden_sun_field_authored_reset_done = true;
+        }
+    } else {
+        g_golden_sun_field_authored_reset_done = false;
+    }
+    // Func_b168 is measured in both the equal-scroll field and the two stable
+    // Palace intervals. Keep object authorization narrower than generic Mode 0
+    // by sharing only these authenticated map classes.
+    g_golden_sun_expanded_obj_scene = g_golden_sun_mode0_field ||
+        g_golden_sun_mode0_split_scroll;
+    const GoldenSunWidePolicyReason effective_reason = split_frame_authorized
+        ? split_reason : reason;
+    trace_golden_sun_wide_policy(dispcnt, io, flags, effective_reason);
+    return flags;
+}
+
+int golden_sun_wide_tilemap_provider(int bg, int hw_x, int screen_y,
+                                     std::uint16_t* out_entry) {
+    const gba::GbaBus* bus = gbarecomp::active_bus();
+    const bool equal_scroll_field = g_golden_sun_mode0_field;
+    const bool split_scroll_palace = g_golden_sun_mode0_split_scroll;
+
+    GoldenSunFieldProviderTrace* trace = nullptr;
+    if (golden_sun_wide_diagnostics_enabled() && bg >= 0 && bg < 4) {
+        trace = &g_golden_sun_field_provider_trace[
+            static_cast<std::size_t>(bg)];
+        ++trace->calls;
+        if (equal_scroll_field) ++trace->equal_scroll_calls;
+        else if (split_scroll_palace) ++trace->split_scroll_calls;
+        trace->min_x = std::min(trace->min_x,
+                                static_cast<std::int32_t>(hw_x));
+        trace->max_x = std::max(trace->max_x,
+                                static_cast<std::int32_t>(hw_x));
+        trace->min_y = std::min(trace->min_y,
+                                static_cast<std::int32_t>(screen_y));
+        trace->max_y = std::max(trace->max_y,
+                                static_cast<std::int32_t>(screen_y));
+    }
+    const auto reject = [&](bool precondition, bool boundary, bool raw,
+                            bool lookup_miss) {
+        if (trace) {
+            ++trace->unavailable;
+            if (precondition) ++trace->precondition_rejects;
+            if (boundary) ++trace->boundary_rejects;
+            if (raw) ++trace->raw_unavailable;
+            if (lookup_miss) ++trace->lookup_misses;
+        }
+        return gba::kWsTilemapUnavailable;
+    };
+    const auto replace = [&] {
+        if (trace) ++trace->replacements;
+        return gba::kWsTilemapReplace;
+    };
+    if (!g_ws_active || (!equal_scroll_field && !split_scroll_palace) ||
+        !g_golden_sun_wide_line_io_valid) {
+        return reject(true, false, false, false);
+    }
+    // This is a presentation-time read of the already-active EWRAM image.
+    // It does not use bus_read_* and therefore cannot mutate guest timing or
+    // device state while the PPU is compositing the scanline.
+    if (!bus) {
+        return reject(true, false, false, false);
+    }
+    trace_golden_sun_field_map(bus->ewram_ptr());
+
+    if (equal_scroll_field) {
+        // If BG3 says this coordinate is un-authored, suppress every equal-
+        // scroll field BG here. Otherwise BG1/BG2 can expose unrelated atlas
+        // tiles underneath the rejected BG3 sample.
+        std::uint16_t boundary_entry = 0;
+        gsr::widescreen::GoldenSunFieldTilemapMetadata boundary_metadata;
+        const bool boundary_resolved =
+            gsr::widescreen::golden_sun_field_tilemap_entry(
+                g_golden_sun_wide_line_dispcnt,
+                g_golden_sun_wide_line_io.data(),
+                g_golden_sun_wide_line_io.size(), bus->ewram_ptr(),
+                256u * 1024u, 3, hw_x, screen_y, &boundary_entry,
+                &boundary_metadata);  // authored-gate disabled: see below.
+        if (gsr::widescreen::golden_sun_field_atlas_unavailable(
+                boundary_metadata)) {
+            return reject(false, true, true, false);
+        }
+
+        if (bg == 3) {
+            if (boundary_resolved) *out_entry = boundary_entry;
+            return boundary_resolved ? replace()
+                                     : reject(false, false, false, true);
+        }
+    }
+
+    gsr::widescreen::GoldenSunFieldTilemapMetadata metadata;
+    const bool resolved = gsr::widescreen::golden_sun_field_tilemap_entry(
+                g_golden_sun_wide_line_dispcnt,
+                g_golden_sun_wide_line_io.data(),
+                g_golden_sun_wide_line_io.size(), bus->ewram_ptr(),
+                256u * 1024u, bg, hw_x, screen_y, out_entry, &metadata,
+                nullptr, false, split_scroll_palace);
+    // Equal-scroll BG3 is the cross-layer boundary oracle above. Palace's
+    // split-scroll class deliberately does not use BG3 for BG1/BG2; every
+    // layer still rejects its own measured unavailable source and bad bounds.
+    if (gsr::widescreen::golden_sun_field_atlas_unavailable(metadata)) {
+        return reject(false, false, true, false);
+    }
+    return resolved ? replace() : reject(false, false, false, true);
+}
+
+int golden_sun_wide_bg_x_provider(
+    int bg, int output_x,
+    int screen_y,  // Arrives in hardware space from the PPU: native rows are
+                   // 0..159, margins are negative (top) or >=160 (bottom).
+    int*) {
+    // This provider is only for the expanded output. The runtime leaves
+    // game-owned hooks installed across a live toggle, so avoid touching the
+    // native/supersampled path while the view is back at 240 pixels.
+    if (!g_ws_active) return 0;
+    // golden_sun_suppress_bg0_margin expects canvas-space Y (0..extra_top +
+    // 160 + extra_bottom, native window at [extra_top, extra_top+160)) to
+    // match output_x's canvas space, so shift hardware-space screen_y here.
+    const int canvas_y =
+        screen_y + static_cast<int>(g_golden_sun_wide_extra_top);
+    if (gsr::widescreen::golden_sun_suppress_bg0_margin(
+            bg, output_x, canvas_y, g_golden_sun_wide_extra_left,
+            g_golden_sun_wide_extra_right, g_golden_sun_wide_extra_top,
+            g_golden_sun_wide_extra_bottom)) {
+        return -1;
+    }
+    return 0;
+}
+
+int golden_sun_wide_obj_x_provider(int raw_x, int* out_x) {
+    // The GBA OBJ X field is nine bits and normally decodes 0x100..0x1FF as
+    // -256..-1.  Golden Sun's town field is already scene-authenticated by
+    // the margin policy; reinterpret only the raw values needed to cover the
+    // widened right edge.  Values outside that exact 24px envelope retain the
+    // hardware signed decode, and non-field scenes never opt into this hook.
+    if (!g_ws_active || !out_x ||
+        !gsr::widescreen::golden_sun_field_obj_x_authorized(
+            g_golden_sun_expanded_obj_scene, raw_x,
+            g_golden_sun_wide_extra_right)) {
+        return 0;
+    }
+    *out_x = raw_x;
+    return 1;
+}
+
+void clear_golden_sun_obj_y_provenance() {
+    g_golden_sun_obj_y_provenance.fill({});
+}
+
+void record_golden_sun_obj_y_provenance(std::uint32_t instruction_pc,
+                                        std::uint32_t pre_truncation_y) {
+    if (!g_ws_active || !g_golden_sun_expanded_obj_scene ||
+        g_golden_sun_wide_extra_bottom == 0u ||
+        (instruction_pc != 0x0800B27Cu &&
+         instruction_pc != 0x0800B326u)) {
+        return;
+    }
+    const int limit = gsr::widescreen::golden_sun_field_obj_bottom_cull_limit(
+        g_golden_sun_wide_extra_bottom);
+    if (pre_truncation_y < gsr::widescreen::kNativeHeight ||
+        pre_truncation_y > static_cast<std::uint32_t>(limit)) {
+        return;
+    }
+    const std::uint64_t address = static_cast<std::uint64_t>(g_cpu.R[7]) +
+        (instruction_pc == 0x0800B27Cu ? 16u : 4u);
+    if (address > UINT32_MAX) return;
+    const int slot = gsr::widescreen::golden_sun_oam_shadow_slot(
+        static_cast<std::uint32_t>(address));
+    if (slot < 0 || static_cast<std::size_t>(slot) >=
+                         g_golden_sun_obj_y_provenance.size()) {
+        return;
+    }
+    GoldenSunObjYProvenance& provenance =
+        g_golden_sun_obj_y_provenance[static_cast<std::size_t>(slot)];
+    provenance.valid = true;
+    provenance.raw_y = static_cast<std::uint8_t>(pre_truncation_y);
+    provenance.frame = runtime_current_frame();
+    provenance.auth_epoch = g_golden_sun_field_auth_epoch;
+}
+
+int golden_sun_wide_obj_attr_y_provider(int oam_index,
+                                        std::uint16_t attr0,
+                                        std::uint16_t,
+                                        std::uint16_t,
+                                        int* out_y) {
+    if (!g_ws_active || !g_golden_sun_expanded_obj_scene || !out_y ||
+        oam_index < 0 || static_cast<std::size_t>(oam_index) >=
+                              g_golden_sun_obj_y_provenance.size() ||
+        g_golden_sun_wide_extra_bottom == 0u) {
+        return 0;
+    }
+    const int raw_y = static_cast<int>(attr0 & 0x00FFu);
+    if (!gsr::widescreen::golden_sun_field_obj_y_expanded(
+            raw_y, g_golden_sun_wide_extra_top,
+            g_golden_sun_wide_extra_bottom)) {
+        return 0;
+    }
+    const GoldenSunObjYProvenance& provenance =
+        g_golden_sun_obj_y_provenance[static_cast<std::size_t>(oam_index)];
+    if (!provenance.valid ||
+        !gsr::widescreen::golden_sun_obj_provenance_frame_fresh(
+            provenance.frame, runtime_current_frame()) ||
+        provenance.auth_epoch != g_golden_sun_field_auth_epoch ||
+        provenance.raw_y != static_cast<std::uint8_t>(raw_y)) {
+        return 0;
+    }
+    *out_y = raw_y;
+    return 1;
+}
+
+struct GoldenSunCullTrace {
+    std::uint32_t pc;
+    // `calls` is the raw routed-PC count. It is intentionally recorded before
+    // the Mode-0/authentication guard so transition calls cannot disappear.
+    std::uint64_t calls = 0;
+    std::uint64_t overrides = 0;
+    std::uint64_t gate_rejects = 0;
+    std::int32_t min_coord = INT32_MAX;
+    std::int32_t max_coord = INT32_MIN;
+};
+
+std::array<GoldenSunCullTrace, 6> g_golden_sun_cull_trace{{
+    {0x0800B27Cu}, {0x0800B322u}, {0x0800B326u},
+    {0x0800B3CAu}, {0x0800B3D6u}, {0x0800B3EAu},
+}};
+
+std::uint64_t g_golden_sun_cull_last_report_frame = UINT64_MAX;
+
+void report_golden_sun_cull_trace(std::uint64_t frame,
+                                  const char* reason) {
+    if (!golden_sun_wide_diagnostics_enabled()) return;
+    // Emit every reviewed site, including zeroes. A zero for B3CA/B3D6/B3EA
+    // is evidence about the raw route rather than an artifact of the policy
+    // guard suppressing its counter.
+    for (const auto& stat : g_golden_sun_cull_trace) {
+        const std::int32_t min_coord = stat.calls != 0u ? stat.min_coord : 0;
+        const std::int32_t max_coord = stat.calls != 0u ? stat.max_coord : 0;
+        std::fprintf(
+            stderr,
+            "[wide-cull] frame=%llu auth_epoch=%llu reason=%s "
+            "pc=0x%08x calls=%llu overrides=%llu gate_rejects=%llu "
+            "coord=%d..%d\n",
+            static_cast<unsigned long long>(frame),
+            static_cast<unsigned long long>(g_golden_sun_field_auth_epoch),
+            reason, stat.pc,
+            static_cast<unsigned long long>(stat.calls),
+            static_cast<unsigned long long>(stat.overrides),
+            static_cast<unsigned long long>(stat.gate_rejects), min_coord,
+            max_coord);
+    }
+    report_golden_sun_literal_trace(frame, reason);
+}
+
+void begin_golden_sun_field_auth_epoch() {
+    if (golden_sun_wide_diagnostics_enabled()) {
+        report_golden_sun_cull_trace(runtime_current_frame(),
+                                     "auth-epoch-end");
+        report_golden_sun_field_provider_trace(runtime_current_frame(),
+                                               "auth-epoch-end");
+        report_golden_sun_field_producers("auth-epoch-end");
+    }
+    clear_golden_sun_obj_y_provenance();
+    reset_golden_sun_field_producers();
+    g_golden_sun_field_provider_trace = {};
+    for (auto& stat : g_golden_sun_cull_trace) {
+        const std::uint32_t pc = stat.pc;
+        stat = {};
+        stat.pc = pc;
+    }
+    for (auto& stat : g_golden_sun_literal_trace) {
+        const std::uint32_t pc = stat.pc;
+        stat = {};
+        stat.pc = pc;
+    }
+    ++g_golden_sun_field_auth_epoch;
+    g_golden_sun_field_epoch_map_writes = 0;
+    g_golden_sun_field_epoch_raw_writes = 0;
+    g_golden_sun_field_epoch_map_dma_writes = 0;
+    g_golden_sun_field_epoch_raw_dma_writes = 0;
+    g_golden_sun_field_table_cpu_logs_in_epoch = 0;
+    g_golden_sun_field_table_dma_logs_in_epoch = 0;
+    const bool vram_rearmed = gba::vram_trace::rearm_bounded_window();
+    if (golden_sun_wide_diagnostics_enabled()) {
+        std::fprintf(stderr,
+                     "[wide-auth-epoch] frame=%llu auth_epoch=%llu "
+                     "vram_trace_rearmed=%u\n",
+                     static_cast<unsigned long long>(runtime_current_frame()),
+                     static_cast<unsigned long long>(
+                         g_golden_sun_field_auth_epoch),
+                     vram_rearmed ? 1u : 0u);
+        // CRASH-03 provenance: re-CRC the pool-LDM stack window at every
+        // auth-epoch boundary so a stale-since-load window is visible in
+        // session logs without retaining guest bytes.
+        runtime_note_pool_ldm_epoch_crc();
+    }
+}
+
+void maybe_report_golden_sun_cull_trace() {
+    if (!golden_sun_wide_diagnostics_enabled()) return;
+    const std::uint64_t frame = runtime_current_frame();
+    // This callback runs once per scanline.  The object-scene bit can change
+    // between scanlines as DISPCNT transitions, so using it as an immediate
+    // report trigger floods stderr during map transitions and stalls the
+    // game thread.  Cull evidence is diagnostic only; sample it periodically.
+    if (g_golden_sun_cull_last_report_frame == UINT64_MAX) {
+        g_golden_sun_cull_last_report_frame = frame;
+        return;
+    }
+    if (frame < g_golden_sun_cull_last_report_frame + 120u) return;
+    report_golden_sun_cull_trace(frame, "periodic");
+    g_golden_sun_cull_last_report_frame = frame;
+}
+
+void report_golden_sun_cull_trace_at_exit() {
+    if (!golden_sun_wide_diagnostics_enabled()) return;
+    report_golden_sun_cull_trace(runtime_current_frame(), "exit");
+}
+
+void record_golden_sun_cull_trace(std::uint32_t pc) {
+    if (!golden_sun_wide_diagnostics_enabled()) return;
+    const int site = gsr::widescreen::golden_sun_cull_site_index(pc);
+    if (site < 0 || static_cast<std::size_t>(site) >=
+                         g_golden_sun_cull_trace.size()) {
+        return;
+    }
+    GoldenSunCullTrace& stat = g_golden_sun_cull_trace[
+        static_cast<std::size_t>(site)];
+    ++stat.calls;
+    std::int32_t coord = 0;
+    if (pc == 0x0800B322u) coord = static_cast<std::int32_t>(g_cpu.R[4]);
+    else if (pc == 0x0800B27Cu || pc == 0x0800B326u)
+        coord = static_cast<std::int32_t>(g_cpu.R[6]);
+    else if (pc == 0x0800B3D6u || pc == 0x0800B3EAu)
+        coord = static_cast<std::int32_t>(g_cpu.R[3]);
+    stat.min_coord = std::min(stat.min_coord, coord);
+    stat.max_coord = std::max(stat.max_coord, coord);
+}
+
+void record_golden_sun_cull_gate_reject(std::uint32_t pc) {
+    if (!golden_sun_wide_diagnostics_enabled()) return;
+    const int site = gsr::widescreen::golden_sun_cull_site_index(pc);
+    if (site < 0 || static_cast<std::size_t>(site) >=
+                         g_golden_sun_cull_trace.size()) {
+        return;
+    }
+    ++g_golden_sun_cull_trace[static_cast<std::size_t>(site)].gate_rejects;
+}
+
+void record_golden_sun_cull_override(std::uint32_t pc) {
+    if (!golden_sun_wide_diagnostics_enabled()) return;
+    const int site = gsr::widescreen::golden_sun_cull_site_index(pc);
+    if (site < 0 || static_cast<std::size_t>(site) >=
+                         g_golden_sun_cull_trace.size()) {
+        return;
+    }
+    ++g_golden_sun_cull_trace[static_cast<std::size_t>(site)].overrides;
+}
+
+// Func_b168's final field-object cull is the THUMB `cmp r4,#239` at this
+// exact ROM PC. The recompiler config routes only that immediate through the
+// hook; every other compare remains a literal. The margin policy's live
+// Mode-0 field bit is the same scene authentication used by the BG provider,
+// so battle/UI/transition objects retain the guest cutoff.
+int golden_sun_wide_obj_cull_immediate(std::uint32_t instruction_pc,
+                                       std::uint32_t original_value,
+                                       std::uint32_t* out_value) {
+    constexpr std::uint32_t kFieldObjXCullPc = 0x0800B322u;
+    // Count the exact configured route before the policy guard. The raw
+    // invocation count is diagnostic only; it must remain visible when a
+    // transition (such as Palace) correctly rejects the Mode-0 classifier.
+    record_golden_sun_cull_trace(instruction_pc);
+    // The config contract is Mode-0 expanded-view only.  Keep the immediate
+    // widening fail-closed until the same live scene authentication used by
+    // the field tile/object providers is present; otherwise a menu, battle,
+    // or transition can write coordinates that the faithful scene rejects.
+    const bool x_authorized =
+        gsr::widescreen::golden_sun_field_obj_cull_authorized(
+            g_golden_sun_expanded_obj_scene, instruction_pc, original_value,
+            g_golden_sun_wide_extra_right);
+    const bool y_authorized =
+        gsr::widescreen::golden_sun_field_obj_y_cull_authorized(
+            g_golden_sun_expanded_obj_scene, instruction_pc, original_value,
+            g_golden_sun_wide_extra_bottom);
+    if (!g_ws_active || !out_value || (!x_authorized && !y_authorized)) {
+        record_golden_sun_cull_gate_reject(instruction_pc);
+        return 0;
+    }
+    if (x_authorized && instruction_pc == kFieldObjXCullPc &&
+        original_value == 239u) {
+        *out_value = static_cast<std::uint32_t>(
+            gsr::widescreen::golden_sun_field_obj_right_cull_limit(
+                g_golden_sun_wide_extra_right));
+        record_golden_sun_cull_override(instruction_pc);
+        return 1;
+    }
+    if (y_authorized) {
+        *out_value = static_cast<std::uint32_t>(
+            gsr::widescreen::golden_sun_field_obj_bottom_cull_limit(
+                g_golden_sun_wide_extra_bottom));
+        // The compare sees the full screen Y before the accepted store
+        // truncates it to the low OAM byte. Record only this authenticated,
+        // address-validated producer so raw 160..255 can later be resolved
+        // without reinterpreting unrelated off-top sprites.
+        record_golden_sun_obj_y_provenance(instruction_pc, g_cpu.R[6]);
+        record_golden_sun_cull_override(instruction_pc);
+        return 1;
+    }
+    // 0x0800B27C/0x0800B326 are the only widened Y compares. B388 remains
+    // unchanged because its latest measured capture executed it zero times.
+    // The three Func_b388 routes remain installed for attribution, but the
+    // acceptance session executed none of them; do not infer a missing visual
+    // override from an unexecuted route.
+    return 0;
+}
+
+int golden_sun_wide_literal_override(std::uint32_t instruction_pc,
+                                     std::uint32_t original_value,
+                                     std::uint32_t* out_value) {
+    GoldenSunLiteralTrace* trace = nullptr;
+    const int trace_index = gsr::widescreen::golden_sun_literal_trace_index(
+        instruction_pc);
+    if (trace_index >= 0) {
+        trace = &g_golden_sun_literal_trace[static_cast<std::size_t>(
+            trace_index)];
+    }
+    const bool diagnostics = golden_sun_wide_diagnostics_enabled();
+    if (trace != nullptr && diagnostics) {
+        gsr::widescreen::golden_sun_literal_trace_call(*trace, original_value);
+    }
+    const auto gate_reject = [&] {
+        if (trace != nullptr && diagnostics) {
+            gsr::widescreen::golden_sun_literal_trace_gate_reject(*trace);
+        }
+        return 0;
+    };
+    const auto compare_reject = [&] {
+        if (trace != nullptr && diagnostics) {
+            gsr::widescreen::golden_sun_literal_trace_compare_reject(*trace);
+        }
+        return 0;
+    };
+    const auto accepted = [&] {
+        if (trace != nullptr && diagnostics) {
+            gsr::widescreen::golden_sun_literal_trace_override(*trace);
+        }
+        return 1;
+    };
+    if (!g_ws_active || !g_golden_sun_expanded_obj_scene || !out_value)
+        return gate_reject();
+    if (instruction_pc == gsr::widescreen::kFieldListXUpperLiteralPc) {
+        if (original_value != 0x012FFFFEu) return compare_reject();
+        if (g_golden_sun_wide_extra_right == 0u) return gate_reject();
+        *out_value = gsr::widescreen::golden_sun_field_list_x_upper_literal(
+            g_golden_sun_wide_extra_right);
+        return accepted();
+    }
+    if (instruction_pc == gsr::widescreen::kFieldListYLowerLiteralPc) {
+        if (original_value != 0xFFE00000u) return compare_reject();
+        if (g_golden_sun_wide_extra_top == 0u) return gate_reject();
+        *out_value = gsr::widescreen::golden_sun_field_list_y_lower_literal(
+            g_golden_sun_wide_extra_top);
+        return accepted();
+    }
+    return gate_reject();
+}
+
+void golden_sun_wide_ewram_write_observer(std::uint32_t address,
+                                          std::uint32_t size) {
+    // DMA has descriptor-level provenance and must not be misreported as a
+    // CPU store or establish authored-cell identity one copied unit at a time.
+    if (gba::vram_trace::dma_active()) return;
+    // Keep this bitmap diagnostic-only. In particular, a loaded savestate can
+    // contain a populated table before any post-load CPU store repopulates
+    // the bitmap; the provider therefore remains explicitly unwired below.
+    g_golden_sun_field_authored.mark_write(address, size);
+    record_golden_sun_field_table_write(address, size);
+}
+
+void install_golden_sun_widescreen(std::uint32_t extra_left,
+                                   std::uint32_t extra_right,
+                                   std::uint32_t extra_top,
+                                   std::uint32_t extra_bottom) {
+    // run_game resets all game-owned PPU hooks before startup. This callback
+    // is reached only after an expanded view has been authorized and applied.
+    g_golden_sun_wide_extra_left = extra_left;
+    g_golden_sun_wide_extra_right = extra_right;
+    g_golden_sun_wide_extra_top = extra_top;
+    g_golden_sun_wide_extra_bottom = extra_bottom;
+    g_golden_sun_mode0_field = false;
+    g_golden_sun_mode0_split_scroll = false;
+    g_golden_sun_mode0_split_scroll_frame.reset();
+    g_golden_sun_expanded_obj_scene = false;
+    clear_golden_sun_obj_y_provenance();
+    g_golden_sun_wide_line_io_valid = false;
+    g_golden_sun_wide_line_dispcnt = 0;
+    g_golden_sun_field_authored.reset();
+    g_golden_sun_field_authored_reset_done = true;
+    g_golden_sun_wide_field_map_census.clear();
+    g_golden_sun_wide_field_map_trace_frame = UINT64_MAX;
+    g_golden_sun_field_auth_epoch = 0;
+    g_golden_sun_field_map_writes = {};
+    g_golden_sun_field_raw_writes = {};
+    g_golden_sun_field_map_dma_writes = {};
+    g_golden_sun_field_raw_dma_writes = {};
+    g_golden_sun_field_provider_trace = {};
+    reset_golden_sun_field_producers();
+    g_golden_sun_field_epoch_map_writes = 0;
+    g_golden_sun_field_epoch_raw_writes = 0;
+    g_golden_sun_field_epoch_map_dma_writes = 0;
+    g_golden_sun_field_epoch_raw_dma_writes = 0;
+    g_golden_sun_field_table_cpu_logs_in_epoch = 0;
+    g_golden_sun_field_table_dma_logs_in_epoch = 0;
+    gba::vram_trace::reset_oam_trace_window();
+    g_golden_sun_wide_policy_seen = false;
+    g_golden_sun_wide_policy_last_flags = gsr::widescreen::kPillarboxAll;
+    g_golden_sun_wide_policy_last_reason =
+        GoldenSunWidePolicyReason::UnsupportedMode;
+    g_golden_sun_wide_policy_transition_count = 0;
+    g_golden_sun_wide_policy_logged_transitions = 0;
+    g_golden_sun_wide_policy_sample_count = 0;
+    g_golden_sun_wide_policy_sample_frame = UINT64_MAX;
+    g_golden_sun_wide_policy_sample_end_frame = UINT64_MAX;
+    g_golden_sun_wide_policy_sample_transition = 0;
+    g_golden_sun_wide_policy_samples_in_window = 0;
+    g_golden_sun_margin_diagnostic_callbacks = 0;
+    g_golden_sun_margin_diagnostic_logged = 0;
+    g_golden_sun_margin_diagnostic_last_log_frame = UINT64_MAX;
+    g_golden_sun_margin_diagnostic_total = {};
+    g_golden_sun_margin_diagnostic_last = {};
+    for (auto& stat : g_golden_sun_literal_trace) {
+        const std::uint32_t pc = stat.pc;
+        stat = {};
+        stat.pc = pc;
+    }
+    static bool cull_report_armed = false;
+    if (!cull_report_armed) {
+        cull_report_armed = true;
+        std::atexit(report_golden_sun_cull_trace_at_exit);
+    }
+    static bool wide_report_armed = false;
+    if (!wide_report_armed) {
+        wide_report_armed = true;
+        std::atexit(report_golden_sun_wide_diagnostics_at_exit);
+    }
+    gba::g_ws_margin_policy =
+        golden_sun_wide_margin_policy_callback;
+    gba::g_ws_margin_diagnostics = golden_sun_wide_diagnostics_enabled()
+        ? golden_sun_wide_margin_diagnostics_callback : nullptr;
+    gba::g_ws_tilemap_provider = golden_sun_wide_tilemap_provider;
+    gba::g_ws_bg_x_provider = golden_sun_wide_bg_x_provider;
+    gba::g_ws_obj_x_provider = golden_sun_wide_obj_x_provider;
+    // Do not install the old raw-Y provider: 160..255 is dual-use. The rich
+    // hook below only reinterprets a slot with fresh writer provenance.
+    gba::g_ws_obj_y_provider = nullptr;
+    gba::g_ws_obj_attr_y_provider = golden_sun_wide_obj_attr_y_provider;
+    // The EWRAM authored-cell probe is opt-in. Keep both the generic fast
+    // path seam and the GbaBus slow-path observer null for ordinary runs;
+    // either path reports the same CPU store exactly once when diagnostics are
+    // enabled.
+    if (golden_sun_wide_diagnostics_enabled()) {
+        gba::g_ws_ewram_write_observer = golden_sun_wide_ewram_write_observer;
+        g_runtime_fast_ewram_write_observer =
+            golden_sun_wide_ewram_write_observer;
+    } else {
+        gba::g_ws_ewram_write_observer = nullptr;
+        g_runtime_fast_ewram_write_observer = nullptr;
+    }
+    gba::vram_trace::set_dma_descriptor_observer(
+        golden_sun_wide_dma_descriptor_observer);
+    gba::g_ws_bg_x_provider_layers = 0xFu; // BG0 + Mode0 field layers.
+    g_runtime_thumb_alu_imm_override = golden_sun_wide_obj_cull_immediate;
+    g_runtime_thumb_literal_override = golden_sun_wide_literal_override;
+}
+
+// Golden Sun-specific policy lives in the project runner. The reusable
+// gbarecomp runtime only exposes generic memory-write callback seams.
+const bool g_player_speed_diagnostic =
+    std::getenv("GSR_PLAYER_SPEED_DIAGNOSTIC") != nullptr;
+const bool g_player_speed_diagnostic_bypass =
+    std::getenv("GSR_PLAYER_SPEED_DIAGNOSTIC_BYPASS") != nullptr;
+extern "C" unsigned long long g_runtime_vblank_starts;
+std::atomic<unsigned long long> g_player_speed_callback_calls{0};
+std::atomic<unsigned long long> g_player_speed_exact_hits{0};
+std::atomic<unsigned long long> g_player_speed_address_hits{0};
+std::atomic<unsigned long long> g_player_speed_pc_hits{0};
+std::atomic<std::uint32_t> g_player_speed_first_address_pc{0};
+std::atomic<std::uint32_t> g_player_speed_first_pc_address{0};
+std::atomic<long long> g_player_speed_requested_delta_sum{0};
+std::atomic<long long> g_player_speed_applied_delta_sum{0};
+
+constexpr std::uint32_t kEndpointXWriterPc = 0x0800DC36u;
+constexpr std::uint32_t kEndpointYWriterPc = 0x0800DC3Au;
+struct PlayerSpeedWindowStats {
+    unsigned long long calls = 0;
+    unsigned long long first_frame = 0;
+    unsigned long long last_frame = 0;
+    std::uint32_t addr = 0;
+    std::uint32_t first_before = 0;
+    std::uint32_t first_requested = 0;
+    std::uint32_t first_applied = 0;
+    std::uint32_t last_before = 0;
+    std::uint32_t last_requested = 0;
+    std::uint32_t last_applied = 0;
+};
+PlayerSpeedWindowStats g_player_speed_windows[2][4]{};
+
+int player_speed_replay_window(unsigned long long frame) {
+    // g_runtime_vblank_starts is session-relative; state1 resumes guest frame
+    // 510330, while the replay's input rows use the absolute guest frame.
+    if (frame >= 116u && frame < 427u) return 0;  // right walk
+    if (frame >= 468u && frame < 656u) return 1;  // left + B
+    return -1;
+}
+
+void record_player_speed_window(int window, int stage, std::uint32_t addr,
+                                std::uint32_t before,
+                                std::uint32_t requested,
+                                std::uint32_t applied) {
+    if (window < 0) return;
+    PlayerSpeedWindowStats& stats = g_player_speed_windows[window][stage];
+    if (stats.calls++ == 0) {
+        stats.first_frame = g_runtime_vblank_starts;
+        stats.addr = addr;
+        stats.first_before = before;
+        stats.first_requested = requested;
+        stats.first_applied = applied;
+    }
+    stats.last_frame = g_runtime_vblank_starts;
+    stats.last_before = before;
+    stats.last_requested = requested;
+    stats.last_applied = applied;
+}
+
+int player_speed_write_override(std::uint32_t pc, std::uint32_t addr,
+                                std::uint32_t requested, std::uint32_t width,
+                                std::uint32_t* out_value) {
+    using namespace gsr::player_speed_cheat;
+    const int replay_window = player_speed_replay_window(g_runtime_vblank_starts);
+    if (g_player_speed_diagnostic) {
+        const unsigned long long call = g_player_speed_callback_calls.fetch_add(
+            1, std::memory_order_relaxed);
+        if (call == 0) {
+            std::fprintf(stderr,
+                         "[cheat] PlayerWalkRun2x callback active: "
+                         "first_pc=0x%08X first_addr=0x%08X width=%u\n",
+                         pc, addr, width);
+        }
+        if (addr == kAccumulator && width == 4u) {
+            const unsigned long long hit = g_player_speed_address_hits.fetch_add(
+                1, std::memory_order_relaxed);
+            if (hit == 0) {
+                g_player_speed_first_address_pc.store(pc,
+                                                      std::memory_order_relaxed);
+            }
+        }
+        if (pc == kWriterPc) {
+            const unsigned long long hit = g_player_speed_pc_hits.fetch_add(
+                1, std::memory_order_relaxed);
+            if (hit == 0) {
+                g_player_speed_first_pc_address.store(addr,
+                                                       std::memory_order_relaxed);
+            }
+        }
+        if (width == 4u &&
+            (pc == kEndpointXWriterPc || pc == kEndpointYWriterPc)) {
+            static std::atomic<unsigned> target_logged{0};
+            if (target_logged.exchange(1u, std::memory_order_relaxed) == 0u) {
+                const std::uint32_t camera_base = addr -
+                    (pc == kEndpointXWriterPc ? 0x08u : 0x10u);
+                const std::uint32_t target = bus_read_u32(camera_base + 0x68u);
+                std::fprintf(
+                    stderr,
+                    "[cheat] PlayerWalkRun2x target: camera=0x%08X "
+                    "target=0x%08X live=%u coords=0x%08X/0x%08X/0x%08X\n",
+                    camera_base, target, target ? bus_read_u32(target) : 0u,
+                    target ? bus_read_u32(target + 0x08u) : 0u,
+                    target ? bus_read_u32(target + 0x0Cu) : 0u,
+                    target ? bus_read_u32(target + 0x10u) : 0u);
+            }
+            record_player_speed_window(
+                replay_window, pc == kEndpointXWriterPc ? 2 : 3, addr,
+                bus_read_u32(addr), requested, requested);
+        }
+    }
+    if (!out_value || !matches(pc, addr, width)) return 0;
+    const std::uint32_t before = bus_read_u32(addr);
+    const std::uint32_t applied = g_player_speed_diagnostic_bypass
+        ? requested
+        : transform(before, requested,
+                    static_cast<std::uint32_t>(
+                        runtime_get_mem_write_override_enabled()));
+    if (g_player_speed_diagnostic) {
+        record_player_speed_window(
+            replay_window, pc == kWriterXPc ? 0 : 1, addr, before, requested,
+            applied);
+        g_player_speed_exact_hits.fetch_add(1, std::memory_order_relaxed);
+        g_player_speed_requested_delta_sum.fetch_add(
+            static_cast<long long>(static_cast<std::int32_t>(requested - before)),
+            std::memory_order_relaxed);
+        g_player_speed_applied_delta_sum.fetch_add(
+            static_cast<long long>(static_cast<std::int32_t>(applied - before)),
+            std::memory_order_relaxed);
+    }
+    static std::atomic<unsigned> trace_logged{0};
+    if (trace_logged.exchange(1u, std::memory_order_relaxed) == 0u) {
+        std::fprintf(
+            stderr,
+            "[cheat] PlayerWalkRun2x observed: pc=0x%08X addr=0x%08X "
+            "target=0x%08X before=0x%08X requested=0x%08X "
+            "applied=0x%08X delta=0x%08X\n",
+            pc, addr, addr, before, requested, applied,
+            applied - before);
+    }
+    *out_value = applied;
+    return 1;
+}
 
 struct TransientCodeImage {
     std::uint32_t start;
@@ -1083,7 +2855,7 @@ const std::vector<RelocatableOpcodeCandidate>& relocatable_opcode_candidates(
     return thumb ? thumb_candidates : arm;
 }
 
-int try_relocatable_dispatch(std::uint32_t pc, int thumb) {
+RuntimeGuestFn try_relocatable_dispatch(std::uint32_t pc, int thumb) {
     const bool profiling = relocatable_profile_enabled();
     RelocatableProfilePc* pc_stats = nullptr;
     if (profiling) {
@@ -1094,7 +2866,7 @@ int try_relocatable_dispatch(std::uint32_t pc, int thumb) {
         ++pc_stats->calls;
     }
     auto attempt = [&](std::size_t index, std::uint32_t base,
-                       void (*known_fn)(void), bool from_hint) -> bool {
+                       RuntimeGuestFn known_fn, bool from_hint) -> RuntimeGuestFn {
         const auto& image = kRelocatableCodeImages[index];
         auto& image_stats = g_relocatable_profile_images[index];
         const std::uint32_t origin = *image.origin;
@@ -1105,13 +2877,13 @@ int try_relocatable_dispatch(std::uint32_t pc, int thumb) {
             ++pc_stats->candidates;
         }
         const std::uint32_t offset = pc - base;
-        if (offset >= size) return false;
-        void (*fn)(void) = known_fn;
+        if (offset >= size) return nullptr;
+        RuntimeGuestFn fn = known_fn;
         if (fn == nullptr) {
             fn = lookup_entry(image.dispatch_table, *image.dispatch_table_len,
                               origin + offset, thumb);
         }
-        if (fn == nullptr) return false;
+        if (fn == nullptr) return nullptr;
         bool prefix_passed = false;
         const bool resident =
             from_hint ? relocatable_resident_at_cached(index, image, base, pc,
@@ -1119,7 +2891,7 @@ int try_relocatable_dispatch(std::uint32_t pc, int thumb) {
                       : relocatable_resident_at(image, base, &prefix_passed);
         if (!resident) {
             if (profiling && prefix_passed) ++image_stats.prefix_passes;
-            return false;
+            return nullptr;
         }
         if (profiling) {
             ++image_stats.prefix_passes;
@@ -1150,8 +2922,7 @@ int try_relocatable_dispatch(std::uint32_t pc, int thumb) {
         }
         g_relocatable_base_hint[index] = {base, true};
         g_runtime_image_base = base;
-        fn();
-        return true;
+        return fn;
     };
 
     // Try every image's last verified base before doing any discovery work.
@@ -1162,7 +2933,10 @@ int try_relocatable_dispatch(std::uint32_t pc, int thumb) {
         if (thumb != image.thumb) continue;
         if (profiling) ++g_relocatable_profile_images[index].visits;
         const RelocatableBaseHint hint = g_relocatable_base_hint[index];
-        if (hint.valid && attempt(index, hint.base, nullptr, true)) return 1;
+        if (hint.valid) {
+            if (RuntimeGuestFn fn = attempt(index, hint.base, nullptr, true))
+                return fn;
+        }
     }
 
     // Whole-image identity can only match when the live instruction at `pc`
@@ -1189,7 +2963,10 @@ int try_relocatable_dispatch(std::uint32_t pc, int thumb) {
         const RelocatableBaseHint hint =
             g_relocatable_base_hint[it->image_index];
         if (hint.valid && base == hint.base) continue;
-        if (attempt(it->image_index, base, it->entry->fn, false)) return 1;
+        if (RuntimeGuestFn fn =
+                attempt(it->image_index, base, it->entry->fn, false)) {
+            return fn;
+        }
     }
     // Images without immutable ROM backing cannot use the opcode index. Keep
     // the old exhaustive discovery path for them; identity hashing remains the
@@ -1215,11 +2992,12 @@ int try_relocatable_dispatch(std::uint32_t pc, int thumb) {
                 const RelocatableBaseHint hint =
                     g_relocatable_base_hint[index];
                 if (hint.valid && base == hint.base) continue;
-                if (attempt(index, base, entry.fn, false)) return 1;
+                if (RuntimeGuestFn fn = attempt(index, base, entry.fn, false))
+                    return fn;
             }
         }
     }
-    return 0;
+    return nullptr;
 }
 
 void (*lookup_variant(const TransientCodeImage& image,
@@ -1329,6 +3107,10 @@ void blitter_function_entry(std::uint32_t entry_pc) {
     } else if (entry_pc == gsr::blitter_shadow::kAllocatorEntry) {
         g_blitter_shadow.allocator_entry(g_cpu.R[0], g_cpu.R[1]);
     }
+}
+
+void golden_sun_function_entry_observer(std::uint32_t entry_pc) {
+    blitter_function_entry(entry_pc);
 }
 
 void blitter_shadow_dispatch(std::uint32_t pc, int thumb) {
@@ -1729,23 +3511,62 @@ void dynamic_ram_probe_record(std::uint32_t pc, std::uint64_t total_ns,
     }
 }
 
-// Run an unexplained RAM PC: healed native first, else the interpreter
-// bridge (which also enqueues the heal keyed by the live bytes' CRC).
-int dispatch_dynamic_ram(std::uint32_t pc, int thumb) {
+// A resolved dynamic-RAM path has already performed its interpreter/fallback
+// work. Returning this sentinel lets runtime_dispatch stop without falling
+// through to static tables or reporting a second miss.
+void verified_ram_dispatch_noop() {}
+
+// The resolver returns a native function for runtime_dispatch to tail-transfer
+// into. Keep the active-entry marker alive until the generated callee's guest
+// return path retires it; a C++ RAII guard cannot span that tail transfer.
+void verified_ram_mark_active(std::uint32_t pc, int thumb);
+
+// Run an unexplained RAM PC: resolve healed native first, else bridge through
+// the interpreter (which also enqueues the heal keyed by live bytes' CRC).
+RuntimeGuestFn dispatch_dynamic_ram(std::uint32_t pc, int thumb) {
     blitter_shadow_dispatch(pc, thumb);
+    // The builder reuses two measured IWRAM staging slots. The older
+    // 0x030057e0..0x03005a64 image is just as generated as the newer
+    // 0x03006000..0x03006500 image; leaving it on the interpreter path makes
+    // every pool tail-jump pay the full bridge cost while its native shard is
+    // already queued.
+    const bool generated_blitter = !thumb &&
+        ((pc >= 0x030057E0u && pc < 0x03005A64u) ||
+         (pc >= 0x03006000u && pc < 0x03006500u));
     if (!dynamic_ram_probe_on()) {
-        if (overlay_try_dispatch(pc, thumb)) return 1;
+        if (RuntimeGuestFn fn = gbarecomp::overlay_resolve(pc, thumb)) {
+            verified_ram_mark_active(pc, thumb);
+            return fn;
+        }
+        if (generated_blitter) {
+            const auto outcome =
+                gbarecomp::overlay_request_compile(pc, thumb != 0);
+            if (outcome != gbarecomp::OverlayRequestOutcome::Failed) {
+                if (RuntimeGuestFn fn =
+                        gbarecomp::overlay_wait_resolve(
+                            pc, thumb != 0, 10000u)) {
+                    verified_ram_mark_active(pc, thumb);
+                    return fn;
+                }
+            }
+            std::fprintf(stderr,
+                "GoldenSunRecomp: generated blitter 0x%08X failed to heal "
+                "within 10 seconds; refusing unsafe interpreter bridge.\n",
+                pc);
+            std::abort();
+        }
         runtime_dispatch_miss(pc | (thumb ? 1u : 0u));
-        return 1;
+        return &verified_ram_dispatch_noop;
     }
     const auto call_t0 = std::chrono::steady_clock::now();
-    if (overlay_try_dispatch(pc, thumb)) {
+    if (RuntimeGuestFn fn = gbarecomp::overlay_resolve(pc, thumb)) {
+        verified_ram_mark_active(pc, thumb);
         const auto call_t1 = std::chrono::steady_clock::now();
         dynamic_ram_probe_record(pc,
             static_cast<std::uint64_t>(std::chrono::duration_cast<
                 std::chrono::nanoseconds>(call_t1 - call_t0).count()),
             /*interp_ns=*/0, /*interp_insns=*/0, /*overlay_hit=*/true);
-        return 1;
+        return fn;
     }
     const std::uint64_t insns_before = gbarecomp::self_heal_interpreted_insns();
     const auto interp_t0 = std::chrono::steady_clock::now();
@@ -1757,7 +3578,7 @@ int dispatch_dynamic_ram(std::uint32_t pc, int thumb) {
             interp_t1 - interp_t0).count());
     dynamic_ram_probe_record(pc, interp_ns, interp_ns,
                              insns_after - insns_before, /*overlay_hit=*/false);
-    return 1;
+    return &verified_ram_dispatch_noop;
 }
 
 // Fast path for a PC we have already explained: count it and run it without
@@ -1797,6 +3618,100 @@ bool allow_dynamic_ram_pc(const char* reason, std::uint32_t pc, int thumb) {
     return true;
 }
 
+// ── TEMPORARY same-PC recursion probe (GSR_RECURSION_PROBE=1) ───────────────
+// The guard below is intentionally behavior-preserving: this probe only counts
+// hits that the guard was already going to bypass. It records sparse frame
+// buckets rather than one line per event, so a runaway native loop cannot turn
+// diagnostics into its own source of stutter. The frame key is the runtime's
+// VBlank counter, which is the same guest-frame cadence used by frame phase
+// telemetry. No guest bytes or addresses are written to this report.
+bool g_recursion_probe_enabled = [] {
+    const char* e = std::getenv("GSR_RECURSION_PROBE");
+    return e != nullptr && e[0] != '\0' && e[0] != '0';
+}();
+
+struct RecursionProbeBucket {
+    std::uint64_t frame = 0;
+    std::uint64_t total_hits = 0;
+    std::uint64_t fixed_hits = 0;
+    std::uint64_t relocatable_hits = 0;
+    std::uint64_t cache_entry_hits = 0;
+    std::uint64_t uncached_hits = 0;
+};
+
+struct RecursionProbe {
+    static constexpr std::size_t kBucketCount = 16384;
+    std::array<RecursionProbeBucket, kBucketCount> buckets{};
+    std::uint64_t bucket_count = 0;
+    std::uint64_t dropped_buckets = 0;
+
+    void record(std::uint64_t frame, bool fixed, bool relocatable,
+                bool cache_entry) {
+        RecursionProbeBucket* bucket = nullptr;
+        if (bucket_count != 0) {
+            RecursionProbeBucket& last =
+                buckets[(bucket_count - 1u) % kBucketCount];
+            if (last.frame == frame) bucket = &last;
+        }
+        if (bucket == nullptr) {
+            if (bucket_count >= kBucketCount) ++dropped_buckets;
+            bucket = &buckets[bucket_count % kBucketCount];
+            *bucket = {};
+            bucket->frame = frame;
+            ++bucket_count;
+        }
+        ++bucket->total_hits;
+        if (fixed) ++bucket->fixed_hits;
+        if (relocatable) ++bucket->relocatable_hits;
+        if (cache_entry) ++bucket->cache_entry_hits;
+        if (!cache_entry) ++bucket->uncached_hits;
+    }
+
+    void dump() const {
+        if (!g_recursion_probe_enabled || bucket_count == 0) return;
+        const char* events = std::getenv("GBARECOMP_FRAME_EVENTS");
+        std::string path = events && events[0]
+            ? std::string(events) + ".recursion.csv" : std::string();
+        std::FILE* f = path.empty() ? stderr : std::fopen(path.c_str(), "w");
+        if (!f) return;
+        std::fprintf(f,
+            "frame,total_recursion_hits,fixed_hits,relocatable_hits,"
+            "cache_entry_hits,uncached_hits\n");
+        const std::uint64_t count =
+            std::min<std::uint64_t>(bucket_count, kBucketCount);
+        const std::uint64_t first = bucket_count - count;
+        for (std::uint64_t i = 0; i < count; ++i) {
+            const RecursionProbeBucket& bucket =
+                buckets[(first + i) % kBucketCount];
+            std::fprintf(f, "%llu,%llu,%llu,%llu,%llu,%llu\n",
+                static_cast<unsigned long long>(bucket.frame),
+                static_cast<unsigned long long>(bucket.total_hits),
+                static_cast<unsigned long long>(bucket.fixed_hits),
+                static_cast<unsigned long long>(bucket.relocatable_hits),
+                static_cast<unsigned long long>(bucket.cache_entry_hits),
+                static_cast<unsigned long long>(bucket.uncached_hits));
+        }
+        if (f != stderr) {
+            std::fclose(f);
+            std::fprintf(stderr,
+                "[recursion-probe] dumped %llu buckets -> %s"
+                " (dropped=%llu)\n",
+                static_cast<unsigned long long>(count), path.c_str(),
+                static_cast<unsigned long long>(dropped_buckets));
+        } else {
+            std::fprintf(stderr,
+                "[recursion-probe] buckets=%llu dropped=%llu\n",
+                static_cast<unsigned long long>(count),
+                static_cast<unsigned long long>(dropped_buckets));
+        }
+        std::fflush(stderr);
+    }
+};
+
+RecursionProbe g_recursion_probe;
+
+void report_recursion_probe() { g_recursion_probe.dump(); }
+
 // Bounds nested verified-RAM native dispatch on this thread. A cached
 // native entry that re-dispatches its own pc before returning (a
 // generated-code bug, not ordinary nested guest calls) would otherwise
@@ -1808,6 +3723,10 @@ bool allow_dynamic_ram_pc(const char* reason, std::uint32_t pc, int thumb) {
 constexpr std::size_t kVerifiedRamActiveCapacity = 64;
 thread_local std::array<std::uint64_t, kVerifiedRamActiveCapacity>
     g_verified_ram_active_keys{};
+thread_local std::array<std::uint32_t, kVerifiedRamActiveCapacity>
+    g_verified_ram_active_call_depths{};
+thread_local std::array<std::uint32_t, kVerifiedRamActiveCapacity>
+    g_verified_ram_active_return_pcs{};
 thread_local std::size_t g_verified_ram_active_depth = 0;
 thread_local std::vector<std::uint32_t> g_verified_ram_self_dispatch_reported;
 thread_local std::vector<std::uint32_t> g_verified_ram_depth_cap_reported;
@@ -1820,67 +3739,133 @@ bool verified_ram_pc_in(const std::vector<std::uint32_t>& reported,
     return false;
 }
 
-// RAII guard tracking which verified-RAM keys are currently being invoked
-// on this thread, so a native fn that re-dispatches its own pc (or a
-// A->B->A cycle) can be detected and bypassed instead of recursing without
-// bound. The guarded key is always removed on exit, including on an
-// exception unwind out of the native fn.
+// Active verified-RAM entries are guest-call scoped, not C++-call scoped.
+// runtime_dispatch tail-transfers to the returned function, so a local RAII
+// guard would die before that function starts. The runtime return hook below
+// retires these entries after generated BX-LR/cancel handling unwinds the
+// guest call-return stack, preserving both cycle protection and tail calls.
 struct VerifiedRamActiveGuard {
-    bool pushed = false;
     bool self_dispatch = false;
+    bool tail_redispatch = false;
     bool depth_exceeded = false;
 
     explicit VerifiedRamActiveGuard(std::uint64_t key) {
         for (std::size_t i = 0; i < g_verified_ram_active_depth; ++i) {
             if (g_verified_ram_active_keys[i] == key) {
-                self_dispatch = true;
+                // Re-entering the same validated PC is ordinary guest control
+                // flow, including MP2K's nested loop at 0x03000828. The guest
+                // call stack preserves recursion semantics; keep this as a
+                // native tail transfer. The prior crash came specifically
+                // from overlay_try_dispatch's non-tail retry.
+                tail_redispatch = true;
                 return;
             }
         }
         if (g_verified_ram_active_depth >= kVerifiedRamActiveCapacity) {
-            depth_exceeded = true;
-            return;
+            // A long top-level tail-dispatch chain can visit more than 64
+            // distinct RAM entries without a guest return. Those entries are
+            // not recursive host calls. Rotate the bounded diagnostic set;
+            // never turn valid control flow into a multi-million-instruction
+            // interpreter bridge merely because this set filled.
+            g_verified_ram_active_depth = 0;
         }
-        g_verified_ram_active_keys[g_verified_ram_active_depth++] = key;
-        pushed = true;
-    }
-    ~VerifiedRamActiveGuard() {
-        if (pushed) --g_verified_ram_active_depth;
     }
     VerifiedRamActiveGuard(const VerifiedRamActiveGuard&) = delete;
     VerifiedRamActiveGuard& operator=(const VerifiedRamActiveGuard&) = delete;
 };
 
-int verified_ram_dispatch(std::uint32_t pc, int thumb) {
+void verified_ram_dispatch_return_hook(std::uint32_t return_pc,
+                                       std::uint32_t call_stack_depth) {
+    // A guest return truncates the runtime call stack. Every marker created
+    // below that new depth belongs to a callee that has now returned. Remove
+    // by swap; ordering is only diagnostic/protection state, not guest state.
+    for (std::size_t i = g_verified_ram_active_depth; i != 0;) {
+        const std::size_t slot = i - 1u;
+        const bool unwound =
+            g_verified_ram_active_call_depths[slot] > call_stack_depth;
+        const bool top_level_return =
+            g_verified_ram_active_call_depths[slot] == 0u &&
+            g_verified_ram_active_return_pcs[slot] == (return_pc & ~1u);
+        if (!unwound && !top_level_return) {
+            i = slot;
+            continue;
+        }
+        --g_verified_ram_active_depth;
+        if (slot != g_verified_ram_active_depth) {
+            g_verified_ram_active_keys[slot] =
+                g_verified_ram_active_keys[g_verified_ram_active_depth];
+            g_verified_ram_active_call_depths[slot] =
+                g_verified_ram_active_call_depths[g_verified_ram_active_depth];
+            g_verified_ram_active_return_pcs[slot] =
+                g_verified_ram_active_return_pcs[g_verified_ram_active_depth];
+        }
+        i = std::min(i, g_verified_ram_active_depth);
+    }
+}
+
+void verified_ram_mark_active(std::uint32_t pc, int thumb) {
+    if (g_verified_ram_active_depth >= kVerifiedRamActiveCapacity) return;
+    const std::uint64_t key = verified_ram_key(pc, thumb);
+    const std::uint32_t call_depth = runtime_call_stack_depth();
+    g_verified_ram_active_keys[g_verified_ram_active_depth] = key;
+    g_verified_ram_active_call_depths[g_verified_ram_active_depth] = call_depth;
+    g_verified_ram_active_return_pcs[g_verified_ram_active_depth] =
+        g_cpu.R[14] & ~1u;
+    ++g_verified_ram_active_depth;
+}
+
+void verified_ram_dispatch_outer_boundary() {
+    // The runner has regained control only after the current top-level guest
+    // dispatch returned. This can be a scheduling yield/SWI rather than a
+    // guest BX-LR, so no return hook is guaranteed to have fired. Nested
+    // markers are retired by the call-return hook; clear the remaining
+    // top-level markers here so the next outer resume is a fresh dispatch.
+    if (runtime_call_stack_depth() == 0u)
+        g_verified_ram_active_depth = 0;
+}
+
+RuntimeGuestFn verified_ram_dispatch(std::uint32_t pc, int thumb) {
     // A PC already classified as generated code short-circuits everything
     // below. This must come FIRST: the identity scan re-hashes the whole
     // containing candidate image (SHA-1 over ~1.2 KB) and then every
     // relocatable image at this base (~2.5 KB more) before it can conclude
     // what it already concluded the first time. Generated code is HOT — a
     // single fight dispatches these ~100,000 times — so paying that scan per
-    // dispatch cost hundreds of MB of hashing and made the fight crawl.
-    if (dynamic_ram_pc_repeat(pc)) return dispatch_dynamic_ram(pc, thumb);
-
     const std::uint64_t key = verified_ram_key(pc, thumb);
 
+    if (dynamic_ram_pc_repeat(pc)) return dispatch_dynamic_ram(pc, thumb);
+
     VerifiedRamActiveGuard active_guard(key);
+
     if (active_guard.self_dispatch) {
         // A verified-RAM native entry called back into runtime_dispatch for
         // the exact same pc/thumb it is currently executing, before
         // returning. Left alone this recurses through
         // runtime_dispatch -> verified_ram_dispatch -> fn() without bound
         // and overflows the host stack (this is the fix for that crash).
-        // Evict the cache entry and fall through to the ordinary
-        // static/overlay/interpreter path instead.
+        // Evict the cache entry before using the interpreter fallback; do not
+        // let the ordinary static/overlay path select this active body again.
         const auto self_cached = g_verified_ram_cache.find(key);
+        if (g_recursion_probe_enabled) {
+            const bool cache_entry = self_cached != g_verified_ram_cache.end();
+            const bool fixed = cache_entry &&
+                self_cached->second.identity_index < kTransientCodeImages.size();
+            // The active guard also wraps try_relocatable_dispatch(). PIC
+            // entries do not populate g_verified_ram_cache, so an uncached
+            // same-key hit is the relocatable path; fixed native entries always
+            // have their cache row until this guard evicts it below.
+            const bool relocatable = !cache_entry;
+            g_recursion_probe.record(runtime_current_frame(), fixed,
+                                     relocatable, cache_entry);
+        }
         if (!verified_ram_pc_in(g_verified_ram_self_dispatch_reported, pc)) {
             g_verified_ram_self_dispatch_reported.push_back(pc);
             std::fprintf(stderr,
                 "GoldenSunRecomp: SELF-DISPATCH RECURSION at 0x%08X (%s) "
                 "identity_index=%zu — a verified-RAM native entry "
-                "re-dispatched its own pc before returning. Bypassing this "
-                "entry once and falling through to the ordinary dispatch "
-                "path instead of recursing without bound.\n",
+                "re-dispatched its own pc before returning. Bridging this "
+                "edge once through the interpreter instead of recursing "
+                "without bound.\n",
                 pc, thumb ? "thumb" : "arm",
                 self_cached != g_verified_ram_cache.end()
                     ? self_cached->second.identity_index
@@ -1888,23 +3873,40 @@ int verified_ram_dispatch(std::uint32_t pc, int thumb) {
         }
         if (self_cached != g_verified_ram_cache.end())
             g_verified_ram_cache.erase(self_cached);
-        return 0;
+        // This dispatch was already handled by the active native entry.  A
+        // null return would make runtime_dispatch continue into the static
+        // table (and then Stage-2 on a miss), where a same-PC static entry can
+        // re-enter the body that just declined.  Bridge the recursive edge
+        // once through the interpreter and return a handled sentinel so the
+        // dispatcher cannot select either lower tier.
+        runtime_bridge_interpret(pc, thumb != 0, 0u, 0u);
+        return &verified_ram_dispatch_noop;
     }
     if (active_guard.depth_exceeded) {
         // Not a same-pc self-dispatch, but this thread's nested
         // verified-RAM native dispatch depth ran past the cap — e.g. an
         // A->B->A cycle across distinct pcs. Refuse to recurse further and
-        // fall through to the ordinary dispatch path.
+        // bridge through the interpreter once. As with same-PC recursion,
+        // returning null here would let runtime_dispatch select a static or
+        // Stage-2 RAM body for the declined transfer.
         if (!verified_ram_pc_in(g_verified_ram_depth_cap_reported, pc)) {
             g_verified_ram_depth_cap_reported.push_back(pc);
             std::fprintf(stderr,
                 "GoldenSunRecomp: VERIFIED-RAM DISPATCH DEPTH CAP (%zu) hit "
                 "at pc=0x%08X (%s) — refusing to nest further and falling "
-                "through to the ordinary dispatch path.\n",
+                "back to the interpreter.\n",
                 kVerifiedRamActiveCapacity, pc, thumb ? "thumb" : "arm");
         }
-        return 0;
+        // runtime_dispatch_miss retries ready overlays first. At this point
+        // that can re-enter an already-active body and bypass this depth cap.
+        runtime_bridge_interpret(pc, thumb != 0, 0u, 0u);
+        return &verified_ram_dispatch_noop;
     }
+
+    const auto mark_active = [&] {
+        if (!active_guard.tail_redispatch)
+            verified_ram_mark_active(pc, thumb);
+    };
 
     const auto cached = g_verified_ram_cache.find(key);
     if (cached != g_verified_ram_cache.end()) {
@@ -1916,11 +3918,11 @@ int verified_ram_dispatch(std::uint32_t pc, int thumb) {
             local_words_current) {
             if (cached->second.action == VerifiedRamAction::Native &&
                 cached->second.fn != nullptr) {
-                cached->second.fn();
-                return 1;
+                mark_active();
+                return cached->second.fn;
             }
             // A fixed identity owns the ordinary static dispatch entry.
-            return 0;
+            return nullptr;
         }
         // The page epoch may have changed because of an unrelated write in
         // the same RAM page. Revalidate the identity that already won for
@@ -1946,10 +3948,10 @@ int verified_ram_dispatch(std::uint32_t pc, int thumb) {
                 thumb == candidate.thumb && identity_refreshed) {
                 if (cached->second.action == VerifiedRamAction::Native &&
                     cached->second.fn != nullptr) {
-                    cached->second.fn();
-                    return 1;
+                    mark_active();
+                    return cached->second.fn;
                 }
-                return 0;
+                return nullptr;
             }
         }
         g_verified_ram_cache.erase(cached);
@@ -2037,14 +4039,16 @@ int verified_ram_dispatch(std::uint32_t pc, int thumb) {
         if (candidate.dispatch_table == nullptr) {
             // This identity owns the fixed AOT entry in kDispatchTable.
             cache_verified(VerifiedRamAction::Static, nullptr, candidate_index);
-            return 0;
+            return nullptr;
         }
         if (void (*fn)(void) = lookup_variant(candidate, pc, thumb)) {
             cache_verified(VerifiedRamAction::Native, fn, candidate_index);
-            fn();
-            return 1;
+            mark_active();
+            return fn;
         }
-        if (dynamic_ram_pc_repeat(pc)) return dispatch_dynamic_ram(pc, thumb);
+        if (dynamic_ram_pc_repeat(pc)) {
+            return dispatch_dynamic_ram(pc, thumb);
+        }
         std::fprintf(stderr,
             "GoldenSunRecomp: verified transient image %s has no AOT entry "
             "for 0x%08X\n",
@@ -2063,10 +4067,15 @@ int verified_ram_dispatch(std::uint32_t pc, int thumb) {
     // its live bytes hash to a registered image. This runs before every abort
     // path below, including the mode mismatch — a stale ARM registration can
     // overlap a THUMB thunk installed at the same stack address later.
-    if (try_relocatable_dispatch(pc, thumb)) return 1;
+    if (RuntimeGuestFn fn = try_relocatable_dispatch(pc, thumb)) {
+        mark_active();
+        return fn;
+    }
 
-    if (!covered) return 0;
-    if (dynamic_ram_pc_repeat(pc)) return dispatch_dynamic_ram(pc, thumb);
+    if (!covered) return nullptr;
+    if (dynamic_ram_pc_repeat(pc)) {
+        return dispatch_dynamic_ram(pc, thumb);
+    }
     if (!mode_matched) {
         std::fprintf(stderr,
             "GoldenSunRecomp: transient code mode mismatch at 0x%08X\n", pc);
@@ -2203,6 +4212,11 @@ int main(int argc, char** argv) {
     // subsystem, so as much of the run as possible is covered. nullptr =
     // default to the directory this executable lives in.
     gbarecomp::crash_handler_install(nullptr);
+    // The field atlas source is now part of the evidence-backed widescreen
+    // policy. Keep the payload-free producer trace opt-in for future source
+    // investigations; set GBARECOMP_VRAM_MAP_TRACE=1 when needed.
+    gba::vram_trace::set_default_enabled(false);
+    if (g_recursion_probe_enabled) std::atexit(report_recursion_probe);
 
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--help") == 0 ||
@@ -2215,23 +4229,73 @@ int main(int argc, char** argv) {
     gbarecomp::RunOptions options;
     options.builtin_game_name = "Golden Sun";
     options.builtin_rom_sha1 = kRomSha1;
-    options.function_entry_observer = blitter_function_entry;
-    options.max_view_width = 240;
+    options.function_entry_observer = golden_sun_function_entry_observer;
+    options.max_view_width = 360;
+    options.max_view_height = 240;
     options.frame_interpolation_available = true;
     options.enhanced_timing_available = true;
     options.native_renderer_available = true;
     options.max_resize_view_width = 240;
     options.resize_driven_view = false;
+    options.extended_view_init = install_golden_sun_widescreen;
     options.launcher_region = "USA/Europe";
     options.launcher_game_config = "game.toml";
-    options.launcher_expose_widescreen = false;
+    options.launcher_expose_widescreen = true;
     options.launcher_expose_adaptive_view = false;
+    options.widescreen_view_width = 288;
+    options.widescreen_view_height = 160;
+    options.launcher_aspect_labels = kGoldenSunAspectLabels;
+    options.launcher_aspect_view_widths = kGoldenSunAspectWidths;
+    options.launcher_aspect_view_heights = kGoldenSunAspectHeights;
+    options.launcher_num_aspects = 3;
     g_runtime_ram_dispatch_hook = verified_ram_dispatch;
+    g_runtime_call_return_hook = verified_ram_dispatch_return_hook;
+    g_runtime_guest_step_boundary_hook = verified_ram_dispatch_outer_boundary;
+    g_runtime_mem_write_override = player_speed_write_override;
     init_ram_code_page_masks();
     g_verified_ram_cache.clear();
     g_verified_identity_cache = {};
     g_relocatable_identity_cache = {};
     const int result = gbarecomp::run_game(argc, argv, options);
+    if (g_player_speed_diagnostic) {
+        std::fprintf(
+            stderr,
+            "[cheat] PlayerWalkRunSpeed diagnostic: multiplier_final=%d "
+            "callback_calls=%llu address_hits=%llu pc_hits=%llu "
+            "exact_hits=%llu first_address_pc=0x%08X first_pc_address=0x%08X "
+            "requested_delta_sum=%lld applied_delta_sum=%lld\n",
+            runtime_get_mem_write_override_enabled(),
+            g_player_speed_callback_calls.load(std::memory_order_relaxed),
+            g_player_speed_address_hits.load(std::memory_order_relaxed),
+            g_player_speed_pc_hits.load(std::memory_order_relaxed),
+            g_player_speed_exact_hits.load(std::memory_order_relaxed),
+            g_player_speed_first_address_pc.load(std::memory_order_relaxed),
+            g_player_speed_first_pc_address.load(std::memory_order_relaxed),
+            g_player_speed_requested_delta_sum.load(std::memory_order_relaxed),
+            g_player_speed_applied_delta_sum.load(std::memory_order_relaxed));
+        constexpr const char* kWindowNames[] = {"right", "left_b"};
+        constexpr const char* kStageNames[] = {
+            "run_limit", "walk_limit", "endpoint_x", "endpoint_y"};
+        for (int window = 0; window < 2; ++window) {
+            for (int stage = 0; stage < 4; ++stage) {
+                const PlayerSpeedWindowStats& stats =
+                    g_player_speed_windows[window][stage];
+                std::fprintf(
+                    stderr,
+                    "[cheat] PlayerWalkRun2x downstream: bypass=%d "
+                    "window=%s stage=%s calls=%llu frames=%llu/%llu "
+                    "addr=0x%08X "
+                    "first=0x%08X/0x%08X/0x%08X "
+                    "last=0x%08X/0x%08X/0x%08X\n",
+                    g_player_speed_diagnostic_bypass ? 1 : 0,
+                    kWindowNames[window], kStageNames[stage], stats.calls,
+                    stats.first_frame, stats.last_frame, stats.addr,
+                    stats.first_before, stats.first_requested,
+                    stats.first_applied, stats.last_before,
+                    stats.last_requested, stats.last_applied);
+            }
+        }
+    }
     if (std::getenv("GBARECOMP_RAM_CACHE_STATS")) {
         std::fprintf(stderr,
             "ram_cache_stats epoch=%llu hashes=%llu image_hits=%llu "

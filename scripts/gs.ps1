@@ -179,7 +179,7 @@ if (Test-Stage 'recompile') {
     $recompileExit = $LASTEXITCODE
     $collisions = @(Select-String -Path $log -SimpleMatch 'control-flow entries into')
 
-    $summary = Select-String -Path $log -Pattern 'TOTAL emitted|long_branch_calls|midfn_aliases|alias_seeds_dropped|data_ranges_honored'
+    $summary = Select-String -Path $log -Pattern 'TOTAL emitted|thumb literal hooks|long_branch_calls|midfn_aliases|alias_seeds_dropped|data_ranges_honored'
     foreach ($line in $summary) { Write-Host "    $($line.Line.Trim())" }
 
     if ($collisions.Count -gt 0) {
@@ -195,6 +195,20 @@ if (Test-Stage 'recompile') {
     }
     if ($recompileExit -ne 0) {
         throw "gba_recompile exited $recompileExit. Full log: $log"
+    }
+
+    # A TOML literal override is only effective when the emitted instruction
+    # contains the runtime chokepoint.  Keep stale generated shards from
+    # silently making the runner's callback unreachable.
+    $literalHookSites = @('0x0800C6F2', '0x0800C6FE')
+    $generatedShards = @(Get-ChildItem -LiteralPath $CorpusDir -Filter 'recompiled_*.cpp' -File)
+    foreach ($site in $literalHookSites) {
+        $needle = "runtime_thumb_literal(${site}u"
+        $hook = @($generatedShards | Select-String -SimpleMatch $needle)
+        if ($hook.Count -eq 0) {
+            throw "GATE FAILED: generated corpus is missing runtime literal hook at $site. Regenerate with the current gba_recompile."
+        }
+        Write-Host "    generated literal hook present: $site" -ForegroundColor Green
     }
     Write-Host "    gate passed: zero data_range collisions" -ForegroundColor Green
 }

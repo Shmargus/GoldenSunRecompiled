@@ -11,6 +11,8 @@ sys.path.insert(0, str(ROOT / "tools"))
 from build_main_toml import (  # noqa: E402
     REVIEWED_JUMP_TABLES,
     REVIEWED_RESUME_FUNCTIONS,
+    REVIEWED_THUMB_ALU_IMMEDIATE_OVERRIDES,
+    REVIEWED_THUMB_LITERAL_OVERRIDES,
     ROM_BASE,
     apply_data_exceptions,
     decode_cartridge_entry,
@@ -227,6 +229,14 @@ class MainTomlTests(unittest.TestCase):
             data_exception_sha256="c" * 64,
         )
         self.assertIn("[[resume_range]]", text)
+        for entry in REVIEWED_THUMB_ALU_IMMEDIATE_OVERRIDES:
+            self.assertIn("[[thumb_alu_immediate_override]]", text)
+            self.assertIn(f"addr = 0x{entry['addr']:08x}", text)
+            self.assertIn(entry["note"], text)
+        for entry in REVIEWED_THUMB_LITERAL_OVERRIDES:
+            self.assertIn("[[thumb_literal_override]]", text)
+            self.assertIn(f"addr = 0x{entry['addr']:08x}", text)
+            self.assertIn(entry["note"], text)
         self.assertIn("start = 0x08001000", text)
         self.assertIn("end = 0x08001040", text)
         self.assertIn("source_addr = 0x08000010", text)

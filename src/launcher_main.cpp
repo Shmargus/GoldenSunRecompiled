@@ -9,6 +9,11 @@
 #include <gdiplus.h>
 
 #include "crash_handler.h"
+#include "launcher_audio_policy.h"
+#include "launcher_replay_policy.h"
+#include "launcher_session_id.h"
+#include "launcher_test_policy.h"
+#include "launcher_widescreen_diagnostics_policy.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -28,6 +33,144 @@ namespace {
 
 constexpr char kExpectedRomSha1[] =
     "5c4695205413df7db52b9a184815a07783999971";
+
+// Diagnostic variables are deliberately opt-in. The checkbox is reset to
+// this value on every launcher start, and the selected values are applied to
+// the child environment only.
+const auto k_launcher_test_defaults = gsr::launcher_test_defaults();
+bool g_test_variables = k_launcher_test_defaults.master;
+// Child selections are remembered while the launcher is open. They are
+// intentionally not persisted. Self-healing remains active for normal
+// launches; the other children start unchecked and require the master
+// checkbox.
+bool g_test_selfheal_ram = k_launcher_test_defaults.self_heal_ram;
+bool g_test_cost_probe = k_launcher_test_defaults.cost_probe;
+bool g_test_present_cadence = k_launcher_test_defaults.present_cadence;
+bool g_test_blitter_shadow = k_launcher_test_defaults.blitter_shadow;
+bool g_test_recursion_probe = k_launcher_test_defaults.recursion_probe;
+bool g_test_ram_churn_probe = k_launcher_test_defaults.ram_churn_probe;
+bool g_test_oam_shadow_trace = k_launcher_test_defaults.oam_shadow_trace;
+bool g_widescreen_diagnostics =
+    gsr::launcher_widescreen_diagnostics_default();
+
+struct LauncherAudioSettings {
+    bool native_mp2k = false;
+    bool turbo_decoupled = false;
+    bool copy_session_id_to_clipboard = false;
+};
+
+// Root-launcher settings live outside config/local.json: that file contains
+// user machine paths and must not be rewritten by the launcher.
+LauncherAudioSettings g_audio_settings{};
+bool g_strict_static_route = false;
+
+bool parse_bool_setting(const std::string& value) {
+    return value == "1" || value == "true" || value == "TRUE" ||
+           value == "yes" || value == "on";
+}
+
+std::string trim_setting(std::string value) {
+    const std::size_t first = value.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos) return {};
+    const std::size_t last = value.find_last_not_of(" \t\r\n");
+    return value.substr(first, last - first + 1);
+}
+
+LauncherAudioSettings load_launcher_audio_settings(const fs::path& root) {
+    LauncherAudioSettings settings;
+    std::ifstream file(root / L"local" / L"launcher-settings.ini");
+    if (!file) return settings;
+
+    bool in_audio = false;
+    bool in_launcher = false;
+    std::string line;
+    while (std::getline(file, line)) {
+        line = trim_setting(line);
+        if (line.empty() || line[0] == '#' || line[0] == ';') continue;
+        if (line.front() == '[' && line.back() == ']') {
+            in_audio = line == "[Audio]";
+            in_launcher = line == "[Launcher]";
+            continue;
+        }
+        if (!in_audio && !in_launcher) continue;
+        const std::size_t equals = line.find('=');
+        if (equals == std::string::npos) continue;
+        const std::string key = trim_setting(line.substr(0, equals));
+        const bool value = parse_bool_setting(
+            trim_setting(line.substr(equals + 1)));
+        if (in_audio && key == "NativeMp2kAudio") settings.native_mp2k = value;
+        else if (in_audio && key == "TurboAudioDecoupled") {
+            settings.turbo_decoupled = value;
+        } else if (in_launcher && key == "CopySessionIdToClipboard") {
+            settings.copy_session_id_to_clipboard = value;
+        }
+    }
+    if (!settings.native_mp2k) settings.turbo_decoupled = false;
+    return settings;
+}
+
+void save_launcher_audio_settings(const fs::path& root,
+                                  const LauncherAudioSettings& settings) {
+    const fs::path path = root / L"local" / L"launcher-settings.ini";
+    std::error_code ec;
+    fs::create_directories(path.parent_path(), ec);
+    if (ec) return;
+
+    std::vector<std::string> lines;
+    if (std::ifstream input(path); input) {
+        std::string line;
+        while (std::getline(input, line)) lines.push_back(line);
+    }
+
+    std::vector<std::string> kept;
+    bool in_managed_section = false;
+    for (const std::string& line : lines) {
+        const std::string trimmed = trim_setting(line);
+        if (!trimmed.empty() && trimmed.front() == '[' &&
+            trimmed.back() == ']') {
+            in_managed_section = trimmed == "[Audio]" ||
+                                 trimmed == "[Launcher]";
+            if (in_managed_section) continue;
+        }
+        if (!in_managed_section) kept.push_back(line);
+    }
+    while (!kept.empty() && trim_setting(kept.back()).empty()) kept.pop_back();
+
+    std::ofstream output(path, std::ios::trunc);
+    if (!output) return;
+    for (const std::string& line : kept) output << line << '\n';
+    if (!kept.empty()) output << '\n';
+    output << "[Audio]\n"
+           << "NativeMp2kAudio=" << (settings.native_mp2k ? "true" : "false")
+           << "\n"
+           << "TurboAudioDecoupled="
+           << (settings.native_mp2k && settings.turbo_decoupled ? "true" : "false")
+           << "\n"
+           << "[Launcher]\n"
+           << "CopySessionIdToClipboard="
+           << (settings.copy_session_id_to_clipboard ? "true" : "false")
+           << "\n";
+}
+
+bool inherited_environment_truthy(const wchar_t* name) {
+    wchar_t value[8] = {};
+    const DWORD length = GetEnvironmentVariableW(name, value,
+                                                   static_cast<DWORD>(std::size(value)));
+    return length != 0 && !(length == 1 && value[0] == L'0');
+}
+
+std::wstring inherited_environment_value(const wchar_t* name) {
+    std::vector<wchar_t> buffer(256);
+    for (;;) {
+        const DWORD length = GetEnvironmentVariableW(
+            name, buffer.data(), static_cast<DWORD>(buffer.size()));
+        if (length == 0) return {};
+        if (length < buffer.size() - 1) {
+            return std::wstring(buffer.data(), length);
+        }
+        buffer.resize(static_cast<std::size_t>(length) + 1);
+    }
+}
 
 std::wstring module_dir() {
     std::vector<wchar_t> buffer(512);
@@ -261,6 +404,43 @@ std::wstring make_session_log_path(const fs::path& logs_dir) {
     return (logs_dir / name).wstring();
 }
 
+// Clipboard support is best-effort. The launcher's clipboard preference must
+// never turn a valid game launch into an error if another application owns
+// the clipboard or the allocation/API call fails.
+bool copy_session_id_to_clipboard(HWND owner, const std::wstring& log_path) {
+    const std::wstring session_id = gsr::session_log_id_from_path(log_path);
+    if (session_id.empty()) return false;
+
+    const SIZE_T bytes = (session_id.size() + 1) * sizeof(wchar_t);
+    HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, bytes);
+    if (!memory) return false;
+    auto* text = static_cast<wchar_t*>(GlobalLock(memory));
+    if (!text) {
+        GlobalFree(memory);
+        return false;
+    }
+    std::copy(session_id.begin(), session_id.end(), text);
+    text[session_id.size()] = L'\0';
+    GlobalUnlock(memory);
+
+    if (!OpenClipboard(owner)) {
+        GlobalFree(memory);
+        return false;
+    }
+
+    bool copied = false;
+    if (EmptyClipboard()) {
+        if (SetClipboardData(CF_UNICODETEXT, memory)) {
+            // Ownership transfers to the clipboard on success.
+            memory = nullptr;
+            copied = true;
+        }
+    }
+    CloseClipboard();
+    if (memory) GlobalFree(memory);
+    return copied;
+}
+
 // Keeps the newest (kKeepLogCount - 1) existing logs so this session's new
 // file brings the total back up to kKeepLogCount. session_YYYYMMDD_HHMMSS
 // sorts lexicographically in chronological order, so no parsing is needed.
@@ -285,9 +465,13 @@ void prune_old_logs(const fs::path& logs_dir) {
         events.replace_extension(L".events.csv");
         phase.replace_extension(L".phase.csv");
         const fs::path misses = events.wstring() + L".misses.csv";
+        const fs::path recursion = events.wstring() + L".recursion.csv";
+        const fs::path ram_churn = events.wstring() + L".ram-churn.csv";
         fs::remove(logs[i], ec);
         fs::remove(events, ec);
         fs::remove(misses, ec);
+        fs::remove(recursion, ec);
+        fs::remove(ram_churn, ec);
         fs::remove(phase, ec);
     }
 }
@@ -360,8 +544,106 @@ void pump_pipe_to_log(HANDLE pipe_read, const char* tag,
     CloseHandle(pipe_read);
 }
 
+// CreateProcess takes a complete environment block when one is supplied. Use
+// that instead of SetEnvironmentVariableW so launcher settings do not leak
+// into the launcher process (or into a later child if the UI is reused).
+class ChildEnvironment {
+public:
+    ChildEnvironment() {
+        LPWCH source = GetEnvironmentStringsW();
+        if (!source) return;
+        valid_ = true;
+        for (const wchar_t* entry = source; *entry != L'\0';
+             entry += std::wcslen(entry) + 1) {
+            entries_.emplace_back(entry);
+        }
+        FreeEnvironmentStringsW(source);
+    }
+
+    bool valid() const { return valid_; }
+
+    bool contains(const std::wstring& name) const {
+        return find(name) != entries_.end();
+    }
+
+    void set(const std::wstring& name, const std::wstring& value) {
+        remove(name);
+        entries_.push_back(name + L"=" + value);
+    }
+
+    void unset(const std::wstring& name) { remove(name); }
+
+    std::vector<wchar_t> block() const {
+        std::vector<std::wstring> sorted = entries_;
+        std::sort(sorted.begin(), sorted.end(),
+                  [](const std::wstring& left, const std::wstring& right) {
+                      return _wcsicmp(left.c_str(), right.c_str()) < 0;
+                  });
+
+        std::vector<wchar_t> result;
+        for (const std::wstring& entry : sorted) {
+            result.insert(result.end(), entry.begin(), entry.end());
+            result.push_back(L'\0');
+        }
+        // The environment block is terminated by an additional NUL.
+        if (result.empty()) result.push_back(L'\0');
+        result.push_back(L'\0');
+        return result;
+    }
+
+private:
+    using EntryList = std::vector<std::wstring>;
+
+    EntryList::iterator find(const std::wstring& name) {
+        return std::find_if(entries_.begin(), entries_.end(),
+                            [&name](const std::wstring& entry) {
+                                const std::size_t equals = entry.find(L'=');
+                                // Entries beginning with '=' are Windows'...
+                                // per-drive current-directory variables.
+                                return equals != std::wstring::npos &&
+                                       equals != 0 &&
+                                       equals == name.size() &&
+                                       _wcsnicmp(entry.c_str(), name.c_str(),
+                                                 equals) == 0;
+                            });
+    }
+
+    EntryList::const_iterator find(const std::wstring& name) const {
+        return std::find_if(entries_.begin(), entries_.end(),
+                            [&name](const std::wstring& entry) {
+                                const std::size_t equals = entry.find(L'=');
+                                return equals != std::wstring::npos &&
+                                       equals != 0 &&
+                                       equals == name.size() &&
+                                       _wcsnicmp(entry.c_str(), name.c_str(),
+                                                 equals) == 0;
+                            });
+    }
+
+    void remove(const std::wstring& name) {
+        entries_.erase(std::remove_if(entries_.begin(), entries_.end(),
+                                      [&name](const std::wstring& entry) {
+                                          const std::size_t equals =
+                                              entry.find(L'=');
+                                          return equals != std::wstring::npos &&
+                                                 equals != 0 &&
+                                                 equals == name.size() &&
+                                                 _wcsnicmp(entry.c_str(),
+                                                           name.c_str(),
+                                                           equals) == 0;
+                                      }),
+                       entries_.end());
+    }
+
+    bool valid_ = false;
+    EntryList entries_;
+};
+
 int run_game(const fs::path& root, const std::wstring& rom,
              const std::wstring& bios, HWND window) {
+    // Save before spawning so a launch cannot lose a changed checkbox.
+    save_launcher_audio_settings(root, g_audio_settings);
+
     // Prefer gs011_opt: it is configured WITH SDL2 (the host window), so the
     // game actually presents a frame. build/gs011_rel is the same tree at
     // Release -O3 but was configured without SDL2 (verified 2026-08-15:
@@ -393,19 +675,6 @@ int run_game(const fs::path& root, const std::wstring& rom,
     }
 
     fs::create_directories(root / L"recomp_cache");
-    // Golden Sun's Camelot intro overflows the Windows host stack with the
-    // present-in-place path. Use the stable frame-boundary unwind path here.
-    SetEnvironmentVariableW(L"GBARECOMP_PRESENT_IN_PLACE", L"0");
-    // The menu/overworld reaches mutable generated RAM code. The runtime
-    // verifies its CRC on every native entry and re-heals on any change.
-    SetEnvironmentVariableW(L"GBARECOMP_SELFHEAL_RAM", L"1");
-    // The native MP2K path is still probationary; keep canonical GBA audio.
-    SetEnvironmentVariableW(L"GBARECOMP_AUDIO_NATIVE", L"0");
-    // Keep the canonical GBA left/right Direct Sound buses instead of the
-    // legacy faithful mono host route. This does not enable native MP2K.
-    SetEnvironmentVariableW(L"GBARECOMP_AUDIO_STEREO", L"1");
-    SetEnvironmentVariableW(L"GBARECOMP_HEAL_CACHE",
-                            (root / L"recomp_cache").c_str());
 
     const fs::path logs_dir = root / L"logs";
     std::error_code dir_ec;
@@ -438,24 +707,107 @@ int run_game(const fs::path& root, const std::wstring& rom,
         std::ofstream latest(logs_dir / L"latest.txt", std::ios::binary | std::ios::trunc);
         if (latest) latest << wide_to_utf8(log_path) << '\n';
 
-        // Keep battle-stutter evidence beside the ordinary session log. These
-        // switches only dump existing bounded timing rings at clean shutdown;
-        // they do not capture ROM, save, or framebuffer bytes. Respect an
-        // explicit developer override.
+        if (g_audio_settings.copy_session_id_to_clipboard) {
+            // Failure is intentionally silent; logging and launch continue.
+            copy_session_id_to_clipboard(window, log_path);
+        }
+    }
+
+    ChildEnvironment child_environment;
+    if (!child_environment.valid()) {
+        if (log_file != INVALID_HANDLE_VALUE) CloseHandle(log_file);
+        MessageBoxW(nullptr, L"The game environment could not be prepared.",
+                    L"Golden Sun Recompiled", MB_OK | MB_ICONERROR);
+        return 1;
+    }
+
+    // Golden Sun's Camelot intro overflows the Windows host stack with the
+    // present-in-place path. Use the stable frame-boundary unwind path here.
+    child_environment.set(L"GBARECOMP_PRESENT_IN_PLACE", L"0");
+    // Native MP2K and decoupled Turbo are experimental and opt-in. Strict
+    // static acceptance always wins over the UI and keeps both canonical.
+    const auto audio_policy = gsr::resolve_launcher_audio_policy(
+        g_audio_settings.native_mp2k,
+        g_audio_settings.turbo_decoupled,
+        g_strict_static_route,
+        false /* MuteDuringTurbo is runtime-owned and has precedence there. */);
+    const bool native_mp2k = audio_policy.native_mp2k;
+    const bool turbo_decoupled = audio_policy.turbo_decoupled;
+    child_environment.set(L"GBARECOMP_AUDIO_NATIVE",
+                          native_mp2k ? L"1" : L"0");
+    child_environment.set(L"GBARECOMP_TURBO_AUDIO",
+                          turbo_decoupled ? L"decoupled" : L"0");
+    // Keep the canonical GBA left/right Direct Sound buses instead of the
+    // legacy faithful mono host route. This does not enable native MP2K.
+    child_environment.set(L"GBARECOMP_AUDIO_STEREO", L"1");
+    child_environment.set(L"GBARECOMP_HEAL_CACHE",
+                          (root / L"recomp_cache").wstring());
+
+    // WIDE-01 diagnostics are launcher-owned and always explicit: unchecked
+    // means the child receives 0, even if the launcher inherited 1 from a
+    // developer shell. This keeps normal gameplay free of optional traces.
+    const auto widescreen_diagnostics_policy =
+        gsr::resolve_launcher_widescreen_diagnostics_policy(
+            g_widescreen_diagnostics);
+    child_environment.set(L"GBARECOMP_VRAM_MAP_TRACE",
+                          widescreen_diagnostics_policy.environment_value);
+
+    // These are diagnostics, never part of the faithful default. Explicitly
+    // remove inherited values when the master checkbox is off so a
+    // shell-launched value cannot silently turn this into a crutch run;
+    // self-healing is the one intentional exception.
+    struct TestEnvironmentVariable {
+        const wchar_t* name;
+        bool enabled;
+    };
+    const TestEnvironmentVariable test_environment_variables[] = {
+        {L"GBARECOMP_SELFHEAL_RAM", g_test_selfheal_ram},
+        {L"GBARECOMP_COST_PROBE", g_test_cost_probe},
+        {L"GBARECOMP_PRESENT_CADENCE", g_test_present_cadence},
+        {L"GSR_BLITTER_SHADOW", g_test_blitter_shadow},
+        {L"GSR_RECURSION_PROBE", g_test_recursion_probe},
+        {L"GSR_RAM_CHURN_PROBE", g_test_ram_churn_probe},
+        {L"GSR_OAM_SHADOW_TRACE", g_test_oam_shadow_trace},
+    };
+    for (const TestEnvironmentVariable& variable : test_environment_variables) {
+        const bool self_heal =
+            std::wcscmp(variable.name, L"GBARECOMP_SELFHEAL_RAM") == 0;
+        if (gsr::launcher_test_variable_enabled(g_test_variables, self_heal,
+                                                variable.enabled)) {
+            child_environment.set(variable.name, L"1");
+        } else if (std::wcscmp(variable.name, L"GSR_BLITTER_SHADOW") == 0) {
+            // This probe falls back to the config UI's Additional debug
+            // logging when the variable is absent. Keep this child toggle
+            // authoritative even when that unrelated setting is enabled.
+            child_environment.set(variable.name, L"0");
+        } else {
+            child_environment.unset(variable.name);
+        }
+    }
+
+    if (logging) {
+        // Respect an explicit developer override inherited by the launcher.
         fs::path events_path = log_path;
         fs::path phase_path = log_path;
         events_path.replace_extension(L".events.csv");
         phase_path.replace_extension(L".phase.csv");
-        if (GetEnvironmentVariableW(L"GBARECOMP_FRAME_EVENTS", nullptr, 0) == 0)
-            SetEnvironmentVariableW(L"GBARECOMP_FRAME_EVENTS",
-                                    events_path.c_str());
-        if (GetEnvironmentVariableW(L"GBARECOMP_FRAME_PHASE", nullptr, 0) == 0)
-            SetEnvironmentVariableW(L"GBARECOMP_FRAME_PHASE",
-                                    phase_path.c_str());
+        if (!child_environment.contains(L"GBARECOMP_FRAME_EVENTS"))
+            child_environment.set(L"GBARECOMP_FRAME_EVENTS",
+                                  events_path.wstring());
+        if (!child_environment.contains(L"GBARECOMP_FRAME_PHASE"))
+            child_environment.set(L"GBARECOMP_FRAME_PHASE",
+                                  phase_path.wstring());
     }
 
     std::wstring command = L"\"" + game.wstring() + L"\" --bios \"" +
                            bios + L"\" --rom \"" + rom + L"\"";
+    // Developer-only replay seam. The normal launcher command is unchanged
+    // when these inherited variables are absent. Input replay is already
+    // inherited by ChildEnvironment; these controls only bridge the state
+    // path and an optional windowed frame budget to the runner CLI.
+    gsr::append_developer_replay_arguments(
+        command, inherited_environment_value(L"GBARECOMP_LOAD_STATE"),
+        inherited_environment_value(L"GBARECOMP_REPLAY_FRAMES"));
     std::vector<wchar_t> mutable_command(command.begin(), command.end());
     mutable_command.push_back(L'\0');
 
@@ -492,8 +844,10 @@ int run_game(const fs::path& root, const std::wstring& rom,
     }
 
     PROCESS_INFORMATION process{};
+    std::vector<wchar_t> environment_block = child_environment.block();
     if (!CreateProcessW(game.c_str(), mutable_command.data(), nullptr, nullptr,
-                        inherit_handles, 0, nullptr, root.c_str(), &startup,
+                        inherit_handles, CREATE_UNICODE_ENVIRONMENT,
+                        environment_block.data(), root.c_str(), &startup,
                         &process)) {
         if (out_read) CloseHandle(out_read);
         if (out_write) CloseHandle(out_write);
@@ -538,6 +892,19 @@ int run_game(const fs::path& root, const std::wstring& rom,
 
 constexpr int kPickRomButton = 1001;
 constexpr int kQuitButton = 1002;
+constexpr int kTestVariablesButton = 1003;
+constexpr int kSelfHealRamButton = 1004;
+constexpr int kCostProbeButton = 1005;
+constexpr int kPresentCadenceButton = 1006;
+constexpr int kBlitterShadowButton = 1007;
+constexpr int kRecursionProbeButton = 1008;
+constexpr int kRamChurnProbeButton = 1009;
+constexpr int kNativeMp2kButton = 1010;
+constexpr int kTurboAudioButton = 1011;
+constexpr int kAudioHelpText = 1012;
+constexpr int kCopySessionIdButton = 1013;
+constexpr int kOamShadowTraceButton = 1014;
+constexpr int kWideDiagnosticsButton = 1015;
 
 fs::path g_launcher_root;
 std::wstring g_launcher_bios;
@@ -555,9 +922,92 @@ void layout_buttons(HWND window) {
     const int y = std::max<int>(0, static_cast<int>(client.bottom - button_height - 28));
     HWND pick = GetDlgItem(window, kPickRomButton);
     HWND quit = GetDlgItem(window, kQuitButton);
+    HWND test_variables = GetDlgItem(window, kTestVariablesButton);
+    HWND wide_diagnostics = GetDlgItem(window, kWideDiagnosticsButton);
     if (pick) MoveWindow(pick, x, y, button_width, button_height, TRUE);
     if (quit) MoveWindow(quit, x + button_width + gap, y,
                          button_width, button_height, TRUE);
+
+    constexpr int toggle_height = 28;
+    constexpr int wide_toggle_width = 360;
+    const int toggle_x = std::max<int>(
+        0, static_cast<int>((client.right - wide_toggle_width) / 2));
+    const int wide_toggle_y = std::max<int>(0, y - toggle_height - 8);
+    if (wide_diagnostics) {
+        MoveWindow(wide_diagnostics, toggle_x, wide_toggle_y,
+                   wide_toggle_width, toggle_height, TRUE);
+    }
+
+    if (test_variables) {
+        constexpr int test_toggle_width = 220;
+        const int test_toggle_x = std::max<int>(
+            0, static_cast<int>((client.right - test_toggle_width) / 2));
+        const int test_toggle_y = std::max<int>(
+            0, wide_toggle_y - toggle_height - 6);
+        MoveWindow(test_variables, test_toggle_x, test_toggle_y,
+                   test_toggle_width, toggle_height, TRUE);
+
+        constexpr int child_width = 240;
+        constexpr int child_height = 24;
+        constexpr int child_gap = 2;
+        const int child_x = std::max<int>(
+            0, static_cast<int>((client.right - child_width) / 2));
+        const int child_bottom = test_toggle_y - 6;
+        const int child_top = child_bottom -
+            (child_height * 7 + child_gap * 6);
+        const int child_y[] = {
+            child_top,
+            child_top + child_height + child_gap,
+            child_top + (child_height + child_gap) * 2,
+            child_top + (child_height + child_gap) * 3,
+            child_top + (child_height + child_gap) * 4,
+            child_top + (child_height + child_gap) * 5,
+            child_top + (child_height + child_gap) * 6,
+        };
+        const int child_ids[] = {
+            kSelfHealRamButton,
+            kCostProbeButton,
+            kPresentCadenceButton,
+            kBlitterShadowButton,
+            kRecursionProbeButton,
+            kRamChurnProbeButton,
+            kOamShadowTraceButton,
+        };
+        for (int i = 0; i < 7; ++i) {
+            HWND child = GetDlgItem(window, child_ids[i]);
+            if (!child) continue;
+            MoveWindow(child, child_x, std::max(0, child_y[i]), child_width,
+                       child_height, TRUE);
+            ShowWindow(child, g_test_variables ? SW_SHOW : SW_HIDE);
+        }
+
+        const int audio_top = std::max(0, child_top - 56);
+        constexpr int audio_width = 500;
+        const int audio_x = std::max<int>(
+            0, static_cast<int>((client.right - audio_width) / 2));
+        HWND native_mp2k = GetDlgItem(window, kNativeMp2kButton);
+        HWND turbo_audio = GetDlgItem(window, kTurboAudioButton);
+        HWND audio_help = GetDlgItem(window, kAudioHelpText);
+        HWND copy_session_id = GetDlgItem(window, kCopySessionIdButton);
+        if (copy_session_id) {
+            MoveWindow(copy_session_id, audio_x, std::max(0, audio_top - 76),
+                       audio_width, 24, TRUE);
+        }
+        if (native_mp2k) {
+            MoveWindow(native_mp2k, audio_x, audio_top, audio_width, 24, TRUE);
+            EnableWindow(native_mp2k, !g_strict_static_route);
+        }
+        if (turbo_audio) {
+            MoveWindow(turbo_audio, audio_x, audio_top + 26,
+                       audio_width, 24, TRUE);
+        EnableWindow(turbo_audio, g_audio_settings.native_mp2k &&
+                                      !g_strict_static_route);
+        }
+        if (audio_help) {
+            MoveWindow(audio_help, audio_x, std::max(0, audio_top - 46),
+                       audio_width, 44, TRUE);
+        }
+    }
 }
 
 void paint_splash(HWND window, HDC dc) {
@@ -604,6 +1054,19 @@ LRESULT CALLBACK launcher_window_proc(HWND window, UINT message,
                                       WPARAM w_param, LPARAM l_param) {
     switch (message) {
     case WM_CREATE: {
+        // Optional acceptance diagnostics are session-only and always start
+        // unchecked; this prevents a prior trace run from making normal play
+        // noisy on the next launcher invocation.
+        g_widescreen_diagnostics =
+            gsr::launcher_widescreen_diagnostics_default();
+        g_test_variables = k_launcher_test_defaults.master;
+        g_test_selfheal_ram = k_launcher_test_defaults.self_heal_ram;
+        g_test_cost_probe = k_launcher_test_defaults.cost_probe;
+        g_test_present_cadence = k_launcher_test_defaults.present_cadence;
+        g_test_blitter_shadow = k_launcher_test_defaults.blitter_shadow;
+        g_test_recursion_probe = k_launcher_test_defaults.recursion_probe;
+        g_test_ram_churn_probe = k_launcher_test_defaults.ram_churn_probe;
+        g_test_oam_shadow_trace = k_launcher_test_defaults.oam_shadow_trace;
         CreateWindowExW(0, L"BUTTON", L"Pick ROM",
                         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
                         0, 0, 0, 0, window,
@@ -614,6 +1077,115 @@ LRESULT CALLBACK launcher_window_proc(HWND window, UINT message,
                         0, 0, 0, 0, window,
                         reinterpret_cast<HMENU>(kQuitButton),
                         GetModuleHandleW(nullptr), nullptr);
+        HWND wide_diagnostics = CreateWindowExW(
+            0, L"BUTTON", L"Widescreen diagnostics (WIDE-01)",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+            0, 0, 0, 0, window,
+            reinterpret_cast<HMENU>(kWideDiagnosticsButton),
+            GetModuleHandleW(nullptr), nullptr);
+        if (wide_diagnostics) {
+            SendMessageW(wide_diagnostics, WM_SETFONT,
+                         reinterpret_cast<WPARAM>(g_button_font), TRUE);
+            SendMessageW(wide_diagnostics, BM_SETCHECK,
+                         g_widescreen_diagnostics
+                             ? BST_CHECKED : BST_UNCHECKED,
+                         TRUE);
+        }
+        HWND test_variables = CreateWindowExW(
+            0, L"BUTTON", L"Test variables",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+            0, 0, 0, 0, window,
+            reinterpret_cast<HMENU>(kTestVariablesButton),
+            GetModuleHandleW(nullptr), nullptr);
+        // The default is intentionally OFF for every launcher invocation.
+        if (test_variables) {
+            SendMessageW(test_variables, WM_SETFONT,
+                         reinterpret_cast<WPARAM>(g_button_font), TRUE);
+            SendMessageW(test_variables, BM_SETCHECK, BST_UNCHECKED, TRUE);
+        }
+        struct TestChildControl {
+            int id;
+            const wchar_t* label;
+            bool checked;
+        };
+        const TestChildControl children[] = {
+            {kSelfHealRamButton, L"Self-heal RAM", g_test_selfheal_ram},
+            {kCostProbeButton, L"Cost probe", g_test_cost_probe},
+            {kPresentCadenceButton, L"Present cadence", g_test_present_cadence},
+            {kBlitterShadowButton, L"Blitter shadow", g_test_blitter_shadow},
+            {kRecursionProbeButton, L"Recursion probe", g_test_recursion_probe},
+            {kRamChurnProbeButton, L"RAM churn probe", g_test_ram_churn_probe},
+            {kOamShadowTraceButton, L"OAM shadow writer trace", g_test_oam_shadow_trace},
+        };
+        for (const TestChildControl& child : children) {
+            HWND control = CreateWindowExW(
+                0, L"BUTTON", child.label,
+                WS_CHILD | WS_TABSTOP | BS_AUTOCHECKBOX,
+                0, 0, 0, 0, window,
+                reinterpret_cast<HMENU>(child.id),
+                GetModuleHandleW(nullptr), nullptr);
+            if (!control) continue;
+            SendMessageW(control, WM_SETFONT,
+                         reinterpret_cast<WPARAM>(g_button_font), TRUE);
+            SendMessageW(control, BM_SETCHECK,
+                         child.checked ? BST_CHECKED : BST_UNCHECKED, TRUE);
+        }
+
+        HWND native_mp2k = CreateWindowExW(
+            0, L"BUTTON", L"Native MP2K audio (Experimental)",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+            0, 0, 0, 0, window,
+            reinterpret_cast<HMENU>(kNativeMp2kButton),
+            GetModuleHandleW(nullptr), nullptr);
+        HWND turbo_audio = CreateWindowExW(
+            0, L"BUTTON", L"Normal-speed Turbo audio (Experimental)",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+            0, 0, 0, 0, window,
+            reinterpret_cast<HMENU>(kTurboAudioButton),
+            GetModuleHandleW(nullptr), nullptr);
+        HWND audio_help = CreateWindowExW(
+            0, L"STATIC",
+            L"Default audio coupled. Launcher toggle: MP2K music-only Turbo; "
+            L"PSG/FIFO omitted. 2x-4x only; 1x/>4x/uncapped or "
+            L"reverb/unsupported falls back to canonical coupled audio. "
+            L"MuteDuringTurbo wins.",
+            WS_CHILD | WS_VISIBLE | SS_LEFT,
+            0, 0, 0, 0, window,
+            reinterpret_cast<HMENU>(kAudioHelpText),
+            GetModuleHandleW(nullptr), nullptr);
+        for (HWND control : {native_mp2k, turbo_audio, audio_help}) {
+            if (!control) continue;
+            SendMessageW(control, WM_SETFONT,
+                         reinterpret_cast<WPARAM>(g_button_font), TRUE);
+        }
+        if (native_mp2k) {
+            SendMessageW(native_mp2k, BM_SETCHECK,
+                         g_audio_settings.native_mp2k && !g_strict_static_route
+                             ? BST_CHECKED : BST_UNCHECKED,
+                         TRUE);
+        }
+        if (turbo_audio) {
+            SendMessageW(turbo_audio, BM_SETCHECK,
+                         g_audio_settings.native_mp2k &&
+                                 g_audio_settings.turbo_decoupled &&
+                                 !g_strict_static_route
+                             ? BST_CHECKED : BST_UNCHECKED,
+                         TRUE);
+        }
+        HWND copy_session_id = CreateWindowExW(
+            0, L"BUTTON", L"Copy session ID to clipboard",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+            0, 0, 0, 0, window,
+            reinterpret_cast<HMENU>(kCopySessionIdButton),
+            GetModuleHandleW(nullptr), nullptr);
+        if (copy_session_id) {
+            SendMessageW(copy_session_id, WM_SETFONT,
+                         reinterpret_cast<WPARAM>(g_button_font), TRUE);
+            SendMessageW(copy_session_id, BM_SETCHECK,
+                         g_audio_settings.copy_session_id_to_clipboard
+                             ? BST_CHECKED : BST_UNCHECKED,
+                         TRUE);
+        }
         layout_buttons(window);
         return 0;
     }
@@ -658,6 +1230,94 @@ LRESULT CALLBACK launcher_window_proc(HWND window, UINT message,
             DestroyWindow(window);
             return 0;
         }
+        if (LOWORD(w_param) == kWideDiagnosticsButton) {
+            g_widescreen_diagnostics = SendMessageW(
+                GetDlgItem(window, kWideDiagnosticsButton), BM_GETCHECK, 0, 0) ==
+                BST_CHECKED;
+            return 0;
+        }
+        if (LOWORD(w_param) == kNativeMp2kButton) {
+            g_audio_settings.native_mp2k = SendMessageW(
+                GetDlgItem(window, kNativeMp2kButton), BM_GETCHECK, 0, 0) ==
+                BST_CHECKED;
+            if (!g_audio_settings.native_mp2k) {
+                g_audio_settings.turbo_decoupled = false;
+                HWND turbo_audio = GetDlgItem(window, kTurboAudioButton);
+                if (turbo_audio)
+                    SendMessageW(turbo_audio, BM_SETCHECK, BST_UNCHECKED, TRUE);
+            }
+            save_launcher_audio_settings(g_launcher_root, g_audio_settings);
+            layout_buttons(window);
+            return 0;
+        }
+        if (LOWORD(w_param) == kTurboAudioButton) {
+            g_audio_settings.turbo_decoupled =
+                g_audio_settings.native_mp2k &&
+                SendMessageW(GetDlgItem(window, kTurboAudioButton), BM_GETCHECK,
+                             0, 0) == BST_CHECKED;
+            if (!g_audio_settings.native_mp2k) {
+                SendMessageW(GetDlgItem(window, kTurboAudioButton), BM_SETCHECK,
+                             BST_UNCHECKED, TRUE);
+            }
+            save_launcher_audio_settings(g_launcher_root, g_audio_settings);
+            return 0;
+        }
+        if (LOWORD(w_param) == kCopySessionIdButton) {
+            g_audio_settings.copy_session_id_to_clipboard =
+                SendMessageW(GetDlgItem(window, kCopySessionIdButton),
+                             BM_GETCHECK, 0, 0) == BST_CHECKED;
+            save_launcher_audio_settings(g_launcher_root, g_audio_settings);
+            return 0;
+        }
+        if (LOWORD(w_param) == kTestVariablesButton) {
+            g_test_variables = SendMessageW(
+                                  GetDlgItem(window, kTestVariablesButton),
+                                  BM_GETCHECK, 0, 0) == BST_CHECKED;
+            layout_buttons(window);
+            return 0;
+        }
+        if (LOWORD(w_param) == kSelfHealRamButton) {
+            g_test_selfheal_ram = SendMessageW(
+                GetDlgItem(window, kSelfHealRamButton), BM_GETCHECK, 0, 0) ==
+                BST_CHECKED;
+            return 0;
+        }
+        if (LOWORD(w_param) == kCostProbeButton) {
+            g_test_cost_probe = SendMessageW(
+                GetDlgItem(window, kCostProbeButton), BM_GETCHECK, 0, 0) ==
+                BST_CHECKED;
+            return 0;
+        }
+        if (LOWORD(w_param) == kPresentCadenceButton) {
+            g_test_present_cadence = SendMessageW(
+                GetDlgItem(window, kPresentCadenceButton), BM_GETCHECK, 0, 0) ==
+                BST_CHECKED;
+            return 0;
+        }
+        if (LOWORD(w_param) == kBlitterShadowButton) {
+            g_test_blitter_shadow = SendMessageW(
+                GetDlgItem(window, kBlitterShadowButton), BM_GETCHECK, 0, 0) ==
+                BST_CHECKED;
+            return 0;
+        }
+        if (LOWORD(w_param) == kRecursionProbeButton) {
+            g_test_recursion_probe = SendMessageW(
+                GetDlgItem(window, kRecursionProbeButton), BM_GETCHECK, 0, 0) ==
+                BST_CHECKED;
+            return 0;
+        }
+        if (LOWORD(w_param) == kRamChurnProbeButton) {
+            g_test_ram_churn_probe = SendMessageW(
+                GetDlgItem(window, kRamChurnProbeButton), BM_GETCHECK, 0, 0) ==
+                BST_CHECKED;
+            return 0;
+        }
+        if (LOWORD(w_param) == kOamShadowTraceButton) {
+            g_test_oam_shadow_trace = SendMessageW(
+                GetDlgItem(window, kOamShadowTraceButton), BM_GETCHECK, 0, 0) ==
+                BST_CHECKED;
+            return 0;
+        }
         if (LOWORD(w_param) == kPickRomButton) {
             const std::wstring rom = choose_rom(g_launcher_root);
             if (!rom.empty() &&
@@ -691,6 +1351,9 @@ int show_launcher(const fs::path& root, const std::wstring& bios) {
 
     g_launcher_root = root;
     g_launcher_bios = bios;
+    g_audio_settings = load_launcher_audio_settings(root);
+    g_strict_static_route = inherited_environment_truthy(
+        L"GBARECOMP_STRICT_STATIC");
     g_splash_image = std::make_unique<Gdiplus::Image>(
         (root / L"gssplash.jpg").c_str());
     g_button_font = CreateFontW(22, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
@@ -765,6 +1428,25 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
                     L"Golden Sun Recompiled", MB_OK | MB_ICONERROR);
         gbarecomp::crash_handler_mark_clean_exit();
         return 1;
+    }
+    const bool developer_auto_launch =
+        inherited_environment_truthy(L"GBARECOMP_AUTO_LAUNCH");
+    if (developer_auto_launch) {
+        // This path is deliberately opt-in and uses the same cached ROM plus
+        // exact SHA-1 validation as the normal Pick ROM button. It exists so
+        // scripted replay can still enter through GoldenSunLauncher.exe.
+        const fs::path cached_path = root / L"local" / L"launcher-rom.txt";
+        const std::wstring cached_rom = read_cached_path(cached_path);
+        std::wstring error;
+        if (!cached_rom.empty() && validate_rom(cached_rom, &error)) {
+            g_audio_settings = load_launcher_audio_settings(root);
+            g_strict_static_route = inherited_environment_truthy(
+                L"GBARECOMP_STRICT_STATIC");
+            SetProcessDPIAware();
+            const int result = run_game(root, cached_rom, bios, nullptr);
+            gbarecomp::crash_handler_mark_clean_exit();
+            return result;
+        }
     }
     SetProcessDPIAware();
     const int result = show_launcher(root, bios);

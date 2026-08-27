@@ -30,6 +30,64 @@ target_include_directories(gsr_blitter_shadow_observer_test PRIVATE
 add_test(NAME blitter_shadow_observer_test
          COMMAND gsr_blitter_shadow_observer_test)
 
+add_executable(gsr_launcher_audio_policy_test
+    tests/cpp/launcher_audio_policy_test.cpp)
+target_include_directories(gsr_launcher_audio_policy_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/src)
+add_test(NAME launcher_audio_policy_test
+         COMMAND gsr_launcher_audio_policy_test)
+
+add_executable(gsr_launcher_test_policy_test
+    tests/cpp/launcher_test_policy_test.cpp)
+target_include_directories(gsr_launcher_test_policy_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/src)
+add_test(NAME launcher_test_policy_test
+         COMMAND gsr_launcher_test_policy_test)
+
+add_executable(gsr_launcher_widescreen_diagnostics_policy_test
+    tests/cpp/launcher_widescreen_diagnostics_policy_test.cpp)
+target_include_directories(gsr_launcher_widescreen_diagnostics_policy_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/src)
+add_test(NAME launcher_widescreen_diagnostics_policy_test
+         COMMAND gsr_launcher_widescreen_diagnostics_policy_test)
+
+add_executable(gsr_launcher_session_id_test
+    tests/cpp/launcher_session_id_test.cpp)
+target_include_directories(gsr_launcher_session_id_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/src)
+add_test(NAME launcher_session_id_test
+         COMMAND gsr_launcher_session_id_test)
+
+add_executable(gsr_player_speed_cheat_test
+    tests/cpp/player_speed_cheat_test.cpp)
+target_include_directories(gsr_player_speed_cheat_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/gbarecomp/src/runtime)
+add_test(NAME player_speed_cheat_test
+         COMMAND gsr_player_speed_cheat_test)
+
+add_executable(gsr_widescreen_policy_test
+    tests/cpp/widescreen_policy_test.cpp)
+target_include_directories(gsr_widescreen_policy_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/gbarecomp/src/runtime)
+add_test(NAME widescreen_policy_test
+         COMMAND gsr_widescreen_policy_test)
+
+add_executable(gsr_widescreen_literal_trace_test
+    tests/cpp/widescreen_literal_trace_test.cpp)
+target_include_directories(gsr_widescreen_literal_trace_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/src)
+add_test(NAME widescreen_literal_trace_test
+         COMMAND gsr_widescreen_literal_trace_test)
+
+add_executable(gsr_launcher_replay_policy_test
+    tests/cpp/launcher_replay_policy_test.cpp)
+target_include_directories(gsr_launcher_replay_policy_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/src)
+add_test(NAME launcher_replay_policy_test
+         COMMAND gsr_launcher_replay_policy_test)
+
 find_package(Python3 3.10 COMPONENTS Interpreter REQUIRED)
 add_test(
     NAME symbol_corpus_validation

@@ -43,6 +43,77 @@ REVISION_RE = re.compile(r"^[0-9a-f]{40}$")
 # `[[resume_range]]` is capped at 0x1000 bytes by the upstream TOML schema.
 RESUME_RANGE_MAX_BYTES = 0x1000
 
+# The widened field view needs two exact guest cull constants relaxed. ROM
+# disassembly proves Func_b168's final horizontal reject at 0x0800b322 and
+# its two vertical paths at 0x0800b27c/0x0800b326. The runner changes them only
+# for the authenticated Mode-0 field and active matching margins.
+REVIEWED_THUMB_ALU_IMMEDIATE_OVERRIDES = (
+    {
+        "addr": 0x0800B27C,
+        "note": (
+            "Mode-0 expanded-view only: Func_b168 alternate screen-Y cull is "
+            "cmp r6,#159 at this exact ROM PC; runner widens to the "
+            "authenticated bottom margin"
+        ),
+    },
+    {
+        "addr": 0x0800B322,
+        "note": (
+            "Mode-0 widescreen only: Func_b168 screen-X cull is "
+            "cmp r4,#239 at this exact ROM PC; runner widens to the "
+            "authenticated right margin"
+        ),
+    },
+    {
+        "addr": 0x0800B326,
+        "note": (
+            "Mode-0 expanded-view only: Func_b168 screen-Y cull is "
+            "cmp r6,#159 at this exact ROM PC; runner widens to the "
+            "authenticated bottom margin"
+        ),
+    },
+    {
+        "addr": 0x0800B3CA,
+        "note": (
+            "Mode-0 expanded-view only: Func_b388 shared negative X/Y actor "
+            "pre-cull padding; runner extends it by the active margin"
+        ),
+    },
+    {
+        "addr": 0x0800B3D6,
+        "note": (
+            "Mode-0 expanded-view only: Func_b388 actor X upper pre-cull "
+            "half-limit; runner extends it by the active right margin"
+        ),
+    },
+    {
+        "addr": 0x0800B3EA,
+        "note": (
+            "Mode-0 expanded-view only: Func_b388 actor Y upper pre-cull; "
+            "runner extends it by the active bottom margin"
+        ),
+    },
+)
+
+REVIEWED_THUMB_LITERAL_OVERRIDES = (
+    {
+        "addr": 0x0800C6F2,
+        "note": (
+            "Mode-0 expanded-view only: Func_c62c field-list X upper "
+            "bound LDR literal 0x012ffffe at the source PC; runner adds the "
+            "active right margin in 16.16 fixed-point"
+        ),
+    },
+    {
+        "addr": 0x0800C6FE,
+        "note": (
+            "Mode-0 expanded-view only: Func_c62c field-list Y lower bound "
+            "LDR literal -32px at the source PC; runner extends the "
+            "authenticated top margin while preserving the native padding"
+        ),
+    },
+)
+
 # ROM functions that strict-static execution has shown to take an asynchronous
 # IRQ return at an interior instruction. Listing individual PCs for these was a
 # crawl — each build surfaced the next instruction of the same loop — so the
@@ -978,7 +1049,7 @@ REVIEWED_RESUME_FUNCTIONS = (
 # first GS-010 strict-static boundary: native and mGBA architectural state agree
 # through the preceding instruction at 0x080047AC, whose tick reaches VBlank;
 # the headless runtime then unwinds before executing 0x080047AE. The containing
-# THUMB body begins at 0x080047A4. See docs/ORACLE_HANDOFF_BASELINE.md.
+# THUMB body begins at 0x080047A4. See docs/history/ORACLE_HANDOFF_BASELINE.md.
 REVIEWED_RESUME_POINTS = (
     {
         "addr": 0x03000954,
@@ -2254,6 +2325,10 @@ def render_toml(
         f"# reviewed section seeds: {len(section_seeds)}",
         f"# reviewed interworking resumes: {len(interwork_resumes)}",
         f"# derived veneer resumes: {len(veneer_resumes)}",
+        f"# reviewed THUMB ALU immediate overrides: "
+        f"{len(REVIEWED_THUMB_ALU_IMMEDIATE_OVERRIDES)}",
+        f"# reviewed THUMB literal overrides: "
+        f"{len(REVIEWED_THUMB_LITERAL_OVERRIDES)}",
         f"# reviewed resume ranges: {len(resume_ranges)}"
         f" from {len(REVIEWED_RESUME_FUNCTIONS)} function(s)",
         "",
@@ -2269,6 +2344,24 @@ def render_toml(
         "[identity]",
         f'sha1 = "{EXPECTED_SHA1}"',
     ]
+    for entry in REVIEWED_THUMB_ALU_IMMEDIATE_OVERRIDES:
+        lines.extend(
+            [
+                "",
+                "[[thumb_alu_immediate_override]]",
+                f"addr = 0x{entry['addr']:08x}",
+                f"note = {_toml_string(entry['note'])}",
+            ]
+        )
+    for entry in REVIEWED_THUMB_LITERAL_OVERRIDES:
+        lines.extend(
+            [
+                "",
+                "[[thumb_literal_override]]",
+                f"addr = 0x{entry['addr']:08x}",
+                f"note = {_toml_string(entry['note'])}",
+            ]
+        )
     for copy in code_copies:
         lines.extend(
             [
