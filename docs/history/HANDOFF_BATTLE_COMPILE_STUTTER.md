@@ -1,7 +1,7 @@
 > **SUPERSEDED 2026-08-20.** The primary suspicion below (identity drift / the
 > tail-dispatch refactor) was wrong. The real cause was a 128-deep dispatch
 > recursion cap added by `59c1858` returning `0`, which callers read as "no
-> resident code". Read `docs/HANDOFF_2026-08-20.md` instead. Kept for its
+> resident code". Read `docs/history/HANDOFF_2026-08-20.md` instead. Kept for its
 > ruled-out list, which is still accurate.
 
 # Handoff — battle effect recompilation stutter (2026-08-19)

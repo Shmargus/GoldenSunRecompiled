@@ -76,7 +76,7 @@ The generated TOML SHA-256 is:
 `95037ca9c55dfb595b751eb47afb29c45d48be361d298741ac2f02809d9f88e6`
 
 The resume entry is backed by the GS-010 native/mGBA fingerprint comparison in
-`docs/ORACLE_HANDOFF_BASELINE.md`. It rolls into the existing THUMB function at
+`docs/history/ORACLE_HANDOFF_BASELINE.md`. It rolls into the existing THUMB function at
 `0x080047a4`; it does not add or split a function.
 
 ## First-divergence upstream fix
@@ -168,7 +168,7 @@ x86-64 compiler, including the generated directory and pinned upstream
 - No manual jump table has enough evidence yet.
 - The code-copy activation timing has not been synchronized against an oracle.
 - The first architectural divergence is now the PPU-phase-dependent `DISPSTAT`
-  read at `0x080030b8`; see `docs/ORACLE_HANDOFF_BASELINE.md`.
+  read at `0x080030b8`; see `docs/history/ORACLE_HANDOFF_BASELINE.md`.
 - The local generic finder fix must be reviewed upstream and represented by a
   new exact pin before clean-checkout reproducibility can pass.
 - This is static-generation evidence only; no execution or coverage claim is

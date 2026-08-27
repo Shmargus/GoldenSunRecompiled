@@ -1,133 +1,57 @@
 # Current status
 
-Last updated 2026-08-20. This is the short answer to "where is the project?".
-Open work lives in `docs/ACTIVE_ISSUES.md`. Closed records live in
-`docs/history/`.
+Updated 2026-08-26. Faithful 240x160 output and original timing remain the
+default; enhancements are opt-in.
 
-## Right now (2026-08-20)
+## Milestone
 
-A battle/menu stutter regression is fixed in the working tree (uncommitted):
-`gbarecomp`'s 128-deep dispatch recursion cap was reporting resident code as
-missing, causing the same body to be recompiled hundreds of times per battle.
-RAM compiles per battle dropped 2581 to ~195, user-confirmed. Two permanent
-stderr diagnostics (`[ram-compile]`, `[dispatch-miss]`) are deliberately left on
-in normal play. The tail-dispatch refactor (**CORE-01**) is parked and its
-stashes must not be dropped. Remaining small hitch tracked as **PERF-08**,
-blocked on a longer play-session log. See `docs/HANDOFF_2026-08-20.md`.
+Golden Sun is playable through the early game. The current baseline still has
+dynamic RAM marked **NOT_STATIC**. The battle/menu compile-stutter regression
+is fixed; residual small hitches are **PERF-08**. **CORE-01** is parked; see
+[`PARKED.md`](PARKED.md).
 
-## Where the project is
+## Build and launch
 
-Golden Sun runs. The prologue, Vale, the overworld, battles, menus, saves and
-the early game are all playable end to end on a local hash-gated build. The
-faithful 240x160 output at original timing is still the default, and every
-enhancement is opt-in.
+- Playable build: `build/gs011_opt`, selected by the repository-root
+  `GoldenSunLauncher.exe`.
+- Launch only `GoldenSunLauncher.exe`; the user performs gameplay tests.
+- Normal non-LTO builds are preferred. Strict-static and capture runs force
+  Native 240x160.
+- Latest serial playable build passed. Latest validated-ROM replay
+  `logs/session_20260825_221446.log` crossed the former Bilibin crash window
+  through frame `522170`; this does not prove a behavior fix.
 
-This is no longer a research scaffold. It is a playable port with known rough
-edges, tracked in `docs/ACTIVE_ISSUES.md`.
+## Acceptance boundary
 
-## The build you actually run
+Current manual boundary is widescreen/Bilibin. Session `20260826_152239`
+provided two user-identified Palace entries and the measured split-scroll
+evidence now implemented as a separate
+`AuthorizedMode0SplitScroll` Palace map class; runtime authorization still
+requires a complete clean frame and fails closed on invalid/mixed rows. The
+latest `gs011_opt` rearms bounded VRAM metadata per authentication epoch,
+separates CPU/DMA EWRAM-table provenance, reports culls per epoch, and now
+emits a bounded payload-free `[wide-field-producer]` PC/range summary so raw
+producers are not hidden by the 64-record detail cap. Generated fast-path
+EWRAM stores reach this diagnostic
+seam only when the launcher toggle is enabled; authored cells remain unwired.
+The executed B322 horizontal cull and authenticated Mode-0 OBJ-X route cover
+the equal-scroll and stable Palace classes; B27C/B326 widen those same classes
+with fresh OAM-slot provenance. B388 and Mode-2 OBJ remain stock/fail-closed. The
+focused widescreen test and rebuilt `gs011_opt` pass. Re-run
+the single Palace capture through the root launcher with
+[`NEXT_TASK.md`](NEXT_TASK.md).
 
-`build/gs011_opt` — RelWithDebInfo (`-O2 -g -DNDEBUG`). It is the only build
-configured with SDL2, so it is the only one with a host window.
-`src/launcher_main.cpp:365-374` prefers it and falls back to `build/gs011`.
+CRASH-03 provenance now arms at the savestate restore boundary, clears stale
+host-only rings, and emits a payload-free `reason=restore` CRC before resumed
+guest execution. The focused synthetic test and rebuilt `gs011_opt` pass; this
+is diagnostic-only and the poison writer remains unproven.
 
-- `build/gs011` is an older unoptimized Debug build, kept only because earlier
-  measurements are keyed to it. It is roughly 2.9x slower. Do not benchmark
-  against it.
-- `build/gs011_rel` is headless and has no SDL2.
-- LTO is off deliberately. Two attempts produced 0-byte binaries and nearly
-  exhausted this machine's RAM.
+Open work is indexed in [`ACTIVE_ISSUES.md`](ACTIVE_ISSUES.md). Load exactly
+the linked issue or feature file for the task. Do not use
+[`history/`](history/) as current guidance.
 
-Public builds keep `GSR_BUILD_LOCAL_RUNNER=OFF` and require no ROM or BIOS.
-Local runs supply the user's own ROM and BIOS by path; nothing protected is in
-the repository.
+## Protected-data gate
 
-## What is on by default, and what is not
-
-Default (faithful):
-
-- 240x160 output, original 59.7275 Hz timing, raw color.
-
-Opt-in, all default-off:
-
-- Enhanced Timing (exact 60/120 Hz host pacing).
-- Guest CPU overclock, 1x/2x/4x/8x, live-toggleable. Scales per-instruction
-  execution cost only, never halt/idle, DMA or IRQ cycles. 1x is verified
-  bit-exact.
-- 2x scene interpolation, native supersampling, temporal blend ("LCD
-  ghosting"), soft-filter shimmer reduction, color profiles, integer scaling.
-- Turbo, in both Held and Toggle forms, bindable to keyboard or controller.
-
-Configuration is the F1 menu; bindings and choices persist.
-
-## Static coverage
-
-Strict-static acceptance runs (no interpreter, no self-heal, no cache load)
-complete FULLY_STATIC on bounded recorded tracks. That claim is always
-frame- and route-bounded: a route nobody has run will find its own gaps, and
-new gaps are ordinary work, not regressions.
-
-Golden Sun copies code into RAM and swaps map overlays through the same
-addresses, so dispatch cannot key on PC alone. The mechanism is documented in
-`docs/GS011_TRANSIENT_IMAGES.md` (the mechanism is current; its frame counts
-are historical) and `docs/OVERLAYS.md`.
-
-## What is being worked on now
-
-A tail-dispatch refactor in `gbarecomp`. Guest jumps are currently emitted as
-host function calls, so a guest loop that never returns grows the host stack
-without bound — the cause of the Bilibin stack overflow. The refactor makes
-those dispatch as tail transfers instead. `d36b253` is the working checkpoint
-taken before it started.
-
-The refactor introduced its own crash: `overlay_resolve()` sets
-`g_runtime_image_base` for a relocatable RAM-heal entry but nothing restored
-it after the call returned, so a later relocatable body reached through the
-one dispatch tier that never sets the base (the fixed static table) could
-read a stale value — this aborted the Mercury Lighthouse cutscene. Fixed at
-the emitter level (`arm_codegen.cpp`/`emit_function.cpp` resync the base
-right before every dispatch/call transfer and again after a `BL` returns),
-which keeps the tail-jump property the refactor exists for, unlike a
-caller-side wrapper. User-confirmed clear on `build/gs011_test`; full details
-in `docs/ACTIVE_ISSUES.md` under CRASH-04. **Folded into `build/gs011_opt`
-2026-08-16** (rebuilt 12:14); 86-test Python suite and `tail_dispatch_tests`
-pass.
-
-A new crash surfaced in that same build on 2026-08-16 — a genuine interpreter
-opcode gap hit while self-healing `0x03002000`, unrelated to the fix above.
-See `docs/ACTIVE_ISSUES.md` CRASH-05. Also see SESSION-2026-08-16 there for
-why the world map can measure as slow (interpreter-bridge-bound without
-`GBARECOMP_SELFHEAL_RAM=1` and a warm cache) — not a regression.
-
-### Session 2026-08-19
-
-**Mercury Lighthouse crash (CRASH-06) — cause narrowed to one thing.** The guest
-LZ decompressor `Func_2808` never terminates: it runs its output past the
-destination, over its own code at `0x03006000`, and on into the stack. Every
-earlier theory (wrong destination, slot reuse, stack corruption) is fallout from
-that and is now retired. Our translation of the terminator check, bit-refill and
-flag handling was re-checked and looks faithful, so the fault is either the
-compressed blob/pointer going in, or one of ~35 unverified jump-table copy
-routines. Full detail, evidence and next steps in `docs/ACTIVE_ISSUES.md`
-CRASH-06. Temporary `[c06-*]` diagnostics are in the tree and must be removed
-when it closes; `[c06-term]` is broken and needs a different approach.
-
-**Walk speed QoL (QOL-01) — parked.** The hooked write site never fires in the
-real windowed build and the accumulator never moves while walking; all the
-original measurements came from headless/`gs011_rel` and did not transfer. The
-F1 → Enhancements → QoL → Walk Speed control is now greyed out and pinned to 1x.
-
-**Crash tracing now follows the launcher.** The launcher checkbox decides the
-state at every launch and rewrites `AdditionalDebugLogging` in `config.ini` to
-match, so an F1 toggle left on can no longer survive as a hidden override.
-
-**Roadmap:** custom items/weapons and custom Psynergy added as future modding
-work, both gated on finding the tables and the width of the ID fields.
-
-## Reference
-
-- `AGENTS.md` — binding rules. Read first.
-- `docs/ACTIVE_ISSUES.md` — what is open.
-- `ARCHITECTURE.md`, `TESTING.md`, `LEGAL.md` — boundaries.
-- `docs/DEBUGGING.md` — the divergence workflow.
-- `docs/history/` — closed milestones and past sessions. Do not act on them.
+ROM SHA-1 must be `5c4695205413df7db52b9a184815a07783999971`. Never commit or
+expose ROM/BIOS bytes, saves, private traces, screenshots, or generated files
+containing substantial protected data.

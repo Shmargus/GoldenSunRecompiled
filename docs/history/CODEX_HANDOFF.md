@@ -6,10 +6,10 @@ This file tells a Codex-based team how to work in this repository.
 Read in this order before doing anything:
 
 1. `AGENTS.md` — the binding rulebook. It overrides everything, including this file.
-2. `docs/SESSION_2026-08-13.md` — the current state of the investigation, and
+2. `docs/history/SESSION_2026-08-13.md` — the current state of the investigation, and
    which leads are dead.
 3. `TECHNICAL_HANDOFF.md` — historical context. **Its "NEXT STEP" section is
-   wrong**; `docs/SESSION_2026-08-13.md` explains why. Do not act on it.
+   wrong**; `docs/history/SESSION_2026-08-13.md` explains why. Do not act on it.
 
 ---
 
@@ -158,7 +158,7 @@ and warm-loads nothing — this wasted a play session already. Omitting
 `GBARECOMP_SELFHEAL_RAM` leaves mutable-RAM overlays interpreter-only, which
 disables the entire tier most of this work concerns.
 
-Savestates (`C:\Users\Jimmy\Documents\rom\`):
+Savestates (`<private-rom-dir>\`):
 
 - **slot 6** — overworld, reproduces the world-map streaking artifact.
 - **slot 7** — battle, for the sprite-blit investigation.
@@ -182,7 +182,7 @@ exact 2-frame period** — frames 1/3/5 clean, 2/4/6 streaked.
 
 Already refuted, do not re-investigate: normal lazy device catch-up cannot span
 a scanline boundary, and HBlank-**DMA**-driven effects are provably correctly
-ordered. See `docs/SESSION_2026-08-13.md` for the code citations.
+ordered. See `docs/history/SESSION_2026-08-13.md` for the code citations.
 
 The `drain_dma_steal` theory is now **killed by measurement**. Across six
 post-load frames, 1,155 steals were observed. The global maximum was 1,026
@@ -207,7 +207,7 @@ Golden Sun generates sprite-blit code into IWRAM at runtime; 44 distinct PCs in
 0x03006000..0x0300645C report "DYNAMIC RAM CODE ... no registered identity
 matches the live bytes". Self-heal *is* attempted for these. What looked like
 one symptom ("battle lag") was actually two independent causes. Both are now
-fixed. See `docs/SESSION_2026-08-13B.md` for the full session record.
+fixed. See `docs/history/SESSION_2026-08-13B.md` for the full session record.
 
 **2a. Our compile storms — fixed in `gbarecomp/src/runtime/overlay_loader.cpp`.**
 Two defects compounded:
@@ -310,7 +310,7 @@ all 20 fields itself).
 **User-confirmed, not instrumented:** the user play-tested 2x and 4x live and
 reports battle VFX is smooth at both, with no music or animation problems. 8x
 was not tried by choice. The throughput gain itself has not been measured with
-a stopwatch or probe — see `docs/SESSION_2026-08-13B.md` for why (no available
+a stopwatch or probe — see `docs/history/SESSION_2026-08-13B.md` for why (no available
 savestate captures a CPU-bound moment).
 
 ### 3. Per-instruction bookkeeping — measured, hypothesis unproven
@@ -358,7 +358,7 @@ the symptom they actually feel, so weigh it above headless benchmark numbers.
 
 ## Visual enhancement follow-up — 2026-08-13
 
-See `docs/VISUAL_ENHANCEMENTS_2026-08-13.md`.
+See `docs/history/VISUAL_ENHANCEMENTS_2026-08-13.md`.
 
 - F1 Video has live color profiles; Raw remains faithful default.
 - Integer scaling is verified at 3440x1440 (uniform 9x).

@@ -50,7 +50,7 @@ Do not commit a filled example using guessed Golden Sun addresses.
 The version-1 machine-readable schema is
 `symbols/overlay-manifest-schema-v1.json`. The local GS-005 importer verifies
 each compressed range against the exact ROM and partitions function metadata by
-`overlay_id`; see `docs/OVERLAY_IMPORT_BASELINE.md`. This inventory does not
+`overlay_id`; see `docs/history/OVERLAY_IMPORT_BASELINE.md`. This inventory does not
 claim to prove loader activation or lifetime events.
 
 ## Runtime requirements
@@ -72,7 +72,7 @@ GS-008 now passes this gate locally through the pinned runtime's
 `g_runtime_ram_dispatch_hook` and a generic identity-aware registry. Activation
 of an overlapping image evicts the old identity, a range overwrite invalidates
 the active image, and mode mismatches fall through to the existing loud miss
-path. See `docs/OVERLAY_RUNTIME_SPIKE.md` for the automated evidence and the
+path. See `docs/history/OVERLAY_RUNTIME_SPIKE.md` for the automated evidence and the
 remaining Golden Sun integration boundary. The generic change is still an
 uncommitted local upstream delta, not part of the public pin.
 

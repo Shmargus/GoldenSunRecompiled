@@ -16,9 +16,11 @@ Reason: expanded view, timing changes, and replacement presentation make oracle 
 
 ## D-003 — `gbarecomp` is the platform core
 
-Status: provisional until commit and license are pinned.
+Status: accepted. Commit and license pinned 2026-07-18 (see `UPSTREAM.md` and `docs/GBRECOMP_BASELINE.md`).
 
 Reason: it already provides the ARMv4T and GBA runtime layers. Rebuilding those from scratch would multiply scope.
+
+Caveat: the local checkout carries generic fixes not yet upstreamed, so the public pin must not be advanced and gates depending on those fixes are not yet reproducible from the pin alone. Tracked in `ROADMAP.md`.
 
 ## D-004 — `gsret/goldensun` is consumed through local metadata import
 

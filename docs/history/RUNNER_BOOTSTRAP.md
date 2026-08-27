@@ -16,7 +16,7 @@ GS-010 subsequently proved that this historical stop was a headless VBlank
 resume seam, not missing decoded code. The instruction already existed inside
 the `0x080047a4` host body; an evidence-backed `resume = true` alias now reaches
 it. The current first architectural divergence is the `DISPSTAT` read at
-`0x080030b8`. See `docs/ORACLE_HANDOFF_BASELINE.md`.
+`0x080030b8`. See `docs/history/ORACLE_HANDOFF_BASELINE.md`.
 
 No ROM, BIOS, generated source, executable, save data, or trace is stored in the
 public tree. All generated inputs and build products remain under ignored

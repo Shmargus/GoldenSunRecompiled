@@ -22,7 +22,7 @@ Enhanced Timing, 600 frames: mean 16.6662 ms, standard deviation 18.48 us.
 ## Current audio handoff — 2026-08-12
 
 **Native MP2K work is PAUSED.** Full detail, corrected inferences, and the
-point-20 finding are in `docs/MP2K_NATIVE_AUDIO_HANDOFF.md` — read its "Read
+point-20 finding are in `docs/history/MP2K_NATIVE_AUDIO_HANDOFF.md` — read its "Read
 this first" section before touching native audio again. Summary for this
 file:
 
@@ -302,7 +302,7 @@ python -m unittest discover -s tests -p "test_*.py"
 .\local\probe_fifo.ps1 -Frames 600 -SelfHealRam 0
 ```
 
-Written for the next agent. Supersedes `docs/HANDOFF_CRASH_SCRIPTED_FIGHT.md`
+Written for the next agent. Supersedes `docs/history/HANDOFF_CRASH_SCRIPTED_FIGHT.md`
 entirely. Read §1 and §7 before touching anything. The previous, append-ordered
 version of this file is at `local/TECHNICAL_HANDOFF_prev.md` (gitignored) if you
 need the raw session narrative.
@@ -400,7 +400,7 @@ the normal recompiled route and `GBARECOMP_FORCE_INTERP=1`. The first observed
 `0x39D0` source-record writes and subsequent live-channel copies matched exactly,
 including cycle stamps and `r0-r11`; this is not a recompiler-only pointer
 creation divergence. The next owner should trace the shared guest producer/data
-population. See `docs/MP2K_NATIVE_AUDIO_HANDOFF.md` for measured addresses and
+population. See `docs/history/MP2K_NATIVE_AUDIO_HANDOFF.md` for measured addresses and
 the TCP savestate-load caveat.
 
 The subsequent native-shadow pass established that `0x39D0` is an
@@ -442,7 +442,7 @@ stale AOT execution and falls back loudly to interpreter/self-heal. This route
 is therefore `NOT_STATIC`; the measured strict state-5 replay recorded 1,402
 SMC fallbacks and about 6.16 million interpreted instructions. Five focused
 runtime/audio suites passed after the guard/overlay-ABI integration. See
-`docs/MP2K_NATIVE_AUDIO_HANDOFF.md` for the single next trace and acceptance
+`docs/history/MP2K_NATIVE_AUDIO_HANDOFF.md` for the single next trace and acceptance
 order.
 
 The follow-up bounded TCP audio counters isolate the host-rate failure without
@@ -722,10 +722,10 @@ cmake --build build/gs011 --target GoldenSunRecomp    # ~100 s
 Reference perf route (deterministic; repeat runs agree within ~1 s):
 
 ```powershell
-$env:GBARECOMP_HEAL_CACHE='C:\Users\Jimmy\Desktop\GSRecomp\recomp_cache'
+$env:GBARECOMP_HEAL_CACHE='<workspace>\recomp_cache'
 $env:GBARECOMP_INPUT_REPLAY='local\play-sessions\20260808-004722.input'
 .\build\gs011\GoldenSunRecomp.exe --bios <bios> --rom <rom> `
-  --load-state "C:\Users\Jimmy\Documents\rom\Golden Sun.state2" `
+  --load-state "<private-rom-dir>\Golden Sun.state2" `
   --no-window --frames 14000
 ```
 

@@ -62,58 +62,19 @@ Belong here when Golden Sun-specific:
 
 Use synthetic fixture bytes and text; never commit ROM-derived binary fixtures.
 
-The GS-003 symbol-schema tests use only synthetic JSON fixtures and run through
-CTest as `symbol_corpus_validation`. They can also be run directly:
-
-```powershell
-python -m unittest discover -s tests -p test_symbol_corpus.py
-```
-
-GS-004 adds an in-memory synthetic ARM ELF32 builder. It tests `STT_FUNC`,
-mapping-symbol, THUMB-state-bit, `PT_LOAD` source-address, internal-data, and
-overlapping-range behavior without committing a binary fixture. Run both suites
-with:
+Historical milestone notes and closed acceptance records belong in
+`docs/history/`; they are not current test status. Use `docs/STATUS.md` for the
+current configured build and test result, `docs/NEXT_TASK.md` for the immediate
+acceptance scenario, and `docs/ACTIVE_ISSUES.md` for the short issue index.
+Open the linked `docs/issues/` or `docs/features/` file for the test's evidence
+and closure condition. Public Python tests remain the cheap check:
 
 ```powershell
 python -m unittest discover -s tests -p "test_*.py"
 ```
 
-GS-005 adds synthetic same-PC overlay identities and verifies that cross-overlay
-collisions are accepted while unknown identities and manifest/corpus count
-mismatches fail.
-
-GS-006 adds synthetic generated-comment parsing and discrepancy classification
-tests. The ROM-dependent comparison is a local acceptance run documented in
-`docs/GBARECOMP_SCAN_BASELINE.md`; it hash-gates the ROM, validates the scanned
-entry target against the TOML, runs the pinned recompiler, and classifies every
-scanner/import discrepancy without committing generated output.
-
-GS-007 adds synthetic reset-branch, ELF load-mapping, data-range, reviewed
-exception, and proven-seed proposal tests. The ROM-dependent generation and
-34-translation-unit x86-64 compile are documented in
-`docs/MAIN_TOML_BASELINE.md`.
-
-GS-008 adds a generic upstream runtime test that dispatches two immutable image
-identities at the same guest RAM PC and THUMB mode through the real
-`runtime_dispatch` hook. It verifies overlapping activation evicts the stale
-identity, a partial-range overwrite invalidates the active image, and a mode
-mismatch reaches the existing dispatch-miss path. The local 15-test upstream
-result and remaining game integration work are documented in
-`docs/OVERLAY_RUNTIME_SPIKE.md`.
-
-GS-009 adds an opt-in local runner that links the ignored generated cart corpus
-to the pinned platform runtime. Its strict-static acceptance run verifies both
-asset identities, executes the recompiled BIOS, statically dispatches the ARM
-cartridge reset vector at `0x08000000`, and stops at the first later miss
-(`0x080047ae`, THUMB). See `docs/RUNNER_BOOTSTRAP.md`.
-
-GS-010 adds `tools/compare_bios_handoff.py`. It uses the native and mGBA TCP
-interfaces with the same real BIOS and exact ROM, normalizes mGBA's pipelined
-R15, compares CPU state plus writable memory at `0x08000000`, and diffs
-pre-instruction GFP1 records without changing guest control flow. The measured
-first architectural divergence is the `DISPSTAT` read at THUMB `0x080030b8`:
-native returns VBlank status `1`, while mGBA returns HBlank status `2`. See
-`docs/ORACLE_HANDOFF_BASELINE.md`.
+Do not treat ad-hoc executables, `NDEBUG` runs with disabled assertions, or
+unrecorded local traces as acceptance evidence.
 
 ### Metadata validation
 

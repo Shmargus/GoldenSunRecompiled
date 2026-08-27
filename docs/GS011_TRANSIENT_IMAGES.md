@@ -1,6 +1,17 @@
 # GS-011 Transient RAM Code Images
 
-## Status
+> **How to read this file.** The *mechanism* it describes is current and
+> load-bearing: position-independent images for relocatable RAM code, the
+> image-identity rule (an identity must cover the bytes the writer wrote, not
+> the bytes an ELF `STT_FUNC` spans), and the registry structure. Keep relying
+> on those.
+>
+> The *numbers* — frame counts, binary sizes, registry counts, trace-event
+> totals, and which track aborts where — are a snapshot from 2026-08-07 and
+> have been overtaken many times since. Do not quote them as current. For
+> current state see `docs/STATUS.md`.
+
+## Status (2026-08-07 snapshot)
 
 **A non-LTO build (140,228,928 bytes, 2026-08-07 10:46) now completes
 FULLY_STATIC at 10,800 frames on the `campaign` track**, strict-static,
@@ -154,7 +165,7 @@ translation of code that is no longer resident.
 
 The registry is the game runner's own adapter installed on the generic
 `g_runtime_ram_dispatch_hook` seam; the hook is consulted only for PCs in
-`0x02000000..0x04000000` (see `docs/OVERLAY_RUNTIME_SPIKE.md`).
+`0x02000000..0x04000000` (see `docs/history/OVERLAY_RUNTIME_SPIKE.md`).
 
 ## Image inventory
 
@@ -365,7 +376,7 @@ runner  sha256       06c1b32a9fce710c218bcfc583eb300d8e29e32a987d8c57ea5178cc5cb
 ```
 
 The corpus aggregate feeds each `.cpp` file's raw bytes to SHA-256 in lexical
-filename order, matching `docs/MAIN_TOML_BASELINE.md`.
+filename order, matching `docs/history/MAIN_TOML_BASELINE.md`.
 
 Registering the image advanced the strict-static run from 1,491,016 to
 1,882,605 recorded trace events (+26%). Trace events are mem-write/branch/
@@ -842,7 +853,7 @@ longer: relocation removed one unbounded axis, not the discovery work.
 
 Ignored-build evidence, not release artifacts or upstream pins. The corpus
 aggregate feeds each `.cpp` file's raw bytes to SHA-256 in lexical filename
-order, matching `docs/MAIN_TOML_BASELINE.md`.
+order, matching `docs/history/MAIN_TOML_BASELINE.md`.
 
 ```
 main.toml sha256          911d9c4f994a946bf7eba95df88c08bba92f04f51502b6c2f5ba527be6d89b1d

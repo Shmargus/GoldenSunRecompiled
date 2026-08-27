@@ -1,7 +1,7 @@
 # Investigation — why effects stutter, and what else is wrong (2026-08-19)
 
 > Historical, 2026-08-19. Its stutter conclusions were superseded by
-> `docs/HANDOFF_2026-08-20.md`; kept for its measurements.
+> `docs/history/HANDOFF_2026-08-20.md`; kept for its measurements.
 
 Investigation only. **Nothing in this document has been changed or fixed.**
 Everything below is either read out of the source tree or measured from the
