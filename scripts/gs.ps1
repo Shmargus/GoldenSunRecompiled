@@ -197,18 +197,22 @@ if (Test-Stage 'recompile') {
         throw "gba_recompile exited $recompileExit. Full log: $log"
     }
 
-    # A TOML literal override is only effective when the emitted instruction
-    # contains the runtime chokepoint.  Keep stale generated shards from
-    # silently making the runner's callback unreachable.
-    $literalHookSites = @('0x0800C6F2', '0x0800C6FE')
+    # A TOML conditional-branch override is only effective when the emitted
+    # instruction contains the runtime chokepoint. Keep stale generated
+    # shards from silently making the runner's callback unreachable.
+    $conditionalBranchSites = @(
+        '0x0800B27E', '0x0800B324', '0x0800B328',
+        '0x0800B3D2', '0x0800B3DC', '0x0800B3E6', '0x0800B3EC',
+        '0x0800C6FA', '0x0800C702', '0x0800C708'
+    )
     $generatedShards = @(Get-ChildItem -LiteralPath $CorpusDir -Filter 'recompiled_*.cpp' -File)
-    foreach ($site in $literalHookSites) {
-        $needle = "runtime_thumb_literal(${site}u"
+    foreach ($site in $conditionalBranchSites) {
+        $needle = "runtime_conditional_branch(${site}u"
         $hook = @($generatedShards | Select-String -SimpleMatch $needle)
         if ($hook.Count -eq 0) {
-            throw "GATE FAILED: generated corpus is missing runtime literal hook at $site. Regenerate with the current gba_recompile."
+            throw "GATE FAILED: generated corpus is missing runtime conditional-branch hook at $site. Regenerate with the current gba_recompile."
         }
-        Write-Host "    generated literal hook present: $site" -ForegroundColor Green
+        Write-Host "    generated conditional-branch hook present: $site" -ForegroundColor Green
     }
     Write-Host "    gate passed: zero data_range collisions" -ForegroundColor Green
 }

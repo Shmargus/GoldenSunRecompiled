@@ -1,11 +1,24 @@
 # Widescreen investigation
 
-Status: three optional fixed modes implemented, 2026-08-26: Native 240x160
+Status: three optional fixed modes implemented, 2026-08-28: Native 240x160
 (default), Widescreen 288x160, and Expanded Widescreen 360x240. Expanded uses
 true signed margins of ±60 horizontal and ±40 vertical; strict-static and
 framebuffer-capture runs force Native. Palace split-scroll map authorization
-and authenticated equal-scroll OBJ-Y widening are implemented; manual
-multi-scene acceptance remains pending. This change did not launch gameplay.
+is implemented. Current uncommitted source adds a strict 360x240-only bypass
+for ten reviewed guest viewport branches; manual multi-scene acceptance remains
+pending. This change did not launch gameplay.
+
+The 2026-08-28 build fixes B27E/B328 OAM-Y provenance (R7+16/R7+4) with
+bounded payload-free `[wide-obj-y]` diagnostics. Palace table authorization
+requires a complete-clean `AuthorizedMode0SplitScroll` frame and exact map/raw
+CRC `0aef4a71/11020c66`; CPU/DMA writes or CRC mismatch invalidate it. Measured
+fill ID `0x026`, raw `0xFFFF`, and finite out-of-bounds coordinates fail closed;
+other residual IDs remain unmeasured. WIDE-01 remains open.
+
+`build/gs011_opt/GoldenSunRecomp.exe` was rebuilt non-LTO at 2026-08-28
+09:41:15 (878649847 bytes). Python tests passed `86/86`, focused CTest passed
+`2/2`, and the public audit passed. No gameplay or static-status claim was
+made.
 
 ## Conclusion
 
@@ -64,14 +77,18 @@ margins for the measured Mode 2 BG2/BG3 wrap+512x512 configuration or the
 measured Mode 0 256x256 BG1/BG2/BG3 equal-scroll field signature, or the
 separate exact Palace split-scroll signature, with no forced blank or
 WIN0/WIN1/OBJ-window. Mode 0 BG0 remains suppressed outside the central 240px
-canvas; BG1/BG2/BG3 field margins use the measured atlas provider keyed by each
-scanline's raw scroll. Mode 1 and unknown scenes blacken both
-margins. In the authenticated equal-scroll field, the object changes are exact
-`Func_b168` culls: `0x0800B322` widens X `239` to the right edge, while
-`0x0800B27C` and `0x0800B326` widen Y `159` to the active bottom edge. The
-latter paths validate `r7+16`/`r7+4` against the measured 8-byte OAM-shadow
-slots and record fresh per-slot provenance before the low-byte store; unmatched
-raw OBJ-Y `160..255` remains hardware-signed.
+  canvas; BG1/BG2/BG3 field margins use the measured atlas provider keyed by each
+  scanline's raw scroll. Mode 1 and unknown scenes blacken both
+  margins. Separately, the old object immediate/literal threshold widening is
+  removed. In strict
+Expanded 360x240 mode, the runner bypasses the ten exact guest conditional-
+branch decisions reviewed in `src/widescreen_policy.h`: B27E/B324/B328,
+B3D2/B3DC/B3E6/B3EC, and C6FA/C702/C708. The callback receives the original
+CPSR-derived decision and changes only those exact branches; it is globally
+active across scene classes, independent of field/Palace authentication or
+coordinates. Native 240x160 and Widescreen 288x160 preserve the guest
+decision. The unchanged PPU still performs pixel clipping and retains 128 OAM
+slots.
 No camera patch or tile sidecar is used.
 
 Current limitations: expanded view disables the verified native supersampling
@@ -107,8 +124,8 @@ private evidence and must not be committed.
 The measured 256x256 equal-scroll signature classifies the field scene. The
 provider resolves expanded columns from raw scroll plus the EWRAM map/atlas
 tables, while the resident ring remains the canonical center. BG0 remains
-suppressed outside the native canvas. The exact field-object cull is widened
-only in the authenticated Mode-0 field; other scenes retain the guest cutoff.
+suppressed outside the native canvas. Guest viewport-branch bypasses are a
+separate strict Expanded-mode policy and are not gated by this field classifier.
 
 The pre-provider 288px capture made the seam concrete: the right yellow/red
 strip was an untrusted inner 8px regular-BG ring column (patterned, not the
@@ -127,33 +144,28 @@ policy/PPU tests and the full serial playable build pass. User manual
 multi-scene acceptance remains pending. Other valid atlas entries remain
 authored. The NPC visible in the left margin is
 OBJ. The ROM's `Func_b168` field-object
-writer computes screen X in `r4` and rejects `X > 239` at `0x0800B322`.
-The widescreen adapter overrides only that reviewed THUMB immediate in the
-authenticated equal-scroll or stable Palace Mode-0 class, using
-`239 + extra_right` as the inclusive limit
-(263 at 288px, 299 at 360px); the PPU reinterprets emitted raw X `256..299`
-positively. The `0x0800B27C` and `0x0800B326` cutoffs widen to the active
-bottom edge only in those authenticated classes. Their accepted paths
-validate `r7+16`/`r7+4` against the measured 8-byte OAM-shadow slots and record
-fresh per-slot provenance before the low-byte store; unmatched raw Y `160..255`
-remains hardware-signed. Provenance is accepted only in its writer frame or the
-immediately following OAM-shadow handoff frame, preventing stale slot reuse.
-Session `20260826_101559` confirms the exact executed cull route remains
-`0x0800B322`: it accumulated 6,118 calls (4,515 authenticated overrides), while
-all three configured B388 routes accumulated zero calls. Therefore no missing
-horizontal override is proven on the current executed path. The six exact
-routes remain configured for epoch-local attribution, but B388 and its
-unproven pre-cull routes remain unchanged.
+writer computes screen X in `r4`; its historical `X > 239` compare is at
+`0x0800B322`, followed by the reviewed conditional branch at `0x0800B324`.
+The current adapter no longer overrides a THUMB immediate or literal. It
+bypasses only the ten exact conditional branches listed above, and only in
+strict Expanded 360x240 mode. The callback is independent of field/Palace
+authentication and coordinate values; the PPU reinterprets no new values and
+continues to perform its normal pixel clipping. Existing OBJ presentation
+providers retain their measured OAM-shadow and provenance rules; the visible
+signed-Y record is latched by the exact OAM DMA handoff and remains valid while
+the current ATTR0/1/2 exactly match the measured 12-byte staging record. A
+changed or reused slot fails closed; raw-Y, epoch, and DMA gates remain.
+The branch hook does not widen those providers. Session cull/literal counters below are
+historical evidence from the removed implementation.
 
 The generated `gs011_opt` disassembly adds operand evidence for the adjacent
 vertical route: immediately before `0x0800B322`, the guest loads `r1` and `r3`
 from the CPU state, computes `r6 = r1 - r3`, then `0x0800B322` tests `r4` and
-`0x0800B326` tests that derived `r6` against `159`; the accepted B27C/B326
-paths write its low byte to the measured OAM shadow. The unexecuted setup
-routes are likewise not interchangeable: B3CA places `32` in `r2`, B3D6
-places `136` in `r1` and the next instruction doubles it to `272`, while B3EA
-directly compares `r3` with `208`; B388 remains unchanged after zero latest
-calls.
+`0x0800B326` tests that derived `r6` against `159`. The branch PCs are B27E,
+B324, and B328. B388's four bound branches are B3D2/B3DC/B3E6/B3EC.
+Func_c62c's direct reject branches are C6FA/C702/C708, associated with the
+C6F2/C6FE literal-load block. These are decisions, not immediate/literal
+rewrites.
 
 Session `221115` confirms this is the displayed OAM path: DMA at `0x080036A4`
 copied 1024 bytes from the OAM shadow `0x0300347C..0x0300387C` to `0x07000000`,
@@ -192,6 +204,11 @@ with raw BG2-BG1 `0x0200`, and raw BG1-BG2 VOFS `0x0180` with BG2=BG3. It
 requires a complete clean frame, resets on an invalid/mixed row, uses each
 BG's raw scroll, and does not use BG3 as a BG1/BG2 boundary. Producer
 completion remains supporting evidence only and is not a runtime gate. The
+restored/unchanged table path now additionally requires map/raw CRC
+`0aef4a71/11020c66`; CPU/DMA writes and CRC mismatches invalidate authorization.
+Measured fill ID `0x026`, raw `0xFFFF`, and finite out-of-bounds coordinates
+are rejected. Other residual IDs inside the exact fingerprint remain
+unmeasured and are a known limitation.
 next root-launcher capture with the diagnostics toggle—enter, walk, exit,
 re-enter Palace—must verify this route and object behavior. Manual acceptance
 remains pending; no success is claimed.
@@ -213,12 +230,39 @@ useful diagnostic evidence but is not yet a safe general runtime gate (raw
 entry ownership and restore-boundary invalidation still need an explicit
 contract).
 
-The same capture reports the stable Palace cull totals as B27C
-`45,257/45,245/12`, B322 `50,816/50,800/16`, and B326
-`50,607/50,591/16` (calls/overrides/gate rejects); all three B388 routes were
-unexecuted. No OAM-shadow/DMA evidence was present, so these aggregate rejects
-do not prove an earlier producer loss or justify a speculative cull override.
+Session `20260828_111007` confirmed that wiring this bitmap into equal-scroll
+lookups was a regression: restored Bilibin had its valid measured table CRCs
+but zero current-epoch authored cells, producing no replacements. The runtime
+gate was removed again for equal-scroll fields; Palace's separate fingerprint
+authorization is unchanged.
+
+The same historical capture reports stable Palace cull totals for the removed
+immediate-hook implementation: B27C `45,257/45,245/12`, B322
+`50,816/50,800/16`, and B326 `50,607/50,591/16` (calls/overrides/gate
+rejects); all three B388 routes were unexecuted. No OAM-shadow/DMA evidence
+was present, so these aggregate rejects do not prove an earlier producer loss
+or justify a speculative cull override.
 Manual Palace/object acceptance remains pending.
+
+Session `20260828_143521` confirmed Bilibin backgrounds expanded again and
+exposed unconditional earlier object-cull branch overrides. B388 now admits
+only padded X `-92..332` and Y `-92..248`; C62C widens only its measured
+16.16 upper-X and vertical bands. Values outside those bounds retain the guest
+reject. Raw Y `192` still requires slot-specific provenance because it is also
+the game's hidden-sprite value.
+
+Session `20260828_150103` showed the remaining left-edge loss at C6FA: signed
+negative `x+32` values were cast to unsigned. Expanded now admits its added
+signed lower band through `-60px`. Palace margin leakage was provider-backed,
+so its exact authenticated table now uses separate BG1/BG2/BG3 connected-room
+masks seeded from the native canvas, treating `0x026` as a barrier. The mask
+resets on scroll, auth epoch, or table invalidation; equal-scroll fields do not
+use it.
+
+Session `20260828_153341` replaced the Palace mask's full-table flood with the
+exact Expanded margin envelope: four horizontal and three vertical metatile
+cells from native seeds. Authenticated Expanded fields also render unambiguous
+bottom-margin OBJ Y `160..199` without provenance; raw `192` remains gated.
 
 ### State2: battle
 
@@ -268,11 +312,11 @@ this repository through a game-owned `extended_view_init` adapter:
    raw scroll. Invalid pointers, scenes, or source data return unavailable so
    the PPU suppresses the margin. BG0 remains screen-space and is suppressed
    outside the native canvas.
-4. Keep guest object culling unchanged outside the authenticated field. The
-   exact `Func_b168` compare at `0x0800B322` is widened for field margins, and
-   B27C/B326 widen only in the equal-scroll field with fresh OAM-slot
-   provenance. Raw Y `160..255` without a matching record remains signed;
-   B388 and unproven routes remain unchanged.
+4. Keep guest object presentation and PPU clipping unchanged. The exact
+   conditional-branch hook is configured only for the ten reviewed
+   viewport-reject PCs and is enabled only for strict Expanded 360x240 mode;
+   it is global across scene classes, preserves the original decision in all
+   other modes/unknown PCs, and does not rewrite immediates or literals.
 5. UI rules by scene: centered stock canvas first; edge-anchored redesign is a
    later option after exact BG/OBJ ownership is known.
 
@@ -291,9 +335,10 @@ address. The canonical center remains the verification oracle.
 4. **Town/field behavior:** test resident regular-BG wrap/cutoff, landmarks,
    doors, menus, transitions, and save/load. Do not add a tile sidecar to hide
    naturally missing data.
-5. **Object coverage:** manually verify NPCs, doors, particles, shadows, gap
-   jumps, collision, and room edges. The horizontal and bottom field cull
-   limits are exact; manual acceptance remains pending.
+5. **Object coverage:** after corpus regeneration and playable rebuild,
+   manually verify NPCs, doors, particles, shadows, gap jumps, collision, and
+   room edges. Confirm all ten reviewed viewport branches bypass only in strict
+   360x240 mode; manual acceptance remains pending.
 6. **Product surface:** keep the three fixed modes with 240x160 default;
    strict/capture remain Native; manual root-launcher acceptance remains.
 
@@ -305,7 +350,8 @@ using synthetic fixtures. Manual gameplay remains the user's responsibility.
 ## Main risks
 
 - Town tile rings alias plausible-looking but wrong scenery.
-- Stock object culling leaves empty margins or pop-in.
+- Unreviewed guest culling, despawn logic, or OAM exhaustion can still leave
+  empty margins or pop-in.
 - Screen-space BG/OBJ UI repeats or shifts incorrectly.
 - Affine effects extrapolate mathematically but reveal unauthored edges.
 - WIN0/WIN1/OBJ-window and blend masks leak scenery during transitions.

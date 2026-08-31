@@ -51,6 +51,13 @@ target_include_directories(gsr_launcher_widescreen_diagnostics_policy_test PRIVA
 add_test(NAME launcher_widescreen_diagnostics_policy_test
          COMMAND gsr_launcher_widescreen_diagnostics_policy_test)
 
+add_executable(gsr_relocatable_writer_policy_test
+    tests/cpp/relocatable_writer_policy_test.cpp)
+target_include_directories(gsr_relocatable_writer_policy_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/src)
+add_test(NAME relocatable_writer_policy_test
+         COMMAND gsr_relocatable_writer_policy_test)
+
 add_executable(gsr_launcher_session_id_test
     tests/cpp/launcher_session_id_test.cpp)
 target_include_directories(gsr_launcher_session_id_test PRIVATE
@@ -560,6 +567,23 @@ if(GSR_BUILD_LOCAL_RUNNER)
     endif()
 
     add_test(NAME runner_help COMMAND GoldenSunRecomp --help)
+
+    # Split debug symbols out of the executable so the shipped binary stays
+    # small while crash/hang stack traces can still resolve against the
+    # separate .debug file (GNU objcopy debuglink convention).
+    if(CMAKE_BUILD_TYPE MATCHES "^(Debug|RelWithDebInfo)$")
+        find_program(CMAKE_OBJCOPY objcopy)
+        if(CMAKE_OBJCOPY)
+            add_custom_command(TARGET GoldenSunRecomp POST_BUILD
+                COMMAND "${CMAKE_OBJCOPY}" --only-keep-debug "$<TARGET_FILE:GoldenSunRecomp>" "$<TARGET_FILE:GoldenSunRecomp>.debug"
+                COMMAND "${CMAKE_OBJCOPY}" --strip-debug "$<TARGET_FILE:GoldenSunRecomp>"
+                COMMAND "${CMAKE_OBJCOPY}" --add-gnu-debuglink="$<TARGET_FILE_NAME:GoldenSunRecomp>.debug" "$<TARGET_FILE:GoldenSunRecomp>"
+                WORKING_DIRECTORY "$<TARGET_FILE_DIR:GoldenSunRecomp>"
+                COMMENT "Splitting debug symbols for GoldenSunRecomp")
+        else()
+            message(STATUS "objcopy not found; skipping debug-symbol split for GoldenSunRecomp")
+        endif()
+    endif()
 
     if(WIN32)
         add_executable(GoldenSunLauncher WIN32

@@ -43,75 +43,20 @@ REVISION_RE = re.compile(r"^[0-9a-f]{40}$")
 # `[[resume_range]]` is capped at 0x1000 bytes by the upstream TOML schema.
 RESUME_RANGE_MAX_BYTES = 0x1000
 
-# The widened field view needs two exact guest cull constants relaxed. ROM
-# disassembly proves Func_b168's final horizontal reject at 0x0800b322 and
-# its two vertical paths at 0x0800b27c/0x0800b326. The runner changes them only
-# for the authenticated Mode-0 field and active matching margins.
-REVIEWED_THUMB_ALU_IMMEDIATE_OVERRIDES = (
-    {
-        "addr": 0x0800B27C,
-        "note": (
-            "Mode-0 expanded-view only: Func_b168 alternate screen-Y cull is "
-            "cmp r6,#159 at this exact ROM PC; runner widens to the "
-            "authenticated bottom margin"
-        ),
-    },
-    {
-        "addr": 0x0800B322,
-        "note": (
-            "Mode-0 widescreen only: Func_b168 screen-X cull is "
-            "cmp r4,#239 at this exact ROM PC; runner widens to the "
-            "authenticated right margin"
-        ),
-    },
-    {
-        "addr": 0x0800B326,
-        "note": (
-            "Mode-0 expanded-view only: Func_b168 screen-Y cull is "
-            "cmp r6,#159 at this exact ROM PC; runner widens to the "
-            "authenticated bottom margin"
-        ),
-    },
-    {
-        "addr": 0x0800B3CA,
-        "note": (
-            "Mode-0 expanded-view only: Func_b388 shared negative X/Y actor "
-            "pre-cull padding; runner extends it by the active margin"
-        ),
-    },
-    {
-        "addr": 0x0800B3D6,
-        "note": (
-            "Mode-0 expanded-view only: Func_b388 actor X upper pre-cull "
-            "half-limit; runner extends it by the active right margin"
-        ),
-    },
-    {
-        "addr": 0x0800B3EA,
-        "note": (
-            "Mode-0 expanded-view only: Func_b388 actor Y upper pre-cull; "
-            "runner extends it by the active bottom margin"
-        ),
-    },
-)
-
-REVIEWED_THUMB_LITERAL_OVERRIDES = (
-    {
-        "addr": 0x0800C6F2,
-        "note": (
-            "Mode-0 expanded-view only: Func_c62c field-list X upper "
-            "bound LDR literal 0x012ffffe at the source PC; runner adds the "
-            "active right margin in 16.16 fixed-point"
-        ),
-    },
-    {
-        "addr": 0x0800C6FE,
-        "note": (
-            "Mode-0 expanded-view only: Func_c62c field-list Y lower bound "
-            "LDR literal -32px at the source PC; runner extends the "
-            "authenticated top margin while preserving the native padding"
-        ),
-    },
+# Exact conditional branches proven by the verified USA/Europe ROM to reject
+# viewport candidates before the unchanged PPU can clip them. The runner may
+# force only these decisions, and only for strict 360x240 geometry.
+REVIEWED_CONDITIONAL_BRANCH_OVERRIDES = (
+    (0x0800B27E, "Func_b168 screen-Y BGT: force the reviewed writer path"),
+    (0x0800B324, "Func_b168 screen-X BGT: force the reviewed writer path"),
+    (0x0800B328, "Func_b168 screen-Y BGT: force the reviewed writer path"),
+    (0x0800B3D2, "Func_b388 lower-X BGE: bypass the padded reject"),
+    (0x0800B3DC, "Func_b388 upper-X BLE: bypass the padded reject"),
+    (0x0800B3E6, "Func_b388 lower-Y BGE: bypass the padded reject"),
+    (0x0800B3EC, "Func_b388 upper-Y BLE: bypass the padded reject"),
+    (0x0800C6FA, "Func_c62c upper-X BLS: bypass the direct reject route"),
+    (0x0800C702, "Func_c62c lower-Y BLE: bypass the direct reject route"),
+    (0x0800C708, "Func_c62c upper-Y BGT: bypass the direct reject route"),
 )
 
 # ROM functions that strict-static execution has shown to take an asynchronous
@@ -2325,10 +2270,8 @@ def render_toml(
         f"# reviewed section seeds: {len(section_seeds)}",
         f"# reviewed interworking resumes: {len(interwork_resumes)}",
         f"# derived veneer resumes: {len(veneer_resumes)}",
-        f"# reviewed THUMB ALU immediate overrides: "
-        f"{len(REVIEWED_THUMB_ALU_IMMEDIATE_OVERRIDES)}",
-        f"# reviewed THUMB literal overrides: "
-        f"{len(REVIEWED_THUMB_LITERAL_OVERRIDES)}",
+        f"# reviewed conditional branch overrides: "
+        f"{len(REVIEWED_CONDITIONAL_BRANCH_OVERRIDES)}",
         f"# reviewed resume ranges: {len(resume_ranges)}"
         f" from {len(REVIEWED_RESUME_FUNCTIONS)} function(s)",
         "",
@@ -2344,22 +2287,13 @@ def render_toml(
         "[identity]",
         f'sha1 = "{EXPECTED_SHA1}"',
     ]
-    for entry in REVIEWED_THUMB_ALU_IMMEDIATE_OVERRIDES:
+    for addr, note in REVIEWED_CONDITIONAL_BRANCH_OVERRIDES:
         lines.extend(
             [
                 "",
-                "[[thumb_alu_immediate_override]]",
-                f"addr = 0x{entry['addr']:08x}",
-                f"note = {_toml_string(entry['note'])}",
-            ]
-        )
-    for entry in REVIEWED_THUMB_LITERAL_OVERRIDES:
-        lines.extend(
-            [
-                "",
-                "[[thumb_literal_override]]",
-                f"addr = 0x{entry['addr']:08x}",
-                f"note = {_toml_string(entry['note'])}",
+                "[[conditional_branch_override]]",
+                f"addr = 0x{addr:08x}",
+                f"note = {_toml_string(note)}",
             ]
         )
     for copy in code_copies:

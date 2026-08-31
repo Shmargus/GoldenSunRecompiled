@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstdio>
@@ -47,54 +48,243 @@ int main() {
         std::puts("widescreen_policy_test: fixed wide geometry mismatch");
         return 1;
     }
-    if (golden_sun_field_obj_right_cull_limit(0) != 239 ||
-        golden_sun_field_obj_right_cull_limit(wide.extra_right) != 263 ||
-        golden_sun_field_obj_right_cull_limit(22) != 261 ||
-        golden_sun_field_obj_right_cull_limit(60) != 299) {
-        std::puts("widescreen_policy_test: field OBJ cull limit mismatch");
-        return 1;
-    }
-    if (golden_sun_field_obj_bottom_cull_limit(0) != 159 ||
-        golden_sun_field_obj_bottom_cull_limit(40) != 199) {
-        std::puts("widescreen_policy_test: field OBJ bottom cull mismatch");
-        return 1;
-    }
-    if (golden_sun_actor_precull_negative_padding(0, 0) != 32 ||
-        golden_sun_actor_precull_negative_padding(60, 40) != 92 ||
-        golden_sun_actor_precull_right_half_limit(0) != 136 ||
-        golden_sun_actor_precull_right_half_limit(60) != 166 ||
-        golden_sun_actor_precull_bottom_limit(0) != 208 ||
-        golden_sun_actor_precull_bottom_limit(40) != 248) {
-        std::puts("widescreen_policy_test: actor pre-cull mismatch");
-        return 1;
-    }
-    if (golden_sun_field_list_x_upper_literal(0) != 0x012FFFFEu ||
-        golden_sun_field_list_x_upper_literal(24) != 0x0147FFFEu ||
-        golden_sun_field_list_x_upper_literal(60) != 0x016BFFFEu ||
-        golden_sun_field_list_y_lower_literal(0) != 0xFFE00000u ||
-        golden_sun_field_list_y_lower_literal(40) != 0xFFB80000u) {
-        std::puts("widescreen_policy_test: field-list literal mismatch");
-        return 1;
-    }
-    // The raw 160..199 range collides with hardware's negative-Y decode for
-    // an off-top sprite. The runner's rich per-slot hook may resolve it only
-    // after authenticated writer provenance.
-    if (!golden_sun_field_obj_y_expanded(160, 40, 40) ||
-        !golden_sun_field_obj_y_expanded(199, 40, 40) ||
-        golden_sun_field_obj_y_expanded(159, 40, 40) ||
-        golden_sun_field_obj_y_expanded(200, 40, 40) ||
-        golden_sun_field_obj_y_expanded(180, 0, 0) ||
-        golden_sun_field_obj_y_expanded(180, 40, 0) ||
-        !golden_sun_field_obj_y_expanded(180, 0, 40)) {
-        std::puts("widescreen_policy_test: field OBJ Y policy mismatch");
-        return 1;
-    }
     const auto expanded = gbarecomp::resolve_view_geometry(
         360, 240, 360, 240, false, 480, 240);
     if (expanded.width != 360 || expanded.height != 240 ||
         expanded.extra_left != 60 || expanded.extra_right != 60 ||
         expanded.extra_top != 40 || expanded.extra_bottom != 40) {
         std::puts("widescreen_policy_test: expanded 360x240 geometry mismatch");
+        return 1;
+    }
+    if (!golden_sun_expanded_view_active(
+            360u, 240u, 60u, 60u, 40u, 40u) ||
+        golden_sun_expanded_view_active(240u, 160u, 0u, 0u, 0u, 0u) ||
+        golden_sun_expanded_view_active(288u, 160u, 24u, 24u, 0u, 0u) ||
+        golden_sun_expanded_view_active(360u, 240u, 60u, 60u, 40u, 39u)) {
+        std::puts("widescreen_policy_test: strict expanded gate mismatch");
+        return 1;
+    }
+    const std::array<std::uint32_t, 10> expected_forced_decisions{
+        0u, 0u, 0u, 1u, 1u, 1u, 1u, 1u, 0u, 0u};
+    for (std::size_t i = 0; i < expected_forced_decisions.size(); ++i) {
+        if (static_cast<std::uint32_t>(
+                kGoldenSunViewportBranchReviews[i].forced_decision) !=
+            expected_forced_decisions[i]) {
+            std::puts("widescreen_policy_test: reviewed decision vector mismatch");
+            return 1;
+        }
+    }
+    // Every reviewed PC remains indexed; B27E/B324 keep their operand-bounded
+    // behavior while the alternate B328 writer stays fail-closed.
+    for (std::size_t i = 0; i < kGoldenSunViewportBranchReviews.size(); ++i) {
+        const auto& review = kGoldenSunViewportBranchReviews[i];
+        if (golden_sun_viewport_branch_site_index(review.pc) !=
+                static_cast<int>(i)) {
+            std::puts("widescreen_policy_test: branch route index mismatch");
+            return 1;
+        }
+    }
+    std::uint32_t object_decision = 0xFFFFFFFFu;
+    for (std::int32_t y : {261, 410}) {
+        if (golden_sun_expanded_viewport_branch_override(
+                0x0800B328u, 1u, 360u, 240u, 60u, 60u, 40u, 40u, y,
+                &object_decision) || object_decision != 0xFFFFFFFFu) {
+            std::puts("widescreen_policy_test: out-of-range OBJ Y admitted");
+            return 1;
+        }
+    }
+    // The generic branch policy keeps the alternate B328 route closed; the
+    // parent-correlated helper below admits only the measured ownership path.
+    for (std::int32_t y : {160, 199}) {
+        object_decision = 0xFFFFFFFFu;
+        if (golden_sun_expanded_viewport_branch_override(
+                0x0800B328u, 1u, 360u, 240u, 60u, 60u, 40u, 40u, y,
+                &object_decision) || object_decision != 0xFFFFFFFFu) {
+            std::puts("widescreen_policy_test: B328 OBJ Y widened");
+            return 1;
+        }
+    }
+    GoldenSunObjB328ParentMatch b328_parent{};
+    b328_parent.valid = true;
+    b328_parent.staging_address = 0x03002070u;
+    b328_parent.frame = 100u;
+    b328_parent.call_depth = 3u;
+    b328_parent.call_return_pc = 0x08001234u;
+    b328_parent.original_decision = 1u;
+    b328_parent.final_decision = 0u;
+    b328_parent.overridden = true;
+    object_decision = 0xFFFFFFFFu;
+    if (!golden_sun_b328_parent_override(
+            true, 1u, 179, 0x03002070u, 100u, 3u, 0x08001234u,
+            b328_parent, &object_decision) || object_decision != 0u) {
+        std::puts("widescreen_policy_test: correlated B328 route rejected");
+        return 1;
+    }
+    const auto expect_b328_parent_reject =
+        [&](bool active, std::uint32_t original, std::int32_t operand,
+            std::uint32_t staging, std::uint64_t frame,
+            std::uint32_t depth, std::uint32_t return_pc,
+            const GoldenSunObjB328ParentMatch& parent,
+            const char* message) {
+            constexpr std::uint32_t untouched = 0xA5A5A5A5u;
+            std::uint32_t decision = untouched;
+            if (golden_sun_b328_parent_override(
+                    active, original, operand, staging, frame, depth,
+                    return_pc, parent, &decision) || decision != untouched) {
+                std::puts(message);
+                return false;
+            }
+            return true;
+        };
+    auto parentless = b328_parent;
+    parentless.valid = false;
+    auto parent_already_accepted = b328_parent;
+    parent_already_accepted.original_decision = 0u;
+    parent_already_accepted.final_decision = 0u;
+    parent_already_accepted.overridden = false;
+    auto parent_stale_staging = b328_parent;
+    parent_stale_staging.staging_address ^= 4u;
+    if (!expect_b328_parent_reject(
+            true, 1u, 179, 0x03002070u, 100u, 3u, 0x08001234u,
+            parentless, "widescreen_policy_test: parentless B328 admitted") ||
+        !expect_b328_parent_reject(
+            true, 1u, 179, 0x03002070u, 100u, 3u, 0x08001234u,
+            parent_already_accepted,
+            "widescreen_policy_test: accepted parent B328 admitted") ||
+        !expect_b328_parent_reject(
+            true, 1u, 179, 0x03002070u, 100u, 3u, 0x08001234u,
+            parent_stale_staging,
+            "widescreen_policy_test: stale B328 staging admitted") ||
+        !expect_b328_parent_reject(
+            true, 1u, 179, 0x03002070u, 101u, 3u, 0x08001234u,
+            b328_parent, "widescreen_policy_test: stale B328 frame admitted") ||
+        !expect_b328_parent_reject(
+            true, 1u, 179, 0x03002070u, 100u, 4u, 0x08001234u,
+            b328_parent, "widescreen_policy_test: stale B328 context admitted") ||
+        !expect_b328_parent_reject(
+            true, 1u, 179, 0x03002070u, 100u, 3u, 0x08001235u,
+            b328_parent, "widescreen_policy_test: stale B328 return admitted") ||
+        !expect_b328_parent_reject(
+            true, 0u, 179, 0x03002070u, 100u, 3u, 0x08001234u,
+            b328_parent, "widescreen_policy_test: accepted B328 widened") ||
+        !expect_b328_parent_reject(
+            true, 1u, 159, 0x03002070u, 100u, 3u, 0x08001234u,
+            b328_parent, "widescreen_policy_test: low B328 band admitted") ||
+        !expect_b328_parent_reject(
+            true, 1u, 200, 0x03002070u, 100u, 3u, 0x08001234u,
+            b328_parent, "widescreen_policy_test: high B328 band admitted") ||
+        !expect_b328_parent_reject(
+            false, 1u, 179, 0x03002070u, 100u, 3u, 0x08001234u,
+            b328_parent, "widescreen_policy_test: inactive B328 widened")) {
+        return 1;
+    }
+    for (std::int32_t x : {240, 299}) {
+        object_decision = 0xFFFFFFFFu;
+        if (!golden_sun_expanded_viewport_branch_override(
+                0x0800B324u, 1u, 360u, 240u, 60u, 60u, 40u, 40u, x,
+                &object_decision) || object_decision != 0u) {
+            std::puts("widescreen_policy_test: valid expanded OBJ X rejected");
+            return 1;
+        }
+    }
+    object_decision = 0xFFFFFFFFu;
+    if (golden_sun_expanded_viewport_branch_override(
+            0x0800B324u, 1u, 360u, 240u, 60u, 60u, 40u, 40u, 300,
+            &object_decision) || object_decision != 0xFFFFFFFFu) {
+        std::puts("widescreen_policy_test: out-of-range OBJ X admitted");
+        return 1;
+    }
+
+    // The seven other routes may admit only their newly visible operand band.
+    // A rejected override must leave the output slot untouched.
+    const auto expect_route = [&](std::uint32_t pc, std::uint32_t original,
+                                  std::int32_t operand, bool expected_override,
+                                  std::uint32_t expected_decision) {
+        constexpr std::uint32_t untouched = 0xA5A5A5A5u;
+        std::uint32_t decision = untouched;
+        const bool overridden = golden_sun_expanded_viewport_branch_override(
+            pc, original, 360u, 240u, 60u, 60u, 40u, 40u, operand,
+            &decision);
+        return overridden == expected_override &&
+            ((!overridden && decision == untouched) ||
+             (overridden && decision == expected_decision));
+    };
+    const std::int32_t b388_lower_x = -92;
+    const std::int32_t b388_lower_y = -72;
+    if (!expect_route(0x0800B3D2u, 0u, b388_lower_x, true, 1u) ||
+        !expect_route(0x0800B3D2u, 0u, b388_lower_x - 1, false, 0u) ||
+        !expect_route(0x0800B3D2u, 0u, -32, false, 0u) ||
+        !expect_route(0x0800B3D2u, 1u, b388_lower_x, false, 0u) ||
+        !expect_route(0x0800B3E6u, 0u, b388_lower_y, true, 1u) ||
+        !expect_route(0x0800B3E6u, 0u, b388_lower_y - 1, false, 0u) ||
+        !expect_route(0x0800B3E6u, 0u, -32, false, 0u) ||
+        !expect_route(0x0800B3E6u, 1u, b388_lower_y, false, 0u)) {
+        std::puts("widescreen_policy_test: B388 lower band mismatch");
+        return 1;
+    }
+    if (!expect_route(0x0800B3DCu, 0u, 273, true, 1u) ||
+        !expect_route(0x0800B3DCu, 0u, 332, true, 1u) ||
+        !expect_route(0x0800B3DCu, 0u, 272, false, 0u) ||
+        !expect_route(0x0800B3DCu, 0u, 333, false, 0u) ||
+        !expect_route(0x0800B3DCu, 1u, 300, false, 0u) ||
+        !expect_route(0x0800B3ECu, 0u, 209, true, 1u) ||
+        !expect_route(0x0800B3ECu, 0u, 248, true, 1u) ||
+        !expect_route(0x0800B3ECu, 0u, 208, false, 0u) ||
+        !expect_route(0x0800B3ECu, 0u, 249, false, 0u) ||
+        !expect_route(0x0800B3ECu, 1u, 220, false, 0u)) {
+        std::puts("widescreen_policy_test: B388 upper band mismatch");
+        return 1;
+    }
+    constexpr std::uint32_t c6fa_old_max = 0x012FFFFEu;
+    constexpr std::uint32_t c6fa_new_max = c6fa_old_max + (60u << 16);
+    constexpr std::int32_t c6fa_lower = -static_cast<std::int32_t>(60u << 16);
+    if (!expect_route(0x0800C6FAu, 0u, c6fa_lower, true, 1u) ||
+        !expect_route(0x0800C6FAu, 0u, c6fa_lower - 1, false, 0u) ||
+        !expect_route(0x0800C6FAu, 0u, -1, true, 1u) ||
+        !expect_route(0x0800C6FAu, 0u, 0, false, 0u) ||
+        !expect_route(0x0800C6FAu, 1u, c6fa_lower, false, 0u) ||
+        !expect_route(0x0800C6FAu, 0u,
+                      static_cast<std::int32_t>(c6fa_old_max + 1u),
+                      true, 1u) ||
+        !expect_route(0x0800C6FAu, 0u,
+                      static_cast<std::int32_t>(c6fa_new_max), true, 1u) ||
+        !expect_route(0x0800C6FAu, 0u,
+                      static_cast<std::int32_t>(c6fa_old_max), false, 0u) ||
+        !expect_route(0x0800C6FAu, 0u,
+                      static_cast<std::int32_t>(c6fa_new_max + 1u),
+                      false, 0u) ||
+        !expect_route(0x0800C6FAu, 1u,
+                      static_cast<std::int32_t>(c6fa_old_max + 1u),
+                      false, 0u)) {
+        std::puts("widescreen_policy_test: C6FA band mismatch");
+        return 1;
+    }
+    constexpr std::int32_t c702_lower =
+        static_cast<std::int32_t>(0xFFE00000u - (40u << 16));
+    constexpr std::int32_t c708_upper = static_cast<std::int32_t>(248u << 16);
+    if (!expect_route(0x0800C702u, 1u, c702_lower, false, 1u) ||
+        !expect_route(0x0800C702u, 1u, c702_lower + 1, true, 0u) ||
+        !expect_route(0x0800C702u, 1u,
+                      static_cast<std::int32_t>(0xFFE00000u), true, 0u) ||
+        !expect_route(0x0800C702u, 0u, c702_lower + 1, false, 0u) ||
+        !expect_route(0x0800C708u, 1u, c708_upper, true, 0u) ||
+        !expect_route(0x0800C708u, 1u, c708_upper + 1, false, 1u) ||
+        !expect_route(0x0800C708u, 1u, static_cast<std::int32_t>(208u << 16),
+                      true, 0u) ||
+        !expect_route(0x0800C708u, 0u, c708_upper, false, 0u)) {
+        std::puts("widescreen_policy_test: C62C band mismatch");
+        return 1;
+    }
+    std::uint32_t unchanged = 0xA5A5A5A5u;
+    if (golden_sun_expanded_viewport_branch_override(
+            0x0800B3F0u, 1u, 360u, 240u, 60u, 60u, 40u, 40u, 0, &unchanged) ||
+        unchanged != 0xA5A5A5A5u ||
+        golden_sun_expanded_viewport_branch_override(
+            0x0800B27Eu, 1u, 288u, 160u, 24u, 24u, 0u, 0u, 0, &unchanged) ||
+        unchanged != 0xA5A5A5A5u ||
+        golden_sun_expanded_viewport_branch_override(
+            0x0800B27Eu, 1u, 360u, 240u, 60u, 60u, 40u, 40u, 160, nullptr)) {
+        std::puts("widescreen_policy_test: branch fail-closed mismatch");
         return 1;
     }
     const auto unsupported = gbarecomp::resolve_view_geometry(
@@ -310,28 +500,307 @@ int main() {
         std::puts("widescreen_policy_test: OAM shadow slot bounds mismatch");
         return 1;
     }
-    if (!golden_sun_field_obj_y_cull_authorized(
-            true, 0x0800B27Cu, 159u, 40u) ||
-        !golden_sun_field_obj_y_cull_authorized(
-            true, 0x0800B326u, 159u, 40u) ||
-        golden_sun_field_obj_y_cull_authorized(
-            false, 0x0800B27Cu, 159u, 40u) ||
-        golden_sun_field_obj_y_cull_authorized(
-            true, 0x0800B322u, 159u, 40u) ||
-        golden_sun_field_obj_y_cull_authorized(
-            true, 0x0800B27Cu, 160u, 40u) ||
-        golden_sun_field_obj_y_cull_authorized(
-            true, 0x0800B27Cu, 159u, 0u) ||
-        !golden_sun_field_obj_y_expanded(183, 0, 24) ||
-        golden_sun_field_obj_y_expanded(184, 0, 24)) {
-        std::puts("widescreen_policy_test: authenticated OBJ-Y mismatch");
+    if (!golden_sun_obj_provenance_dma_handoff(
+            0x0300347Cu, 0x07000000u, 1024u, 0x8400u) ||
+        golden_sun_obj_provenance_dma_handoff(
+            0x0300347Cu, 0x07000000u, 1020u, 0x8400u) ||
+        golden_sun_obj_provenance_dma_handoff(
+            0x0300347Cu, 0x07000000u, 1024u, 0x8460u) ||
+        golden_sun_obj_provenance_dma_handoff(
+            0x0300347Eu, 0x07000000u, 1024u, 0x8400u) ||
+        golden_sun_obj_provenance_dma_handoff(
+            0x0300347Cu, 0x07000008u, 1024u, 0x8400u)) {
+        std::puts("widescreen_policy_test: OBJ provenance DMA handoff mismatch");
+        return 1;
+    }
+    std::uint32_t provenance_address = 0;
+    if (!golden_sun_obj_y_provenance_address(
+            0x0800B27Eu, 0x0300346Cu, &provenance_address) ||
+        provenance_address != 0x0300347Cu ||
+        !golden_sun_obj_y_provenance_address(
+            0x0800B328u, 0x03003478u, &provenance_address) ||
+        provenance_address != 0x0300347Cu ||
+        golden_sun_obj_y_provenance_address(
+            0x0800B27Cu, 0x0300346Cu, &provenance_address) ||
+        golden_sun_obj_y_provenance_address(
+            0x0800B27Eu, UINT32_MAX, &provenance_address)) {
+        std::puts("widescreen_policy_test: OBJ-Y provenance address mismatch");
+        return 1;
+    }
+    if (!golden_sun_obj_y_branch_writes_oam(
+            0x0800B27Eu, 0u, false, 0u) ||
+        !golden_sun_obj_y_branch_writes_oam(
+            0x0800B27Eu, 1u, true, 0u) ||
+        !golden_sun_obj_y_branch_writes_oam(
+            0x0800B328u, 1u, true, 0u) ||
+        golden_sun_obj_y_branch_writes_oam(
+            0x0800B27Eu, 1u, true, 1u) ||
+        golden_sun_obj_y_branch_writes_oam(
+            0x0800B328u, 1u, false, 0u) ||
+        golden_sun_obj_y_branch_writes_oam(
+            0x0800B324u, 1u, true, 0u)) {
+        std::puts("widescreen_policy_test: OBJ-Y fall-through mismatch");
+        return 1;
+    }
+    if (!golden_sun_obj_x_provenance_address(
+            0x0800B324u, 0x03003478u, &provenance_address) ||
+        provenance_address != 0x0300347Cu ||
+        golden_sun_obj_x_provenance_address(
+            0x0800B328u, 0x03003478u, &provenance_address)) {
+        std::puts("widescreen_policy_test: OBJ-X provenance address mismatch");
+        return 1;
+    }
+    if (!golden_sun_palace_table_fingerprint_matches(
+            kGoldenSunPalaceMapCrc, kGoldenSunPalaceRawCrc) ||
+        golden_sun_palace_table_fingerprint_matches(
+            0x7ac260c4u, 0x060ecd2cu) ||
+        golden_sun_palace_table_fingerprint_matches(
+            kGoldenSunPalaceMapCrc ^ 1u, kGoldenSunPalaceRawCrc) ||
+        !golden_sun_palace_table_authorization_allowed(
+            true, false,
+            GoldenSunWidePolicyReason::AuthorizedMode0SplitScroll,
+            kGoldenSunPalaceMapCrc, kGoldenSunPalaceRawCrc) ||
+        golden_sun_palace_table_authorization_allowed(
+            false, false,
+            GoldenSunWidePolicyReason::AuthorizedMode0SplitScroll,
+            kGoldenSunPalaceMapCrc, kGoldenSunPalaceRawCrc) ||
+        golden_sun_palace_table_authorization_allowed(
+            true, true,
+            GoldenSunWidePolicyReason::AuthorizedMode0SplitScroll,
+            kGoldenSunPalaceMapCrc, kGoldenSunPalaceRawCrc) ||
+        golden_sun_palace_table_authorization_allowed(
+            true, false, GoldenSunWidePolicyReason::AuthorizedMode0,
+            kGoldenSunPalaceMapCrc, kGoldenSunPalaceRawCrc)) {
+        std::puts("widescreen_policy_test: Palace table authorization mismatch");
+        return 1;
+    }
+    // An unprovenanced raw 191 is the wrapped representation of an off-top
+    // logical Y (for example -65), so retain canonical GBA wrapping. A fresh
+    // matching signed record still resolves its positive logical coordinate.
+    constexpr int raw_off_top_y = 191;
+    (void)raw_off_top_y;
+    if (golden_sun_obj_y_resolution(false) != GoldenSunObjYResolution::Canonical ||
+        golden_sun_obj_y_resolution(true) !=
+            GoldenSunObjYResolution::SignedProvenance) {
+        std::puts("widescreen_policy_test: OBJ-Y provenance resolution mismatch");
+        return 1;
+    }
+    if (!golden_sun_obj_y_alias_candidate(191, 191) ||
+        !golden_sun_obj_y_alias_candidate(160, 160) ||
+        !golden_sun_obj_y_alias_candidate(95, -161) ||
+        golden_sun_obj_y_alias_candidate(159, 191) ||
+        golden_sun_obj_y_alias_candidate(191, -65) ||
+        golden_sun_obj_y_alias_candidate(95, 95)) {
+        std::puts("widescreen_policy_test: OBJ-Y alias predicate mismatch");
         return 1;
     }
     if (!golden_sun_obj_provenance_frame_fresh(10u, 10u) ||
         !golden_sun_obj_provenance_frame_fresh(10u, 11u) ||
-        golden_sun_obj_provenance_frame_fresh(10u, 12u) ||
-        golden_sun_obj_provenance_frame_fresh(UINT64_MAX, 0u)) {
+        !golden_sun_obj_provenance_frame_fresh(10u, 12u) ||
+        golden_sun_obj_provenance_frame_fresh(10u, 13u) ||
+        golden_sun_obj_provenance_frame_fresh(11u, 10u) ||
+        golden_sun_obj_provenance_frame_fresh(UINT64_MAX, UINT64_MAX) ||
+        !golden_sun_obj_provenance_frame_fresh(UINT64_MAX - 2u, UINT64_MAX) ||
+        golden_sun_obj_provenance_frame_fresh(UINT64_MAX - 1u, 0u) ||
+        golden_sun_obj_provenance_frame_fresh(0u, UINT64_MAX)) {
         std::puts("widescreen_policy_test: OBJ-Y provenance lifetime mismatch");
+        return 1;
+    }
+    if (!golden_sun_obj_provenance_attrs_match(
+            true, 0x001Bu, 0x4050u, 0x0008u,
+            0x001Bu, 0x4050u, 0x0008u) ||
+        golden_sun_obj_provenance_attrs_match(
+            true, 0x001Bu, 0x4050u, 0x0008u,
+            0x001Cu, 0x4050u, 0x0008u) ||
+        golden_sun_obj_provenance_attrs_match(
+            true, 0x001Bu, 0x4050u, 0x0008u,
+            0x001Bu, 0x4051u, 0x0008u) ||
+        golden_sun_obj_provenance_attrs_match(
+            true, 0x001Bu, 0x4050u, 0x0008u,
+            0x001Bu, 0x4050u, 0x0009u) ||
+        golden_sun_obj_provenance_attrs_match(
+            false, 0x001Bu, 0x4050u, 0x0008u,
+            0x001Bu, 0x4050u, 0x0008u)) {
+        std::puts("widescreen_policy_test: OBJ identity mismatch");
+        return 1;
+    }
+
+    // The measured slot-15 crossing is the only raw-159 repair: require the
+    // exact 162/-94, 161/-95, 160/-96, 159/+159 sequence and stable identity.
+    const auto edge_sample = [](int raw_y, int canonical_y,
+                                std::uint64_t frame,
+                                std::uint16_t attr0 = 0x21A2u,
+                                std::uint16_t attr1 = 0x863Bu,
+                                std::uint16_t attr2 = 0x09A4u) {
+        return GoldenSunObjYEdgeAliasSample{
+            true, true, false, 15, 0x030034F4u, 1u, frame, raw_y,
+            canonical_y, attr0, attr1, attr2};
+    };
+    GoldenSunObjYEdgeAliasState edge_state;
+    auto edge_step = golden_sun_obj_y_edge_alias_step(
+        edge_state, edge_sample(162, -94, 519975u, 0x21A2u, 0x863Bu));
+    edge_state = edge_step.state;
+    if (edge_step.activated || edge_state.count != 1u) {
+        std::puts("widescreen_policy_test: edge-alias first sample mismatch");
+        return 1;
+    }
+    for (int i = 0; i < 8; ++i) {
+        edge_step = golden_sun_obj_y_edge_alias_step(
+            edge_state, edge_sample(162, -94, 519975u, 0x21A2u, 0x863Bu));
+        edge_state = edge_step.state;
+        if (edge_step.activated || !edge_state.valid || edge_state.count != 1u ||
+            edge_state.last_raw_y != 162 ||
+            edge_state.last_canonical_y != -94) {
+            std::puts("widescreen_policy_test: edge-alias same-frame repeat reset");
+            return 1;
+        }
+    }
+    edge_step = golden_sun_obj_y_edge_alias_step(
+        edge_state, edge_sample(161, -95, 519976u, 0x21A2u, 0x863Bu));
+    edge_state = edge_step.state;
+    for (int i = 0; i < 8; ++i)
+        edge_state = golden_sun_obj_y_edge_alias_step(
+            edge_state, edge_sample(161, -95, 519976u, 0x21A2u, 0x863Bu)).state;
+    edge_step = golden_sun_obj_y_edge_alias_step(
+        edge_state, edge_sample(160, -96, 519977u, 0x21A2u, 0x863Bu));
+    edge_state = edge_step.state;
+    for (int i = 0; i < 8; ++i)
+        edge_state = golden_sun_obj_y_edge_alias_step(
+            edge_state, edge_sample(160, -96, 519977u, 0x21A2u, 0x863Bu)).state;
+    edge_step = golden_sun_obj_y_edge_alias_step(
+        edge_state, edge_sample(159, 159, 519978u, 0x21A2u, 0x863Bu));
+    if (!edge_step.activated || edge_step.state.valid) {
+        std::puts("widescreen_policy_test: edge-alias crossing mismatch");
+        return 1;
+    }
+    int edge_activations = 1;
+    edge_state = edge_step.state;
+    for (int i = 0; i < 8; ++i) {
+        edge_step = golden_sun_obj_y_edge_alias_step(
+            edge_state, edge_sample(159, 159, 519978u, 0x21A2u, 0x863Bu));
+        edge_state = edge_step.state;
+        edge_activations += edge_step.activated ? 1 : 0;
+    }
+    if (edge_activations != 1) {
+        std::puts("widescreen_policy_test: edge-alias latch persisted");
+        return 1;
+    }
+    const auto same_frame_mutation_resets = [&](auto changed) {
+        GoldenSunObjYEdgeAliasState state;
+        state = golden_sun_obj_y_edge_alias_step(
+            state, edge_sample(162, -94, 519990u)).state;
+        const auto rejected = golden_sun_obj_y_edge_alias_step(state, changed);
+        if (rejected.activated || rejected.state.valid)
+            return false;
+        state = rejected.state;
+        state = golden_sun_obj_y_edge_alias_step(
+            state, edge_sample(161, -95, 519991u)).state;
+        state = golden_sun_obj_y_edge_alias_step(
+            state, edge_sample(160, -96, 519992u)).state;
+        return !golden_sun_obj_y_edge_alias_step(
+                    state, edge_sample(159, 159, 519993u)).activated;
+    };
+    auto same_frame_raw = edge_sample(161, -95, 519990u);
+    auto same_frame_slot = edge_sample(162, -94, 519990u);
+    same_frame_slot.slot = 14;
+    auto same_frame_target = edge_sample(162, -94, 519990u);
+    same_frame_target.target_address = 0x0300347Cu;
+    auto same_frame_epoch = edge_sample(162, -94, 519990u);
+    same_frame_epoch.auth_epoch = 2u;
+    auto same_frame_attr0 = edge_sample(162, -94, 519990u, 0x61A2u);
+    auto same_frame_attr1 = edge_sample(162, -94, 519990u, 0x21A2u, 0x863Cu);
+    auto same_frame_attr2 = edge_sample(162, -94, 519990u, 0x21A2u, 0x863Bu,
+                                        0x09A5u);
+    auto same_frame_inactive = edge_sample(162, -94, 519990u);
+    same_frame_inactive.sprite_active = false;
+    auto same_frame_provenance = edge_sample(162, -94, 519990u);
+    same_frame_provenance.exact_provenance = true;
+    if (!same_frame_mutation_resets(same_frame_raw) ||
+        !same_frame_mutation_resets(same_frame_slot) ||
+        !same_frame_mutation_resets(same_frame_target) ||
+        !same_frame_mutation_resets(same_frame_epoch) ||
+        !same_frame_mutation_resets(same_frame_attr0) ||
+        !same_frame_mutation_resets(same_frame_attr1) ||
+        !same_frame_mutation_resets(same_frame_attr2) ||
+        !same_frame_mutation_resets(same_frame_inactive) ||
+        !same_frame_mutation_resets(same_frame_provenance)) {
+        std::puts("widescreen_policy_test: edge-alias same-frame mutation accepted");
+        return 1;
+    }
+    const auto edge_activates = [&](const auto& first, const auto& second,
+                                    const auto& third, const auto& fourth) {
+        GoldenSunObjYEdgeAliasState state;
+        state = golden_sun_obj_y_edge_alias_step(state, first).state;
+        state = golden_sun_obj_y_edge_alias_step(state, second).state;
+        state = golden_sun_obj_y_edge_alias_step(state, third).state;
+        return golden_sun_obj_y_edge_alias_step(state, fourth).activated;
+    };
+    auto changed_slot = edge_sample(161, -95, 11u);
+    changed_slot.slot = 0;
+    changed_slot.target_address = 0x0300347Cu;
+    changed_slot.attr1 = 0x807Bu;  // prior slot-0 X=259 occupant
+    changed_slot.attr2 = 0x0924u;  // prior slot-0 tile occupant
+    auto changed_target = edge_sample(161, -95, 11u);
+    changed_target.target_address = 0x0300347Cu;
+    auto changed_epoch = edge_sample(161, -95, 11u);
+    changed_epoch.auth_epoch = 2u;
+    auto changed_attr0 = edge_sample(161, -95, 11u, 0x61A2u);
+    auto changed_attr1 = edge_sample(161, -95, 11u, 0x21A2u, 0x843Cu);
+    auto changed_attr2 = edge_sample(161, -95, 11u, 0x21A2u, 0x843Bu,
+                                     0x09A5u);
+    auto wrong_order = edge_sample(160, -96, 11u);
+    auto frame_gap = edge_sample(161, -95, 13u);
+    auto exact_provenance = edge_sample(161, -95, 11u);
+    exact_provenance.exact_provenance = true;
+    const bool n1 = edge_activates(edge_sample(162, -94, 10u), wrong_order,
+                       edge_sample(160, -96, 12u),
+                       edge_sample(159, 159, 13u));
+    const bool n2 = edge_activates(edge_sample(162, -94, 10u), changed_slot,
+                       edge_sample(160, -96, 12u),
+                       edge_sample(159, 159, 13u));
+    const bool n3 = edge_activates(edge_sample(162, -94, 10u), changed_target,
+                       edge_sample(160, -96, 12u),
+                       edge_sample(159, 159, 13u));
+    const bool n4 = edge_activates(edge_sample(162, -94, 10u), changed_epoch,
+                       edge_sample(160, -96, 12u),
+                       edge_sample(159, 159, 13u));
+    const bool n5 = edge_activates(edge_sample(162, -94, 10u), changed_attr0,
+                       edge_sample(160, -96, 12u),
+                       edge_sample(159, 159, 13u));
+    const bool n6 = edge_activates(edge_sample(162, -94, 10u), changed_attr1,
+                       edge_sample(160, -96, 12u),
+                       edge_sample(159, 159, 13u));
+    const bool n7 = edge_activates(edge_sample(162, -94, 10u), changed_attr2,
+                       edge_sample(160, -96, 12u),
+                       edge_sample(159, 159, 13u));
+    const bool n8 = edge_activates(edge_sample(162, -94, 10u), frame_gap,
+                       edge_sample(160, -96, 14u),
+                       edge_sample(159, 159, 15u));
+    const bool n9 = edge_activates(edge_sample(162, -94, 10u), exact_provenance,
+                       edge_sample(160, -96, 12u),
+                       edge_sample(159, 159, 13u));
+    const bool n10 = edge_activates(edge_sample(159, 159, 10u),
+                       edge_sample(161, -95, 11u),
+                       edge_sample(160, -96, 12u),
+                       edge_sample(159, 159, 13u));
+    if (n1 || n2 || n3 || n4 || n5 || n6 || n7 || n8 || n9 || n10) {
+        std::puts("widescreen_policy_test: edge-alias fail-closed mismatch");
+        return 1;
+    }
+    auto disabled = edge_sample(162, -94, 10u);
+    disabled.sprite_active = false;
+    auto edge_native = edge_sample(162, -94, 10u);
+    edge_native.expanded_active = false;
+    if (edge_activates(disabled, edge_sample(161, -95, 11u),
+                       edge_sample(160, -96, 12u),
+                       edge_sample(159, 159, 13u)) ||
+        edge_activates(edge_native, edge_sample(161, -95, 11u),
+                       edge_sample(160, -96, 12u),
+                       edge_sample(159, 159, 13u)) ||
+        golden_sun_obj_y_edge_alias_step(
+            GoldenSunObjYEdgeAliasState{}, edge_sample(159, 159, 10u))
+            .activated) {
+        std::puts("widescreen_policy_test: edge-alias mode/activity mismatch");
         return 1;
     }
 
@@ -371,6 +840,84 @@ int main() {
         std::puts("widescreen_policy_test: split raw-scroll lookup mismatch");
         return 1;
     }
+    GoldenSunFieldTilemapMetadata palace_fill{};
+    palace_fill.map_id = kGoldenSunPalaceNoMapId;
+    palace_fill.has_raw_entry = true;
+    if (!golden_sun_palace_out_of_room(palace_fill)) {
+        std::puts("widescreen_policy_test: Palace fill not out-of-room");
+        return 1;
+    }
+    // A cell can be inside the finite 128x128 table yet still be Palace fill;
+    // the exact table fingerprint must not authorize that residual cell.
+    store32(split_ewram, split_map_offset(6, 73),
+            static_cast<std::uint32_t>(kGoldenSunPalaceNoMapId));
+    if (golden_sun_field_tilemap_entry(
+            palace_dispcnt, io.data(), io.size(), split_ewram.data(),
+            split_ewram.size(), 1, -24, 0, &split_entry, nullptr, nullptr,
+            false, true)) {
+        std::puts("widescreen_policy_test: Palace residual cell accepted");
+        return 1;
+    }
+
+    // The Palace active-region mask must keep each layer's seeded component,
+    // stop at 0x026 barriers, and not make another layer's component reachable.
+    const auto set_region_map = [&](std::uint32_t map_x,
+                                    std::uint32_t map_y,
+                                    std::uint16_t id) {
+        store32(split_ewram, split_map_offset(map_x * 2u, map_y * 2u), id);
+    };
+    for (std::uint32_t map_y = 0; map_y < 128u; ++map_y) {
+        for (std::uint32_t map_x = 0; map_x < 128u; ++map_x)
+            set_region_map(map_x, map_y, kGoldenSunPalaceNoMapId);
+    }
+    for (std::uint32_t tile_y = 0; tile_y < 2u; ++tile_y) {
+        for (std::uint32_t tile_x = 0; tile_x < 2u; ++tile_x)
+            store16(split_ewram, split_raw_offset(7, tile_x, tile_y),
+                    0x1234u);
+    }
+    // BG1 seeds at (4,36), BG2 at (36,12), BG3 at (4,17).
+    set_region_map(4, 36, 7);
+    for (std::uint32_t map_x = 5; map_x <= 24; ++map_x)
+        set_region_map(map_x, 36, 7);
+    for (std::uint32_t map_y = 37; map_y <= 50; ++map_y)
+        set_region_map(4, map_y, 7);
+    set_region_map(36, 12, 7);
+    set_region_map(37, 12, 7); // connected BG2 cell
+    set_region_map(4, 17, 7);
+    set_region_map(5, 17, 7);  // connected BG3 cell
+    set_region_map(20, 20, 7); // disconnected island, never a seed
+    GoldenSunPalaceActiveRegion palace_region;
+    if (!palace_region.build(palace_dispcnt, io.data(), io.size(),
+                             split_ewram.data(), split_ewram.size(), true) ||
+        !palace_region.layer_built(1) || !palace_region.layer_built(2) ||
+        !palace_region.layer_built(3) ||
+        !palace_region.reachable(1, 4, 36) ||
+        !palace_region.reachable(1, 5, 36) ||
+        !palace_region.reachable(1, 23, 36) ||
+        !palace_region.reachable(1, 4, 49) ||
+        palace_region.reachable(1, 4, 50) ||
+        palace_region.reachable(1, 24, 36) ||
+        palace_region.reachable(1, 20, 20) ||
+        palace_region.reachable(1, 36, 12) ||
+        palace_region.reachable(2, 4, 36) ||
+        !palace_region.reachable(2, 36, 12) ||
+        !palace_region.reachable(3, 4, 17) ||
+        !palace_region.seeded(1, 4, 36) ||
+        palace_region.seeded(1, 20, 36) ||
+        !palace_region.seeded(2, 36, 12) ||
+        !palace_region.seeded(3, 4, 17) ||
+        palace_region.seeded(1, 20, 20)) {
+        std::puts("widescreen_policy_test: Palace active-region mismatch");
+        return 1;
+    }
+    palace_region.reset();
+    if (palace_region.reachable(1, 4, 36) ||
+        palace_region.build(palace_dispcnt, io.data(), io.size(),
+                            split_ewram.data(), split_ewram.size(), false) ||
+        palace_region.reachable(1, 4, 36)) {
+        std::puts("widescreen_policy_test: Palace active-region reset mismatch");
+        return 1;
+    }
 
     // Restore the equal-scroll fixture for the existing field/provider cases.
     store16(io, 0x0A, town_bgcnt);
@@ -382,48 +929,6 @@ int main() {
     store16(io, 0x1A, 239);
     store16(io, 0x1C, 115);
     store16(io, 0x1E, 239);
-    const std::array<std::uint32_t, 6> cull_pcs{
-        0x0800B27Cu, 0x0800B322u, 0x0800B326u,
-        0x0800B3CAu, 0x0800B3D6u, 0x0800B3EAu};
-    const std::array<std::uint32_t, 6> cull_immediates{
-        159u, 239u, 159u, 32u, 136u, 208u};
-    for (std::size_t i = 0; i < cull_pcs.size(); ++i) {
-        if (golden_sun_cull_site_index(cull_pcs[i]) !=
-                static_cast<int>(i) ||
-            golden_sun_cull_site_pc(i) != cull_pcs[i] ||
-            golden_sun_cull_site_original(i) != cull_immediates[i] ||
-            !golden_sun_cull_site_matches(cull_pcs[i], cull_immediates[i]) ||
-            golden_sun_cull_site_matches(cull_pcs[i], cull_immediates[i] + 1u)) {
-            std::puts("widescreen_policy_test: cull route mismatch");
-            return 1;
-        }
-    }
-    if (golden_sun_cull_site_index(0x0800B3F0u) != -1 ||
-        golden_sun_cull_site_matches(0x0800B3F0u, 0u)) {
-        std::puts("widescreen_policy_test: unknown cull route accepted");
-        return 1;
-    }
-    // Object authorization is a separate gate from the Mode-0 background
-    // classifier. The executed Func_b168 final X route and the two measured
-    // equal-scroll Y routes are eligible; Mode 2, split-scroll Mode 0, every
-    // other cull site, and the stock native-width route remain fail-closed.
-    if (!golden_sun_field_obj_cull_authorized(
-            true, 0x0800B322u, 239u, 24u) ||
-        golden_sun_field_obj_cull_authorized(
-            false, 0x0800B322u, 239u, 24u) ||
-        golden_sun_field_obj_cull_authorized(
-            true, 0x0800B322u, 239u, 0u) ||
-        golden_sun_field_obj_cull_authorized(
-            true, 0x0800B322u, 159u, 24u) ||
-        golden_sun_field_obj_cull_authorized(
-            true, 0x0800B326u, 159u, 24u) ||
-        golden_sun_field_obj_cull_authorized(
-            true, 0x0800B3CAu, 32u, 24u) ||
-        golden_sun_field_obj_cull_authorized(
-            true, 0x0800B3F0u, 239u, 24u)) {
-        std::puts("widescreen_policy_test: object cull gate mismatch");
-        return 1;
-    }
     if (!golden_sun_field_obj_x_authorized(true, 0x100, 24u) ||
         !golden_sun_field_obj_x_authorized(true, 0x107, 24u) ||
         golden_sun_field_obj_x_authorized(true, 0x108, 0u) ||
@@ -895,6 +1400,134 @@ int main() {
         std::puts(
             "widescreen_policy_test: authored bitmap did not clear on reset");
         return 1;
+    }
+    // Equal-scroll provider lookups use restored table contents directly;
+    // they must not require post-restore authored bits. The explicit helper
+    // gate above remains available to callers that opt into ownership.
+    if (!golden_sun_field_tilemap_entry(
+            town_dispcnt, io.data(), io.size(), ewram.data(), ewram.size(),
+            1, -24, 0, &entry, nullptr, nullptr) || entry != 0x03ffu) {
+        std::puts("widescreen_policy_test: restored equal-scroll lookup rejected");
+        return 1;
+    }
+    // Logical atlas coordinates are finite; a signed margin must not wrap a
+    // negative tile coordinate into cell 127. Synthetic margin rendering also
+    // cannot establish ownership by itself.
+    auto zero_scroll_io = io;
+    for (std::size_t offset : {0x14u, 0x16u, 0x18u, 0x1Au, 0x1Cu, 0x1Eu})
+        store16(zero_scroll_io, offset, 0u);
+    GoldenSunFieldAuthoredMap margin_authored;
+    margin_authored.mark_write(0x02010000u, 4u);
+    if (golden_sun_field_tilemap_entry(
+            town_dispcnt, zero_scroll_io.data(), zero_scroll_io.size(),
+            ewram.data(), ewram.size(), 1, -24, 0, &entry, nullptr,
+            &margin_authored) || margin_authored.authored_count() != 1u) {
+        std::puts("widescreen_policy_test: negative atlas coordinate wrapped");
+        return 1;
+    }
+    margin_authored.reset();
+    if (margin_authored.authored_count() != 0u ||
+        golden_sun_field_tilemap_entry(
+            town_dispcnt, zero_scroll_io.data(), zero_scroll_io.size(),
+            ewram.data(), ewram.size(), 1, -24, 0, &entry, nullptr,
+            &margin_authored)) {
+        std::puts("widescreen_policy_test: stale authored margin survived reset");
+        return 1;
+    }
+
+    // WIDE-01 experimental off-screen cull safety net (Experimental Fixes
+    // toggle). See docs/issues/WIDE-01_NPC_IDENTITY.md, "The off-screen
+    // rule", for the evidence this is built from.
+
+    // resign: the one proven X exception (exactly raw=256 stays positive,
+    // not -256) must hold, alongside plain two's-complement elsewhere.
+    if (golden_sun_experimental_resign_oam_x(256u) != 256) {
+        std::puts("widescreen_policy_test: X=256 resign exception broke");
+        return 1;
+    }
+    if (golden_sun_experimental_resign_oam_x(0u) != 0 ||
+        golden_sun_experimental_resign_oam_x(255u) != 255 ||
+        golden_sun_experimental_resign_oam_x(257u) != 257 - 512 ||
+        golden_sun_experimental_resign_oam_x(511u) != 511 - 512) {
+        std::puts("widescreen_policy_test: X resign wrap broke");
+        return 1;
+    }
+    if (golden_sun_experimental_resign_oam_y(0u) != 0 ||
+        golden_sun_experimental_resign_oam_y(127u) != 127 ||
+        golden_sun_experimental_resign_oam_y(128u) != 128 - 256 ||
+        golden_sun_experimental_resign_oam_y(255u) != 255 - 256) {
+        std::puts("widescreen_policy_test: Y resign wrap broke");
+        return 1;
+    }
+
+    // Ambiguous hardware coordinates must stay visible unless the exact
+    // pre-truncation placement is available. In particular, raw Y=160 may be
+    // a real positive bottom-margin sprite, not only wrapped Y=-96.
+    {
+        int resolved = 0;
+        if (!golden_sun_experimental_resolve_oam_y(160u, true, 160,
+                                                   &resolved) ||
+            resolved != 160 ||
+            golden_sun_experimental_resolve_oam_y(160u, false, 0,
+                                                  &resolved)) {
+            std::puts("widescreen_policy_test: ambiguous Y did not fail closed");
+            return 1;
+        }
+        if (!golden_sun_experimental_resolve_oam_x(256u, true, 256,
+                                                   &resolved) ||
+            resolved != 256 ||
+            golden_sun_experimental_resolve_oam_x(256u, false, 0,
+                                                  &resolved)) {
+            std::puts("widescreen_policy_test: ambiguous X did not fail closed");
+            return 1;
+        }
+    }
+
+    // Half-extent table: every combination WIDE-01_NPC_IDENTITY.md actually
+    // observed must decode to its real GBA pixel size.
+    {
+        struct HalfExtentCase {
+            unsigned shape, size;
+            int expect_half_w, expect_half_h;
+        };
+        const HalfExtentCase cases[] = {
+            {0u, 1u, 8, 8},    // 16x16
+            {0u, 2u, 16, 16},  // 32x32
+            {1u, 0u, 8, 4},    // 16x8 (shadow signature)
+            {2u, 3u, 16, 32},  // 32x64
+        };
+        for (const auto& c : cases) {
+            int half_w = -1, half_h = -1;
+            golden_sun_obj_half_extent(c.shape, c.size, &half_w, &half_h);
+            if (half_w != c.expect_half_w || half_h != c.expect_half_h) {
+                std::puts("widescreen_policy_test: half-extent table wrong");
+                return 1;
+            }
+        }
+    }
+
+    // OAM coordinates are top-left, so the full sprite must clear an edge
+    // before it is hidden. A 32x32 sprite at x=283 overlaps the right edge;
+    // x=300 is the first fully-clear position.
+    {
+        constexpr std::uint32_t kLeft = 60u, kRight = 60u, kTop = 40u,
+                                kBottom = 40u;
+        if (golden_sun_experimental_sprite_fully_offscreen_top_left(
+                283, 0, 32, 32, kLeft, kRight, kTop, kBottom) ||
+            !golden_sun_experimental_sprite_fully_offscreen_top_left(
+                300, 0, 32, 32, kLeft, kRight, kTop, kBottom) ||
+            golden_sun_experimental_sprite_fully_offscreen_top_left(
+                0, 167, 32, 64, kLeft, kRight, kTop, kBottom)) {
+            std::puts("widescreen_policy_test: top-left bounds are wrong");
+            return 1;
+        }
+        int width = 0, height = 0;
+        if (!golden_sun_obj_dimensions(2u, 3u, &width, &height) ||
+            width != 32 || height != 64 ||
+            golden_sun_obj_dimensions(3u, 0u, &width, &height)) {
+            std::puts("widescreen_policy_test: sprite dimensions unsafe");
+            return 1;
+        }
     }
     return 0;
 }

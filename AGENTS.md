@@ -71,8 +71,11 @@ These are repository-scoped defaults for future sessions:
 
 - Keep replies maximally concise: only essential facts, fewest possible words,
   no preamble, repetition, optional detail, or fluff.
-- Always use Luna xHigh subagents for task work; Sol only orchestrates, compares
-  evidence, integrates, and reports.
+- Sol Medium orchestrates and reviews. Investigation is delegated to Luna XHigh;
+  escalate investigation to Luna Max only when XHigh evidence is insufficient.
+  After investigation, Sol synthesizes exact evidence-backed fix instructions.
+  Implementation is delegated to Luna High; Luna Medium is reserved for
+  simple/mechanical fixes.
 - Ask the user when a material choice is ambiguous; do not guess their intent.
 - The user performs all gameplay and other manual testing.
 - Always launch the playable build through the repository-root

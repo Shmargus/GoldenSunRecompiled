@@ -1,11 +1,12 @@
 # Active issues
 
-Updated 2026-08-25. This is an index only. Read `STATUS.md` and
+Updated 2026-08-30. This is an index only. Read `STATUS.md` and
 `NEXT_TASK.md`, then open exactly the linked detail file for the task. Closed
 evidence belongs in [`history/`](history/), which is not current guidance.
 
 ## Performance and correctness
 
+- [LAUNCH-01](issues/LAUNCH-01.md) — Launcher freezes after ROM selection; SDL2 rebuild done, freeze persists.
 - [PERF-08](issues/PERF-08.md) — Residual stutter and dynamic-RAM churn.
 - [CRASH-03](issues/CRASH-03.md) — Wild jump during Bilibin transition.
 - [CRASH-02](issues/CRASH-02.md) — Interpreter bridge call-return depth.
@@ -26,7 +27,8 @@ evidence belongs in [`history/`](history/), which is not current guidance.
 
 ## Graphics and presentation
 
-- [WIDE-01](issues/WIDE-01.md) — Widescreen/culling/scene acceptance umbrella.
+- [WIDE-01](issues/WIDE-01.md) — Widescreen/culling/scene acceptance umbrella;
+  2026-08-30 culling regression reverted, user test pending.
 - [VFX-LINGER-01](issues/VFX-LINGER-01.md) — Sprites over battle fade.
 - [PRES-01](issues/PRES-01.md) — Enhanced Timing A/V drift gate.
 - [PRES-02](issues/PRES-02.md) — Reported screen tearing.
@@ -38,6 +40,14 @@ evidence belongs in [`history/`](history/), which is not current guidance.
 
 - [TOOL-01](issues/TOOL-01.md) — Overlay trace symbolization.
 - [CLEANUP-02](issues/CLEANUP-02.md) — Cost-probe IRQ instrumentation.
+
+## BIOS-free investigation (informational, parked)
+
+- [BIOS-FREE-01](issues/BIOS_FREE_CENSUS.md) — Golden Sun BIOS-dependency
+  census. Informational analysis only; see `BIOS-01` in `PARKED.md`.
+- [BIOS-FREE-02](issues/BIOS_FREE_IRQ_PATH.md) — IRQ path analysis and
+  feasibility verdict. Informational analysis only; see `BIOS-01` in
+  `PARKED.md`.
 
 Resolved: CHEAT-01 is documented in [`features/CHEATS.md`](features/CHEATS.md).
 Deferred: CORE-01 and other parked work are documented in

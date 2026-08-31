@@ -18,6 +18,7 @@
 #include "gba_vram_trace.h"
 #include "recompiled.h"
 #include "relocatable_identity.h"
+#include "relocatable_writer_policy.h"
 #include "player_speed_cheat.h"
 #include "runtime.h"
 #include "runtime_bus_bridge.h"
@@ -25,7 +26,6 @@
 #include "overlay_loader.h"
 #include "self_heal.h"
 #include "sha1.h"
-#include "widescreen_literal_trace.h"
 #include "widescreen_policy.h"
 
 extern "C" unsigned g_ws_active;
@@ -192,22 +192,551 @@ std::uint32_t g_golden_sun_wide_extra_bottom = 0;
 bool g_golden_sun_mode0_field = false;
 bool g_golden_sun_mode0_split_scroll = false;
 gsr::widescreen::GoldenSunFieldAuthoredMap g_golden_sun_field_authored;
-// Edge-detected so the bitmap only clears once per "left the authenticated
-// field" transition, not every scanline the classifier reports the field
-// is inactive (menus/dialogue can hold that state for many frames).
-bool g_golden_sun_field_authored_reset_done = true;
+enum class GoldenSunFieldAuthScene : std::uint8_t { None, EqualScroll, SplitScroll };
+GoldenSunFieldAuthScene g_golden_sun_field_auth_scene =
+    GoldenSunFieldAuthScene::None;
 bool g_golden_sun_expanded_obj_scene = false;
 gsr::widescreen::GoldenSunMode0SplitScrollFrame
     g_golden_sun_mode0_split_scroll_frame;
-struct GoldenSunObjYProvenance {
+
+// Declared here because the diagnostics-only B328 candidate table is defined
+// before the staging-record helpers below.
+struct GoldenSunObjStagingProvenance;
+bool read_golden_sun_obj_staging_attrs(std::uint32_t address,
+                                       std::uint16_t* attr0,
+                                       std::uint16_t* attr1,
+                                       std::uint16_t* attr2);
+GoldenSunObjStagingProvenance* find_golden_sun_obj_staging(
+    std::uint32_t staging_address);
+bool golden_sun_func1dc8_writer_pc(std::uint32_t pc,
+                                   gsr::Func1dc8WriterRoute route);
+void reset_golden_sun_func1dc8_writer_diagnostics();
+// WIDE-01 body/shadow identity trace (see the full definition and comment
+// near kGoldenSunObjCommitOrderLimit below); forward-declared so the EC/F0
+// Func_1dc8 route observers above can call it.
+enum class GoldenSunObjCommitOrderRoute : std::uint8_t { D4, EC, F0 };
+void note_golden_sun_obj_commit_order(GoldenSunObjCommitOrderRoute route,
+                                      std::uint32_t source, int slot,
+                                      std::uint16_t attr0,
+                                      std::uint16_t attr1,
+                                      std::uint16_t attr2, bool x_valid,
+                                      std::int16_t logical_x, bool y_valid,
+                                      std::int16_t logical_y);
+struct RelocatableCodeImage;
+bool relocatable_resident_at(const RelocatableCodeImage& image,
+                             std::uint32_t base, bool* prefix_passed);
+unsigned int ram_code_page_epoch(std::uint32_t addr);
+std::uint64_t g_golden_sun_func1dc8_writer_recognized = 0;
+std::uint64_t g_golden_sun_func1dc8_writer_identity_mismatch = 0;
+std::uint64_t g_golden_sun_func1dc8_writer_unknown_variant = 0;
+unsigned g_golden_sun_func1dc8_writer_logs = 0;
+std::uint32_t g_golden_sun_func1dc8_last_base = 0;
+std::uint64_t g_golden_sun_func1dc8_last_generation = 0;
+struct GoldenSunObjPlacementProvenance {
     bool valid = false;
-    std::uint8_t raw_y = 0;
+    bool x_valid = false;
+    bool y_valid = false;
+    std::int16_t logical_x = 0;
+    std::int16_t logical_y = 0;
     std::uint64_t frame = UINT64_MAX;
     std::uint64_t auth_epoch = 0;
+    // Y-writer identity is kept separately from the X/Y freshness fields so
+    // a later X placement cannot hide which branch supplied logical Y.
+    std::uint32_t writer_branch_pc = 0;
+    std::uint32_t target_address = 0;
+    std::uint64_t writer_generation = 0;
+    // ATTR0/1/2 copied from the exact staging record consumed by 030038D4.
+    // This identity, rather than a short frame-age window, bounds the signed
+    // coordinate's lifetime after the shadow->OAM DMA latch.
+    bool oam_identity_valid = false;
+    std::uint16_t expected_attr0 = 0;
+    std::uint16_t expected_attr1 = 0;
+    std::uint16_t expected_attr2 = 0;
 };
-std::array<GoldenSunObjYProvenance,
+
+// Diagnostic-only link between a B328 positive-Y candidate and the signed-Y
+// cull routes that ran just before it. Keep register values only; never read
+// or print guest payload bytes here.
+struct GoldenSunObjSignedCullObservation {
+    bool valid = false;
+    std::uint64_t frame = UINT64_MAX;
+    std::uint32_t pc = 0;
+    std::int32_t operand = 0;
+    std::uint32_t r7 = 0;
+    std::uint32_t r10 = 0;
+    std::uint32_t r11 = 0;
+    std::uint32_t sp = 0;
+    std::uint32_t lr = 0;
+    std::uint32_t call_depth = 0;
+    std::uint32_t call_return_pc = 0;
+    std::uint64_t sequence = 0;
+};
+
+struct GoldenSunObjB27EParentRoute {
+    bool valid = false;
+    std::uint32_t pc = 0;
+    std::uint32_t staging_address = 0;
+    std::uint64_t frame = UINT64_MAX;
+    std::int32_t operand = 0;
+    std::uint32_t original_decision = 0;
+    std::uint32_t final_decision = 0;
+    bool overridden = false;
+    std::uint32_t r7 = 0;
+    std::uint32_t r10 = 0;
+    std::uint32_t r11 = 0;
+    std::uint32_t sp = 0;
+    std::uint32_t lr = 0;
+    std::uint32_t call_depth = 0;
+    std::uint32_t call_return_pc = 0;
+};
+
+struct GoldenSunObjYCorrelation {
+    bool valid = false;
+    std::uint32_t b328_pc = 0;
+    std::int32_t b328_operand = 0;
+    std::uint32_t b328_r1 = 0;
+    std::uint32_t b328_r3 = 0;
+    std::uint32_t b328_r11 = 0;
+    bool stack_inputs_valid = false;
+    std::uint32_t b328_stack_sp_plus4 = 0;
+    std::uint32_t b328_stack_sp_plus18 = 0;
+    GoldenSunObjB27EParentRoute parent{};
+    std::uint32_t b328_r6 = 0;
+    std::uint32_t b328_r7 = 0;
+    std::uint32_t b328_sp = 0;
+    std::uint32_t b328_lr = 0;
+    std::uint32_t b328_call_depth = 0;
+    std::uint32_t b328_call_return_pc = 0;
+    std::array<GoldenSunObjSignedCullObservation, 4> preceding{};
+};
+
+std::array<GoldenSunObjPlacementProvenance,
            gsr::widescreen::kGoldenSunOamShadowSlotCount>
-    g_golden_sun_obj_y_provenance{};
+    g_golden_sun_obj_pending_provenance{};
+// The guest fills the IWRAM shadow before VBlank, then DMA copies that image
+// to visible OAM.  Keep the two timelines separate: the renderer may only
+// consume the image latched by the exact shadow->OAM handoff.
+std::array<GoldenSunObjPlacementProvenance,
+           gsr::widescreen::kGoldenSunOamShadowSlotCount>
+    g_golden_sun_obj_visible_provenance{};
+
+// B324/B328 operate on the guest's transient 12-byte sprite records in
+// IWRAM, not on the OAM shadow.  Keep the logical coordinates keyed by that
+// record address until the copied 0300387C routine hands the record to its
+// 030038D4 writer.  The writer entry has both identities: R6 is the staging
+// record and R0 is the final OAM-shadow destination.
+struct GoldenSunObjStagingProvenance {
+    bool valid = false;
+    bool x_valid = false;
+    bool y_valid = false;
+    std::uint32_t staging_address = 0;
+    std::int16_t logical_x = 0;
+    std::int16_t logical_y = 0;
+    std::uint64_t frame = UINT64_MAX;
+    std::uint64_t auth_epoch = 0;
+    std::uint32_t x_writer_branch_pc = 0;
+    std::uint32_t y_writer_branch_pc = 0;
+    GoldenSunObjYCorrelation y_correlation{};
+};
+std::array<GoldenSunObjStagingProvenance, 256>
+    g_golden_sun_obj_staging_provenance{};
+
+// F0's entry sees the source record before the generated writer advances R6;
+// the later OAM write sees the destination slot. Keep that exact handoff for
+// one frame so culling never has to infer a source from a reused OAM slot.
+struct GoldenSunObjF0Context {
+    bool valid = false;
+    std::uint64_t frame = UINT64_MAX;
+    std::uint32_t depth = 0;
+    std::uint32_t return_pc = 0;
+    std::uint32_t staging = 0;
+    std::uint32_t record_base = 0;
+    bool shadow = false;
+    std::uint16_t attr0 = 0;
+    std::uint16_t attr1 = 0;
+    std::uint16_t attr2 = 0;
+};
+std::array<GoldenSunObjF0Context,
+           gsr::widescreen::kGoldenSunOamShadowSlotCount>
+    g_golden_sun_obj_f0_contexts{};
+std::uint64_t g_golden_sun_obj_f0_context_frame = UINT64_MAX;
+std::array<GoldenSunObjB27EParentRoute, 256>
+    g_golden_sun_obj_b27e_parent_routes{};
+std::array<std::uint64_t,
+           gsr::widescreen::kGoldenSunOamShadowSlotCount>
+    g_golden_sun_obj_y_alias_last_frame{};
+std::array<std::uint64_t,
+           gsr::widescreen::kGoldenSunOamShadowSlotCount>
+    g_golden_sun_obj_y_canonical_last_frame{};
+unsigned g_golden_sun_obj_y_alias_logs_in_epoch = 0;
+std::uint64_t g_golden_sun_obj_y_alias_logs_dropped = 0;
+std::array<GoldenSunObjSignedCullObservation, 4>
+    g_golden_sun_obj_signed_cull_observations{};
+std::uint64_t g_golden_sun_obj_signed_cull_sequence = 0;
+unsigned g_golden_sun_obj_y_correlation_logs_in_epoch = 0;
+std::uint64_t g_golden_sun_obj_y_correlation_logs_dropped = 0;
+std::array<unsigned, gsr::widescreen::kGoldenSunOamShadowSlotCount>
+    g_golden_sun_obj_y_correlation_slot_logs{};
+struct GoldenSunObjYCorrelationKey {
+    bool valid = false;
+    std::uint32_t staging_address = 0;
+    int slot = -1;
+    std::int32_t b328_operand = 0;
+    std::uint32_t b328_r1 = 0;
+    std::uint32_t b328_r3 = 0;
+    std::uint32_t b328_r11 = 0;
+    std::uint32_t stack_sp_plus4 = 0;
+    std::uint32_t stack_sp_plus18 = 0;
+    std::uint16_t attr0 = 0;
+    std::uint16_t attr1 = 0;
+    std::uint16_t attr2 = 0;
+    std::array<std::uint64_t, 4> cull_sequences{};
+};
+std::array<GoldenSunObjYCorrelationKey, 64>
+    g_golden_sun_obj_y_correlation_keys{};
+// B328 can reject the final Y before a staging handoff exists. Keep a
+// separate, payload-free decision trace for those calls so the B27E parent
+// decision and the B328 decision can be compared using the transient staging
+// record identity and the register/call context. This is diagnostics-only.
+struct GoldenSunObjYCullDecisionKey {
+    bool valid = false;
+    std::uint32_t staging_address = 0;
+    std::uint64_t frame = UINT64_MAX;
+    std::int32_t operand = 0;
+    std::uint32_t original_decision = 0;
+    std::uint32_t final_decision = 0;
+    std::uint32_t r1 = 0;
+    std::uint32_t r3 = 0;
+    std::uint32_t r11 = 0;
+};
+std::array<GoldenSunObjYCullDecisionKey, 64>
+    g_golden_sun_obj_y_cull_decision_keys{};
+unsigned g_golden_sun_obj_y_cull_decision_logs_in_epoch = 0;
+std::uint64_t g_golden_sun_obj_y_cull_decision_logs_dropped = 0;
+constexpr unsigned kGoldenSunObjB328ClassificationSampleLimit = 32u;
+
+enum class GoldenSunObjB328ParentClassification : std::uint8_t {
+    ExactCurrent = 0,
+    SameStagingMismatch,
+    NoParent,
+    Count,
+};
+
+const char* golden_sun_obj_b328_parent_classification_name(
+    GoldenSunObjB328ParentClassification classification) {
+    switch (classification) {
+        case GoldenSunObjB328ParentClassification::ExactCurrent:
+            return "exact-current";
+        case GoldenSunObjB328ParentClassification::SameStagingMismatch:
+            return "same-staging-mismatch";
+        case GoldenSunObjB328ParentClassification::NoParent:
+            return "no-parent";
+        case GoldenSunObjB328ParentClassification::Count:
+            break;
+    }
+    return "unknown";
+}
+
+constexpr unsigned kB328ParentMismatchFrame = 1u << 0;
+constexpr unsigned kB328ParentMismatchCallDepth = 1u << 1;
+constexpr unsigned kB328ParentMismatchReturnPc = 1u << 2;
+
+struct GoldenSunObjB328ClassificationSample {
+    bool valid = false;
+    GoldenSunObjB328ParentClassification classification =
+        GoldenSunObjB328ParentClassification::NoParent;
+    unsigned mismatch_flags = 0;
+    std::uint64_t frame = UINT64_MAX;
+    std::uint32_t staging_address = 0;
+    std::int32_t operand = 0;
+    std::uint64_t parent_frame = UINT64_MAX;
+    std::uint32_t parent_call_depth = 0;
+    std::uint32_t parent_return_pc = 0;
+};
+
+enum class GoldenSunObjB328WriterOutcome : std::uint8_t {
+    Pending = 0,
+    Consumed,
+    Unrelated,
+    IdentityUnproven,
+    Expired,
+    ContextMismatch,
+    AttrMismatch,
+    Count,
+};
+
+struct GoldenSunObjB328AcceptedCandidate {
+    bool valid = false;
+    bool handoff_seen = false;
+    GoldenSunObjB328ParentClassification classification =
+        GoldenSunObjB328ParentClassification::NoParent;
+    std::uint32_t staging_address = 0;
+    std::uint64_t frame = UINT64_MAX;
+    std::uint64_t auth_epoch = 0;
+    std::int32_t operand = 0;
+    std::uint32_t call_depth = 0;
+    std::uint32_t call_return_pc = 0;
+    bool attr_identity_valid = false;
+    std::uint16_t expected_attr0 = 0;
+    std::uint16_t expected_attr1 = 0;
+    std::uint16_t expected_attr2 = 0;
+    GoldenSunObjB328WriterOutcome f0_outcome =
+        GoldenSunObjB328WriterOutcome::Pending;
+    bool f0_writer_seen = false;
+    std::uint64_t f0_writer_frame = UINT64_MAX;
+    std::uint32_t f0_writer_depth = 0;
+    std::uint32_t f0_writer_return_pc = 0;
+    std::uint32_t f0_target_address = 0;
+    int f0_slot = -1;
+    std::uint16_t f0_attr0 = 0;
+    std::uint16_t f0_attr1 = 0;
+    std::uint16_t f0_attr2 = 0;
+    std::uint32_t f0_register_mask = 0;
+    bool f0_entry_seen = false;
+    std::uint64_t f0_entry_frame = UINT64_MAX;
+    std::uint32_t f0_entry_depth = 0;
+    std::uint32_t f0_entry_return_pc = 0;
+    std::uint32_t f0_entry_staging = 0;
+};
+
+enum class GoldenSunObjB328WriterRoute : std::uint8_t {
+    D4 = 0,
+    F0,
+    Count,
+};
+
+const char* golden_sun_obj_b328_writer_route_name(
+    GoldenSunObjB328WriterRoute route) {
+    return route == GoldenSunObjB328WriterRoute::D4 ? "D4" : "F0";
+}
+
+const char* golden_sun_obj_b328_writer_outcome_name(
+    GoldenSunObjB328WriterOutcome outcome) {
+    switch (outcome) {
+        case GoldenSunObjB328WriterOutcome::Pending: return "pending";
+        case GoldenSunObjB328WriterOutcome::Consumed: return "consumed";
+        case GoldenSunObjB328WriterOutcome::Unrelated: return "unrelated";
+        case GoldenSunObjB328WriterOutcome::IdentityUnproven:
+            return "identity-unproven";
+        case GoldenSunObjB328WriterOutcome::Expired: return "expired";
+        case GoldenSunObjB328WriterOutcome::ContextMismatch:
+            return "context-mismatch";
+        case GoldenSunObjB328WriterOutcome::AttrMismatch:
+            return "attr-mismatch";
+        case GoldenSunObjB328WriterOutcome::Count: break;
+    }
+    return "unknown";
+}
+
+struct GoldenSunObjB328RejectedRoute {
+    GoldenSunObjB328WriterOutcome outcome =
+        GoldenSunObjB328WriterOutcome::Pending;
+    bool writer_seen = false;
+    std::uint64_t writer_frame = UINT64_MAX;
+    std::uint32_t writer_depth = 0;
+    std::uint32_t writer_return_pc = 0;
+    std::uint32_t target_address = 0;
+    std::uint32_t writer_staging = 0;
+    int slot = -1;
+    std::uint16_t attr0 = 0;
+    std::uint16_t attr1 = 0;
+    std::uint16_t attr2 = 0;
+    std::uint32_t f0_register_mask = 0;
+    bool f0_entry_seen = false;
+    std::uint64_t f0_entry_frame = UINT64_MAX;
+    std::uint32_t f0_entry_depth = 0;
+    std::uint32_t f0_entry_return_pc = 0;
+    std::uint32_t f0_entry_staging = 0;
+};
+
+struct GoldenSunObjB328RejectedCandidate {
+    bool valid = false;
+    GoldenSunObjB328ParentClassification classification =
+        GoldenSunObjB328ParentClassification::NoParent;
+    unsigned mismatch_flags = 0;
+    std::uint64_t frame = UINT64_MAX;
+    std::uint64_t auth_epoch = 0;
+    std::uint32_t staging_address = 0;
+    std::int32_t operand = 0;
+    std::uint32_t call_depth = 0;
+    std::uint32_t call_return_pc = 0;
+    bool attr_identity_valid = false;
+    std::uint16_t expected_attr0 = 0;
+    std::uint16_t expected_attr1 = 0;
+    std::uint16_t expected_attr2 = 0;
+    std::array<GoldenSunObjB328RejectedRoute,
+               static_cast<std::size_t>(GoldenSunObjB328WriterRoute::Count)>
+        routes{};
+};
+
+struct GoldenSunObjB328RejectedSample {
+    bool valid = false;
+    GoldenSunObjB328WriterRoute route = GoldenSunObjB328WriterRoute::D4;
+    GoldenSunObjB328WriterOutcome outcome =
+        GoldenSunObjB328WriterOutcome::Expired;
+    GoldenSunObjB328ParentClassification classification =
+        GoldenSunObjB328ParentClassification::NoParent;
+    unsigned mismatch_flags = 0;
+    std::uint64_t frame = UINT64_MAX;
+    std::uint64_t writer_frame = UINT64_MAX;
+    std::uint64_t auth_epoch = 0;
+    std::uint32_t staging_address = 0;
+    std::uint32_t writer_staging = 0;
+    std::int32_t operand = 0;
+    std::uint32_t call_depth = 0;
+    std::uint32_t call_return_pc = 0;
+    std::uint32_t writer_depth = 0;
+    std::uint32_t writer_return_pc = 0;
+    std::uint32_t f0_register_mask = 0;
+    bool f0_entry_seen = false;
+    std::uint64_t f0_entry_frame = UINT64_MAX;
+    std::uint32_t f0_entry_depth = 0;
+    std::uint32_t f0_entry_return_pc = 0;
+    std::uint32_t f0_entry_staging = 0;
+    std::uint16_t expected_attr0 = 0;
+    std::uint16_t expected_attr1 = 0;
+    std::uint16_t expected_attr2 = 0;
+    int slot = -1;
+    std::uint16_t attr0 = 0;
+    std::uint16_t attr1 = 0;
+    std::uint16_t attr2 = 0;
+};
+
+struct GoldenSunObjB328AcceptedF0Sample {
+    bool valid = false;
+    GoldenSunObjB328WriterOutcome outcome =
+        GoldenSunObjB328WriterOutcome::Expired;
+    GoldenSunObjB328ParentClassification classification =
+        GoldenSunObjB328ParentClassification::NoParent;
+    std::uint64_t frame = UINT64_MAX;
+    std::uint64_t writer_frame = UINT64_MAX;
+    std::uint64_t auth_epoch = 0;
+    std::uint32_t staging_address = 0;
+    std::int32_t operand = 0;
+    std::uint32_t call_depth = 0;
+    std::uint32_t call_return_pc = 0;
+    std::uint32_t writer_depth = 0;
+    std::uint32_t writer_return_pc = 0;
+    std::uint32_t target_address = 0;
+    bool f0_entry_seen = false;
+    std::uint64_t f0_entry_frame = UINT64_MAX;
+    std::uint32_t f0_entry_depth = 0;
+    std::uint32_t f0_entry_return_pc = 0;
+    std::uint32_t f0_entry_staging = 0;
+    std::uint32_t f0_register_mask = 0;
+    std::uint16_t expected_attr0 = 0;
+    std::uint16_t expected_attr1 = 0;
+    std::uint16_t expected_attr2 = 0;
+    int slot = -1;
+    std::uint16_t attr0 = 0;
+    std::uint16_t attr1 = 0;
+    std::uint16_t attr2 = 0;
+};
+
+struct GoldenSunObjB328Diagnostics {
+    std::array<std::uint64_t, static_cast<std::size_t>(
+        GoldenSunObjB328ParentClassification::Count)> classifications{};
+    std::uint64_t mismatch_frame = 0;
+    std::uint64_t mismatch_call_depth = 0;
+    std::uint64_t mismatch_return_pc = 0;
+    std::array<GoldenSunObjB328ClassificationSample,
+               kGoldenSunObjB328ClassificationSampleLimit> samples{};
+    std::size_t sample_count = 0;
+    std::uint64_t samples_dropped = 0;
+    std::array<std::uint64_t, static_cast<std::size_t>(
+        GoldenSunObjB328ParentClassification::Count)> accepted{};
+    std::array<std::uint64_t, static_cast<std::size_t>(
+        GoldenSunObjB328ParentClassification::Count)> handoffs{};
+    std::array<std::uint64_t, static_cast<std::size_t>(
+        GoldenSunObjB328ParentClassification::Count)> no_handoff{};
+    std::uint64_t accepted_tracking_dropped = 0;
+    std::array<GoldenSunObjB328AcceptedCandidate, 256> candidates{};
+    std::uint64_t rejected_total = 0;
+    std::array<std::array<std::uint64_t,
+                          static_cast<std::size_t>(
+                              GoldenSunObjB328WriterOutcome::Count)>,
+               static_cast<std::size_t>(GoldenSunObjB328WriterRoute::Count)>
+        rejected_outcomes{};
+    std::array<GoldenSunObjB328RejectedCandidate, 256> rejected{};
+    std::uint64_t rejected_tracking_dropped = 0;
+    std::array<GoldenSunObjB328RejectedSample, 32> rejected_samples{};
+    std::size_t rejected_sample_count = 0;
+    std::uint64_t rejected_samples_dropped = 0;
+    std::array<std::uint64_t, static_cast<std::size_t>(
+        GoldenSunObjB328WriterOutcome::Count)> accepted_f0_outcomes{};
+    std::uint64_t accepted_f0_tracking_dropped = 0;
+    std::array<GoldenSunObjB328AcceptedF0Sample, 32> accepted_f0_samples{};
+    std::size_t accepted_f0_sample_count = 0;
+    std::uint64_t accepted_f0_samples_dropped = 0;
+
+    void reset() { *this = {}; }
+};
+GoldenSunObjB328Diagnostics g_golden_sun_obj_b328_diagnostics{};
+
+// A bounded handoff token for the legitimate-looking parentless B328 route.
+// It is diagnostic-only: the branch decision remains unchanged.
+constexpr std::size_t kGoldenSunObjB328ParentlessTokenLimit = 64u;
+struct GoldenSunObjB328ParentlessToken {
+    bool valid = false;
+    std::uint64_t sequence = 0;
+    std::uint64_t frame = UINT64_MAX;
+    std::uint64_t auth_epoch = 0;
+    std::uint32_t staging = 0;
+    std::int32_t operand = 0;
+    std::uint32_t r6 = 0;
+    std::uint32_t r7 = 0;
+    std::uint32_t call_depth = 0;
+    std::uint32_t return_pc = 0;
+    std::uint32_t entry_pc = 0x0800B328u;
+    bool attr_valid = false;
+    std::uint16_t attr0 = 0;
+    std::uint16_t attr1 = 0;
+    std::uint16_t attr2 = 0;
+    bool ec_seen = false;
+    std::uint32_t ec_entry_pc = 0;
+    std::uint32_t ec_r6 = 0;
+    std::uint32_t ec_r7 = 0;
+    std::uint32_t ec_source = 0;
+    const char* ec_reason = "not-seen";
+    bool f0_seen = false;
+    std::uint32_t f0_entry_pc = 0;
+    std::uint32_t f0_r6 = 0;
+    std::uint32_t f0_r7 = 0;
+    std::uint32_t f0_source = 0;
+    std::uint32_t f0_target = 0;
+    int f0_slot = -1;
+    std::uint16_t f0_attr0 = 0;
+    std::uint16_t f0_attr1 = 0;
+    std::uint16_t f0_attr2 = 0;
+    const char* f0_reason = "not-seen";
+};
+std::array<GoldenSunObjB328ParentlessToken,
+           kGoldenSunObjB328ParentlessTokenLimit>
+    g_golden_sun_obj_b328_parentless_tokens{};
+std::uint64_t g_golden_sun_obj_b328_parentless_sequence = 0;
+std::uint64_t g_golden_sun_obj_b328_parentless_dropped = 0;
+struct GoldenSunObjYAcceptedState {
+    bool valid = false;
+    std::uint8_t raw_y = 0;
+    std::int16_t logical_y = 0;
+    std::uint64_t frame = UINT64_MAX;
+    std::uint32_t writer_branch_pc = 0;
+    std::uint32_t target_address = 0;
+    std::uint64_t writer_generation = 0;
+    std::uint16_t attr0 = 0;
+    std::uint16_t attr1 = 0;
+    std::uint16_t attr2 = 0;
+};
+std::array<GoldenSunObjYAcceptedState,
+           gsr::widescreen::kGoldenSunOamShadowSlotCount>
+    g_golden_sun_obj_y_accepted_state{};
+std::array<gsr::widescreen::GoldenSunObjYEdgeAliasState,
+           gsr::widescreen::kGoldenSunOamShadowSlotCount>
+    g_golden_sun_obj_y_edge_alias_state{};
+std::uint64_t g_golden_sun_obj_y_edge_alias_activations = 0;
+unsigned g_golden_sun_obj_y_jump_logs_in_epoch = 0;
+std::uint64_t g_golden_sun_obj_y_jump_logs_dropped = 0;
+std::uint64_t g_golden_sun_field_auth_epoch = 0;
 std::array<std::uint8_t, 0x20> g_golden_sun_wide_line_io{};
 bool g_golden_sun_wide_line_io_valid = false;
 std::uint16_t g_golden_sun_wide_line_dispcnt = 0;
@@ -223,6 +752,2031 @@ constexpr unsigned kGoldenSunWidePolicyTransitionLimit = 16u;
 constexpr unsigned kGoldenSunWidePolicySampleLimit = 16u;
 constexpr unsigned kGoldenSunFieldTableCpuLogLimitPerEpoch = 64u;
 constexpr unsigned kGoldenSunFieldTableDmaLogLimitPerEpoch = 32u;
+constexpr unsigned kGoldenSunObjYProvenanceLogLimitPerEpoch = 128u;
+constexpr unsigned kGoldenSunObjYAliasLogLimitPerEpoch = 64u;
+constexpr unsigned kGoldenSunObjYJumpLogLimitPerEpoch = 64u;
+constexpr unsigned kGoldenSunObjYCorrelationLogLimitPerEpoch = 64u;
+constexpr unsigned kGoldenSunObjYCorrelationPerSlotLimit = 4u;
+constexpr unsigned kGoldenSunObjYCorrelationPerStagingLimit = 2u;
+constexpr unsigned kGoldenSunObjYCullDecisionPerStagingLimit = 4u;
+constexpr unsigned kGoldenSunFieldMapIdAttributionLimit = 32u;
+constexpr unsigned kGoldenSunPalaceMarginSampleLimit = 96u;
+constexpr unsigned kGoldenSunExperimentalCullLogLimit = 128u;
+
+struct GoldenSunExperimentalCullLogState {
+    bool valid = false;
+    int slot = -1;
+    std::uint32_t source = 0;
+    std::uint32_t raw_x = 0;
+    std::uint32_t raw_y = 0;
+    int resolved_x = 0;
+    int resolved_y = 0;
+    unsigned shape = 0;
+    unsigned size = 0;
+    int width = 0;
+    int height = 0;
+    bool culled = false;
+    const char* reason = nullptr;
+};
+std::array<GoldenSunExperimentalCullLogState,
+           gsr::widescreen::kGoldenSunOamShadowSlotCount>
+    g_golden_sun_experimental_cull_last{};
+unsigned g_golden_sun_experimental_cull_logs = 0;
+std::uint64_t g_golden_sun_experimental_cull_logs_dropped = 0;
+bool g_golden_sun_experimental_cull_write_in_progress = false;
+
+const char* golden_sun_field_margin_region(int hw_x, int screen_y,
+                                           std::size_t* out_region);
+bool golden_sun_wide_diagnostics_enabled();
+bool golden_sun_experimental_fixes_enabled();
+bool golden_sun_expanded_obj_view_active();
+
+enum class GoldenSunPalaceMarginOutcome : std::uint8_t {
+    AcceptedNativeSeed = 0,
+    AcceptedConnected,
+    RejectedFill,
+    RejectedMask,
+    RejectedRaw,
+    RejectedLookup,
+    Count,
+};
+
+const char* golden_sun_palace_margin_outcome_name(
+    GoldenSunPalaceMarginOutcome outcome) {
+    switch (outcome) {
+        case GoldenSunPalaceMarginOutcome::AcceptedNativeSeed:
+            return "accepted-native-seed";
+        case GoldenSunPalaceMarginOutcome::AcceptedConnected:
+            return "accepted-connected";
+        case GoldenSunPalaceMarginOutcome::RejectedFill:
+            return "rejected-fill";
+        case GoldenSunPalaceMarginOutcome::RejectedMask:
+            return "rejected-mask";
+        case GoldenSunPalaceMarginOutcome::RejectedRaw:
+            return "rejected-raw";
+        case GoldenSunPalaceMarginOutcome::RejectedLookup:
+            return "rejected-lookup";
+        case GoldenSunPalaceMarginOutcome::Count:
+            break;
+    }
+    return "unknown";
+}
+
+struct GoldenSunPalaceMarginSample {
+    std::uint8_t bg = 0;
+    std::uint8_t region = 0;
+    GoldenSunPalaceMarginOutcome outcome =
+        GoldenSunPalaceMarginOutcome::RejectedLookup;
+    std::int16_t hw_x = 0;
+    std::int16_t screen_y = 0;
+    std::uint16_t map_x = 0;
+    std::uint16_t map_y = 0;
+    std::uint16_t map_id = 0;
+    bool metadata_valid = false;
+};
+
+struct GoldenSunPalaceMarginDiagnostics {
+    static constexpr std::size_t kBgCount = 3u;
+    static constexpr std::size_t kRegionCount = 4u;
+    static constexpr std::size_t kOutcomeCount = static_cast<std::size_t>(
+        GoldenSunPalaceMarginOutcome::Count);
+
+    std::array<std::array<std::array<std::uint64_t, kOutcomeCount>,
+                          kRegionCount>, kBgCount>
+        counts{};
+    std::array<std::array<std::array<bool, kOutcomeCount>, kRegionCount>,
+               kBgCount>
+        sample_seen{};
+    std::array<GoldenSunPalaceMarginSample,
+               kGoldenSunPalaceMarginSampleLimit>
+        samples{};
+    std::size_t sample_count = 0;
+    std::uint64_t samples_dropped = 0;
+
+    void reset() {
+        counts = {};
+        sample_seen = {};
+        sample_count = 0;
+        samples_dropped = 0;
+    }
+
+    void record(int bg, int hw_x, int screen_y,
+                GoldenSunPalaceMarginOutcome outcome,
+                const gsr::widescreen::GoldenSunFieldTilemapMetadata& metadata,
+                bool metadata_valid) {
+        if (bg < 1 || bg > 3) return;
+        std::size_t region = 0;
+        golden_sun_field_margin_region(hw_x, screen_y, &region);
+        const std::size_t bg_index = static_cast<std::size_t>(bg - 1);
+        const std::size_t outcome_index = static_cast<std::size_t>(outcome);
+        ++counts[bg_index][region][outcome_index];
+        if (sample_seen[bg_index][region][outcome_index]) return;
+        sample_seen[bg_index][region][outcome_index] = true;
+        if (sample_count >= samples.size()) {
+            ++samples_dropped;
+            return;
+        }
+        auto& sample = samples[sample_count++];
+        sample.bg = static_cast<std::uint8_t>(bg);
+        sample.region = static_cast<std::uint8_t>(region);
+        sample.outcome = outcome;
+        sample.hw_x = static_cast<std::int16_t>(hw_x);
+        sample.screen_y = static_cast<std::int16_t>(screen_y);
+        sample.map_x = static_cast<std::uint16_t>(metadata.map_x);
+        sample.map_y = static_cast<std::uint16_t>(metadata.map_y);
+        sample.map_id = metadata.map_id;
+        sample.metadata_valid = metadata_valid;
+    }
+};
+
+enum class GoldenSunObjYOutcome : std::uint8_t {
+    CoordinateRejected = 0,
+    ProvenanceMissing,
+    ProvenanceStaleFrame,
+    ProvenanceStaleEpoch,
+    ProvenanceYMismatch,
+    AcceptedProvenance,
+    OutputUnavailable,
+    Count,
+};
+
+const char* golden_sun_obj_y_outcome_name(GoldenSunObjYOutcome outcome) {
+    switch (outcome) {
+        case GoldenSunObjYOutcome::CoordinateRejected: return "coordinate-rejected";
+        case GoldenSunObjYOutcome::ProvenanceMissing: return "provenance-missing";
+        case GoldenSunObjYOutcome::ProvenanceStaleFrame: return "provenance-stale-frame";
+        case GoldenSunObjYOutcome::ProvenanceStaleEpoch: return "provenance-stale-epoch";
+        case GoldenSunObjYOutcome::ProvenanceYMismatch: return "provenance-y-mismatch";
+        case GoldenSunObjYOutcome::AcceptedProvenance: return "accepted-provenance";
+        case GoldenSunObjYOutcome::OutputUnavailable: return "output-unavailable";
+        case GoldenSunObjYOutcome::Count: break;
+    }
+    return "unknown";
+}
+
+struct GoldenSunObjYSlotDiagnostics {
+    std::uint64_t calls = 0;
+    std::uint64_t raw_160_191 = 0;
+    std::uint64_t raw_192 = 0;
+    std::uint64_t raw_193_199 = 0;
+    std::uint64_t raw_200_255 = 0;
+    std::array<std::uint64_t,
+               static_cast<std::size_t>(GoldenSunObjYOutcome::Count)>
+        outcomes{};
+};
+std::array<GoldenSunObjYSlotDiagnostics,
+           gsr::widescreen::kGoldenSunOamShadowSlotCount>
+    g_golden_sun_obj_y_slot_diagnostics{};
+
+// Pixel-relevant provider seam diagnostics. This is deliberately separate
+// from the older steady-state counters: those counters only answer how often
+// a slot was queried and conflate several canonical fallbacks. Keep the
+// aggregate uncapped, while samples are first/change-per-slot and bounded.
+enum class GoldenSunObjYTransitionResolution : std::uint8_t {
+    Signed = 0,
+    Canonical,
+    Count,
+};
+
+enum class GoldenSunObjYTransitionReason : std::uint8_t {
+    NoProvenance = 0,
+    StaleFrame,
+    StaleEpoch,
+    TargetMismatch,
+    RawMismatch,
+    Attr0Mismatch,
+    Attr1Mismatch,
+    Attr2Mismatch,
+    Accepted,
+    OutputUnavailable,
+    Count,
+};
+
+enum class GoldenSunObjYTransitionRegion : std::uint8_t {
+    Top = 0,
+    Native,
+    Bottom,
+    Offscreen,
+    Count,
+};
+
+// Keep the three evidence questions independent. A flood of canonical
+// top-wrap records must not consume the budget needed for accepted bottom
+// candidates or canonical<->signed transitions.
+constexpr unsigned kGoldenSunObjYTransitionSampleLimit = 128u;
+constexpr unsigned kGoldenSunObjYTransitionBucketCount = 3u;
+
+enum class GoldenSunObjYTransitionBucket : std::uint8_t {
+    ActiveCandidateCanonical = 0,
+    SignedBottom,
+    OutcomeTransition,
+    Count,
+};
+
+struct GoldenSunObjYTransitionSample {
+    bool valid = false;
+    std::uint64_t frame = UINT64_MAX;
+    int slot = -1;
+    int raw_y = 0;
+    int canonical_y = 0;
+    int output_y = 0;
+    GoldenSunObjYTransitionResolution resolution =
+        GoldenSunObjYTransitionResolution::Canonical;
+    GoldenSunObjYTransitionReason reason =
+        GoldenSunObjYTransitionReason::NoProvenance;
+    GoldenSunObjYTransitionRegion region =
+        GoldenSunObjYTransitionRegion::Offscreen;
+    std::uint16_t attr0 = 0;
+    std::uint16_t attr1 = 0;
+    std::uint16_t attr2 = 0;
+    std::uint16_t expected_attr0 = 0;
+    std::uint16_t expected_attr1 = 0;
+    std::uint16_t expected_attr2 = 0;
+    std::uint32_t expected_target = 0;
+    std::uint64_t provenance_frame = UINT64_MAX;
+    std::uint64_t provenance_epoch = 0;
+    std::uint32_t target_address = 0;
+    std::uint32_t writer_pc = 0;
+    std::uint64_t writer_generation = 0;
+};
+
+struct GoldenSunObjYTransitionIdentity {
+    bool valid = false;
+    int slot = -1;
+    std::uint32_t target = 0;
+    std::uint16_t attr0 = 0;
+    std::uint16_t attr1 = 0;
+    std::uint16_t attr2 = 0;
+    std::uint16_t expected_attr0 = 0;
+    std::uint16_t expected_attr1 = 0;
+    std::uint16_t expected_attr2 = 0;
+};
+
+struct GoldenSunObjYTransitionOutcomeState {
+    bool valid = false;
+    int slot = -1;
+    std::uint32_t target = 0;
+    GoldenSunObjYTransitionResolution resolution =
+        GoldenSunObjYTransitionResolution::Canonical;
+};
+
+std::array<std::array<std::array<std::uint64_t,
+                                 static_cast<std::size_t>(
+                                     GoldenSunObjYTransitionResolution::Count)>,
+                              static_cast<std::size_t>(
+                                  GoldenSunObjYTransitionRegion::Count)>,
+                     static_cast<std::size_t>(
+                         GoldenSunObjYTransitionReason::Count)>
+    g_golden_sun_obj_y_transition_counts{};
+std::array<std::array<GoldenSunObjYTransitionSample,
+                      kGoldenSunObjYTransitionSampleLimit>,
+           kGoldenSunObjYTransitionBucketCount>
+    g_golden_sun_obj_y_transition_samples{};
+std::array<unsigned, kGoldenSunObjYTransitionBucketCount>
+    g_golden_sun_obj_y_transition_sample_counts{};
+std::array<std::uint64_t, kGoldenSunObjYTransitionBucketCount>
+    g_golden_sun_obj_y_transition_samples_dropped{};
+std::array<std::array<GoldenSunObjYTransitionIdentity,
+                      kGoldenSunObjYTransitionSampleLimit>,
+           2>
+    g_golden_sun_obj_y_transition_seen{};
+std::array<unsigned, 2> g_golden_sun_obj_y_transition_seen_counts{};
+std::array<GoldenSunObjYTransitionOutcomeState, 256>
+    g_golden_sun_obj_y_transition_outcome_states{};
+
+const char* golden_sun_obj_y_transition_resolution_name(
+    GoldenSunObjYTransitionResolution resolution) {
+    return resolution == GoldenSunObjYTransitionResolution::Signed
+        ? "signed" : "canonical";
+}
+
+const char* golden_sun_obj_y_transition_reason_name(
+    GoldenSunObjYTransitionReason reason) {
+    switch (reason) {
+        case GoldenSunObjYTransitionReason::NoProvenance: return "no-provenance";
+        case GoldenSunObjYTransitionReason::StaleFrame: return "stale-frame";
+        case GoldenSunObjYTransitionReason::StaleEpoch: return "stale-epoch";
+        case GoldenSunObjYTransitionReason::TargetMismatch: return "target-mismatch";
+        case GoldenSunObjYTransitionReason::RawMismatch: return "raw-mismatch";
+        case GoldenSunObjYTransitionReason::Attr0Mismatch: return "attr0-mismatch";
+        case GoldenSunObjYTransitionReason::Attr1Mismatch: return "attr1-mismatch";
+        case GoldenSunObjYTransitionReason::Attr2Mismatch: return "attr2-mismatch";
+        case GoldenSunObjYTransitionReason::Accepted: return "accepted";
+        case GoldenSunObjYTransitionReason::OutputUnavailable:
+            return "output-unavailable";
+        case GoldenSunObjYTransitionReason::Count: break;
+    }
+    return "unknown";
+}
+
+const char* golden_sun_obj_y_transition_region_name(
+    GoldenSunObjYTransitionRegion region) {
+    switch (region) {
+        case GoldenSunObjYTransitionRegion::Top: return "top";
+        case GoldenSunObjYTransitionRegion::Native: return "native";
+        case GoldenSunObjYTransitionRegion::Bottom: return "bottom";
+        case GoldenSunObjYTransitionRegion::Offscreen: return "offscreen";
+        case GoldenSunObjYTransitionRegion::Count: break;
+    }
+    return "unknown";
+}
+
+const char* golden_sun_obj_y_transition_bucket_name(
+    GoldenSunObjYTransitionBucket bucket) {
+    switch (bucket) {
+        case GoldenSunObjYTransitionBucket::ActiveCandidateCanonical:
+            return "active-candidate-canonical";
+        case GoldenSunObjYTransitionBucket::SignedBottom:
+            return "signed-bottom";
+        case GoldenSunObjYTransitionBucket::OutcomeTransition:
+            return "outcome-transition";
+        case GoldenSunObjYTransitionBucket::Count:
+            break;
+    }
+    return "unknown";
+}
+
+GoldenSunObjYTransitionRegion golden_sun_obj_y_transition_region(int output_y) {
+    // Expanded logical rows are -40..199. Keep rows outside that actual
+    // output envelope distinct from top/bottom margin rows.
+    if (output_y < -40 || output_y >= 200)
+        return GoldenSunObjYTransitionRegion::Offscreen;
+    if (output_y < 0) return GoldenSunObjYTransitionRegion::Top;
+    if (output_y < 160) return GoldenSunObjYTransitionRegion::Native;
+    return GoldenSunObjYTransitionRegion::Bottom;
+}
+
+int golden_sun_obj_oam_truncated(int logical, int bits);
+
+GoldenSunObjYTransitionReason classify_golden_sun_obj_y_transition(
+    const GoldenSunObjPlacementProvenance& provenance, std::uint64_t frame,
+    std::uint64_t auth_epoch, std::uint32_t expected_target, int raw_y,
+    std::uint16_t attr0, std::uint16_t attr1, std::uint16_t attr2) {
+    if (!provenance.valid || !provenance.y_valid ||
+        !provenance.oam_identity_valid)
+        return GoldenSunObjYTransitionReason::NoProvenance;
+    if (!gsr::widescreen::golden_sun_obj_provenance_frame_fresh(
+            provenance.frame, frame))
+        return GoldenSunObjYTransitionReason::StaleFrame;
+    if (provenance.auth_epoch != auth_epoch)
+        return GoldenSunObjYTransitionReason::StaleEpoch;
+    if (provenance.target_address != expected_target)
+        return GoldenSunObjYTransitionReason::TargetMismatch;
+    if (golden_sun_obj_oam_truncated(provenance.logical_y, 8) != raw_y)
+        return GoldenSunObjYTransitionReason::RawMismatch;
+    if (provenance.expected_attr0 != attr0)
+        return GoldenSunObjYTransitionReason::Attr0Mismatch;
+    if (provenance.expected_attr1 != attr1)
+        return GoldenSunObjYTransitionReason::Attr1Mismatch;
+    if (provenance.expected_attr2 != attr2)
+        return GoldenSunObjYTransitionReason::Attr2Mismatch;
+    return GoldenSunObjYTransitionReason::Accepted;
+}
+
+bool golden_sun_obj_y_steady_state() {
+    return golden_sun_wide_diagnostics_enabled() && g_ws_active &&
+           g_golden_sun_expanded_obj_scene &&
+           (g_golden_sun_mode0_field || g_golden_sun_mode0_split_scroll);
+}
+
+void record_golden_sun_obj_y_outcome(int slot, int raw_y,
+                                     GoldenSunObjYOutcome outcome) {
+    if (!golden_sun_obj_y_steady_state() || slot < 0 ||
+        static_cast<std::size_t>(slot) >= g_golden_sun_obj_y_slot_diagnostics.size() ||
+        raw_y < 160 || raw_y > 255) return;
+    auto& stat = g_golden_sun_obj_y_slot_diagnostics[static_cast<std::size_t>(slot)];
+    ++stat.calls;
+    if (raw_y <= 191) ++stat.raw_160_191;
+    else if (raw_y == 192) ++stat.raw_192;
+    else if (raw_y <= 199) ++stat.raw_193_199;
+    else ++stat.raw_200_255;
+    ++stat.outcomes[static_cast<std::size_t>(outcome)];
+}
+
+void reset_golden_sun_obj_y_alias_diagnostics() {
+    g_golden_sun_obj_y_alias_last_frame.fill(UINT64_MAX);
+    g_golden_sun_obj_y_canonical_last_frame.fill(UINT64_MAX);
+    g_golden_sun_obj_y_alias_logs_in_epoch = 0;
+    g_golden_sun_obj_y_alias_logs_dropped = 0;
+    g_golden_sun_obj_y_accepted_state = {};
+    g_golden_sun_obj_y_edge_alias_state = {};
+    g_golden_sun_obj_y_edge_alias_activations = 0;
+    g_golden_sun_obj_y_jump_logs_in_epoch = 0;
+    g_golden_sun_obj_y_jump_logs_dropped = 0;
+    g_golden_sun_obj_signed_cull_observations = {};
+    g_golden_sun_obj_signed_cull_sequence = 0;
+    g_golden_sun_obj_y_correlation_logs_in_epoch = 0;
+    g_golden_sun_obj_y_correlation_logs_dropped = 0;
+    g_golden_sun_obj_y_correlation_slot_logs = {};
+    g_golden_sun_obj_y_correlation_keys = {};
+    g_golden_sun_obj_y_cull_decision_keys = {};
+    g_golden_sun_obj_y_cull_decision_logs_in_epoch = 0;
+    g_golden_sun_obj_y_cull_decision_logs_dropped = 0;
+    g_golden_sun_obj_b328_diagnostics.reset();
+    g_golden_sun_obj_b27e_parent_routes = {};
+    g_golden_sun_obj_b328_parentless_tokens = {};
+    g_golden_sun_obj_b328_parentless_sequence = 0;
+    g_golden_sun_obj_b328_parentless_dropped = 0;
+    if (golden_sun_wide_diagnostics_enabled()) {
+        g_golden_sun_obj_y_transition_counts = {};
+        g_golden_sun_obj_y_transition_samples = {};
+        g_golden_sun_obj_y_transition_sample_counts = {};
+        g_golden_sun_obj_y_transition_samples_dropped = {};
+        g_golden_sun_obj_y_transition_seen = {};
+        g_golden_sun_obj_y_transition_seen_counts = {};
+        g_golden_sun_obj_y_transition_outcome_states = {};
+    }
+}
+
+std::uint32_t golden_sun_obj_call_return_pc(std::uint32_t depth) {
+    if (depth == 0u) return 0u;
+    const std::uint32_t* stack = runtime_call_stack_data();
+    return stack ? (stack[depth - 1u] & ~1u) : 0u;
+}
+
+GoldenSunObjB27EParentRoute* find_golden_sun_obj_b27e_parent(
+    std::uint32_t staging_address) {
+    for (auto& route : g_golden_sun_obj_b27e_parent_routes) {
+        if (route.valid && route.staging_address == staging_address)
+            return &route;
+    }
+    for (auto& route : g_golden_sun_obj_b27e_parent_routes) {
+        if (!route.valid) {
+            route.staging_address = staging_address;
+            return &route;
+        }
+    }
+    return nullptr;
+}
+
+void record_golden_sun_b27e_parent_route(std::uint32_t original_decision,
+                                         bool overridden,
+                                         std::uint32_t final_decision,
+                                         std::int32_t operand) {
+    if (!golden_sun_expanded_obj_view_active()) return;
+    auto* route = find_golden_sun_obj_b27e_parent(g_cpu.R[7]);
+    if (!route) return;
+    route->valid = true;
+    route->pc = 0x0800B27Eu;
+    route->frame = runtime_current_frame();
+    route->operand = operand;
+    route->original_decision = original_decision;
+    route->final_decision = final_decision;
+    route->overridden = overridden;
+    route->r7 = g_cpu.R[7];
+    route->r10 = g_cpu.R[10];
+    route->r11 = g_cpu.R[11];
+    route->sp = g_cpu.R[13];
+    route->lr = g_cpu.R[14];
+    route->call_depth = runtime_call_stack_depth();
+    route->call_return_pc = golden_sun_obj_call_return_pc(route->call_depth);
+}
+
+const GoldenSunObjB27EParentRoute* find_golden_sun_current_b27e_parent(
+    std::uint32_t staging_address, std::uint64_t frame,
+    std::uint32_t call_depth, std::uint32_t call_return_pc) {
+    for (const auto& route : g_golden_sun_obj_b27e_parent_routes) {
+        if (route.valid && route.staging_address == staging_address &&
+            route.frame == frame && route.call_depth == call_depth &&
+            route.call_return_pc == call_return_pc) {
+            return &route;
+        }
+    }
+    return nullptr;
+}
+
+const GoldenSunObjB27EParentRoute* find_golden_sun_any_b27e_parent(
+    std::uint32_t staging_address) {
+    for (const auto& route : g_golden_sun_obj_b27e_parent_routes) {
+        if (route.valid && route.staging_address == staging_address)
+            return &route;
+    }
+    return nullptr;
+}
+
+struct GoldenSunObjB328ClassificationResult {
+    GoldenSunObjB328ParentClassification classification =
+        GoldenSunObjB328ParentClassification::NoParent;
+    unsigned mismatch_flags = 0;
+    const GoldenSunObjB27EParentRoute* parent = nullptr;
+};
+
+GoldenSunObjB328ClassificationResult classify_golden_sun_b328_parent(
+    std::uint32_t staging_address, std::uint64_t frame,
+    std::uint32_t call_depth, std::uint32_t call_return_pc) {
+    GoldenSunObjB328ClassificationResult result{};
+    result.parent = find_golden_sun_any_b27e_parent(staging_address);
+    if (!result.parent) return result;
+    if (result.parent->frame != frame)
+        result.mismatch_flags |= kB328ParentMismatchFrame;
+    if (result.parent->call_depth != call_depth)
+        result.mismatch_flags |= kB328ParentMismatchCallDepth;
+    if (result.parent->call_return_pc != call_return_pc)
+        result.mismatch_flags |= kB328ParentMismatchReturnPc;
+    result.classification = result.mismatch_flags == 0u
+        ? GoldenSunObjB328ParentClassification::ExactCurrent
+        : GoldenSunObjB328ParentClassification::SameStagingMismatch;
+    return result;
+}
+
+void record_golden_sun_b328_classification(
+    std::int32_t operand, const GoldenSunObjB328ClassificationResult& result,
+    std::uint32_t staging_address, std::uint64_t frame,
+    std::uint32_t call_depth, std::uint32_t call_return_pc) {
+    if (!golden_sun_wide_diagnostics_enabled() ||
+        !golden_sun_expanded_obj_view_active() || operand < 160 ||
+        operand > 199) return;
+    auto& stats = g_golden_sun_obj_b328_diagnostics;
+    const auto class_index = static_cast<std::size_t>(result.classification);
+    ++stats.classifications[class_index];
+    if (result.mismatch_flags & kB328ParentMismatchFrame)
+        ++stats.mismatch_frame;
+    if (result.mismatch_flags & kB328ParentMismatchCallDepth)
+        ++stats.mismatch_call_depth;
+    if (result.mismatch_flags & kB328ParentMismatchReturnPc)
+        ++stats.mismatch_return_pc;
+
+    for (std::size_t i = 0; i < stats.sample_count; ++i) {
+        const auto& sample = stats.samples[i];
+        if (sample.classification == result.classification &&
+            sample.mismatch_flags == result.mismatch_flags &&
+            sample.staging_address == staging_address &&
+            sample.frame == frame && sample.operand == operand) return;
+    }
+    if (stats.sample_count >= stats.samples.size()) {
+        ++stats.samples_dropped;
+        return;
+    }
+    auto& sample = stats.samples[stats.sample_count++];
+    sample.valid = true;
+    sample.classification = result.classification;
+    sample.mismatch_flags = result.mismatch_flags;
+    sample.frame = frame;
+    sample.staging_address = staging_address;
+    sample.operand = operand;
+    if (result.parent) {
+        sample.parent_frame = result.parent->frame;
+        sample.parent_call_depth = result.parent->call_depth;
+        sample.parent_return_pc = result.parent->call_return_pc;
+    }
+    (void)call_depth;
+    (void)call_return_pc;
+}
+
+void record_golden_sun_b328_accepted_candidate(
+    std::int32_t operand,
+    GoldenSunObjB328ParentClassification classification,
+    std::uint32_t staging_address, std::uint64_t frame,
+    std::uint32_t call_depth, std::uint32_t call_return_pc) {
+    if (!golden_sun_wide_diagnostics_enabled() ||
+        !golden_sun_expanded_obj_view_active() || operand < 160 ||
+        operand > 199) return;
+    auto& stats = g_golden_sun_obj_b328_diagnostics;
+    const auto class_index = static_cast<std::size_t>(classification);
+    ++stats.accepted[class_index];
+    for (auto& candidate : stats.candidates) {
+        if (!candidate.valid) {
+            candidate.valid = true;
+            candidate.handoff_seen = false;
+            candidate.classification = classification;
+            candidate.staging_address = staging_address;
+            candidate.frame = frame;
+            candidate.auth_epoch = g_golden_sun_field_auth_epoch;
+            candidate.operand = operand;
+            candidate.call_depth = call_depth;
+            candidate.call_return_pc = call_return_pc;
+            candidate.attr_identity_valid = read_golden_sun_obj_staging_attrs(
+                staging_address, &candidate.expected_attr0,
+                &candidate.expected_attr1, &candidate.expected_attr2);
+            return;
+        }
+    }
+    ++stats.accepted_tracking_dropped;
+    ++stats.accepted_f0_tracking_dropped;
+}
+
+void record_golden_sun_b328_parentless_token(
+    std::uint64_t frame, std::uint32_t staging, std::int32_t operand,
+    std::uint32_t depth, std::uint32_t return_pc) {
+    if (!golden_sun_wide_diagnostics_enabled() ||
+        !golden_sun_expanded_obj_view_active()) return;
+    for (const auto& token : g_golden_sun_obj_b328_parentless_tokens) {
+        if (token.valid && token.frame == frame && token.auth_epoch ==
+            g_golden_sun_field_auth_epoch && token.staging == staging &&
+            token.operand == operand) return;
+    }
+    GoldenSunObjB328ParentlessToken* token = nullptr;
+    for (auto& candidate : g_golden_sun_obj_b328_parentless_tokens) {
+        if (!candidate.valid) {
+            token = &candidate;
+            break;
+        }
+    }
+    if (!token) {
+        ++g_golden_sun_obj_b328_parentless_dropped;
+        return;
+    }
+    *token = {};
+    token->valid = true;
+    token->sequence = ++g_golden_sun_obj_b328_parentless_sequence;
+    token->frame = frame;
+    token->auth_epoch = g_golden_sun_field_auth_epoch;
+    token->staging = staging;
+    token->operand = operand;
+    token->r6 = g_cpu.R[6];
+    token->r7 = g_cpu.R[7];
+    token->call_depth = depth;
+    token->return_pc = return_pc;
+    token->attr_valid = read_golden_sun_obj_staging_attrs(
+        staging, &token->attr0, &token->attr1, &token->attr2);
+}
+
+void link_golden_sun_b328_parentless_ec(
+    std::uint64_t frame, std::uint32_t staging, std::uint32_t depth,
+    std::uint32_t return_pc, std::uint32_t entry_pc) {
+    if (!golden_sun_wide_diagnostics_enabled()) return;
+    GoldenSunObjB328ParentlessToken* found = nullptr;
+    for (auto& token : g_golden_sun_obj_b328_parentless_tokens) {
+        if (!token.valid || token.frame != frame || token.auth_epoch !=
+            g_golden_sun_field_auth_epoch || token.staging != staging) continue;
+        if (found) {
+            found->ec_reason = "ambiguous-token";
+            return;
+        }
+        found = &token;
+    }
+    if (!found) return;
+    found->ec_entry_pc = entry_pc;
+    found->ec_r6 = g_cpu.R[6];
+    found->ec_r7 = g_cpu.R[7];
+    found->ec_source = staging;
+    if (found->call_depth != depth || found->return_pc != return_pc) {
+        found->ec_reason = "context-mismatch";
+        return;
+    }
+    found->ec_seen = true;
+    found->ec_reason = "exact-token";
+}
+
+void link_golden_sun_b328_parentless_f0(
+    std::uint64_t frame, std::uint32_t depth, std::uint32_t return_pc,
+    std::uint32_t entry_pc, std::uint32_t target, int slot,
+    std::uint16_t attr0, std::uint16_t attr1, std::uint16_t attr2) {
+    if (!golden_sun_wide_diagnostics_enabled()) return;
+    GoldenSunObjB328ParentlessToken* found = nullptr;
+    GoldenSunObjB328ParentlessToken* context_match = nullptr;
+    bool context_ambiguous = false;
+    for (auto& token : g_golden_sun_obj_b328_parentless_tokens) {
+        if (!token.valid || token.frame != frame || token.auth_epoch !=
+            g_golden_sun_field_auth_epoch || token.call_depth != depth ||
+            token.return_pc != return_pc) continue;
+        if (context_match) {
+            context_ambiguous = true;
+        } else {
+            context_match = &token;
+        }
+        if (!token.attr_valid || token.attr0 != attr0 ||
+            token.attr1 != attr1 || token.attr2 != attr2) continue;
+        if (found) {
+            found->f0_reason = "ambiguous-token";
+            return;
+        }
+        found = &token;
+    }
+    if (context_ambiguous) {
+        if (found) found->f0_reason = "ambiguous-token";
+        return;
+    }
+    if (!found) {
+        if (context_match && context_match->ec_seen)
+            context_match->f0_reason = "attr-mismatch";
+        return;
+    }
+    found->f0_seen = true;
+    found->f0_entry_pc = entry_pc;
+    found->f0_r6 = g_cpu.R[6];
+    found->f0_r7 = g_cpu.R[7];
+    found->f0_source = found->staging;
+    found->f0_target = target;
+    found->f0_slot = slot;
+    found->f0_attr0 = attr0;
+    found->f0_attr1 = attr1;
+    found->f0_attr2 = attr2;
+    found->f0_reason = "exact-token";
+}
+
+void record_golden_sun_b328_rejected_candidate(
+    std::int32_t operand,
+    GoldenSunObjB328ParentClassification classification,
+    unsigned mismatch_flags, std::uint32_t staging_address,
+    std::uint64_t frame, std::uint32_t call_depth,
+    std::uint32_t call_return_pc) {
+    if (!golden_sun_wide_diagnostics_enabled() ||
+        !golden_sun_expanded_obj_view_active() || operand < 160 ||
+        operand > 199) return;
+    auto& stats = g_golden_sun_obj_b328_diagnostics;
+    ++stats.rejected_total;
+    for (auto& candidate : stats.rejected) {
+        if (!candidate.valid) {
+            candidate.valid = true;
+            candidate.classification = classification;
+            candidate.mismatch_flags = mismatch_flags;
+            candidate.frame = frame;
+            candidate.auth_epoch = g_golden_sun_field_auth_epoch;
+            candidate.staging_address = staging_address;
+            candidate.operand = operand;
+            candidate.call_depth = call_depth;
+            candidate.call_return_pc = call_return_pc;
+            candidate.attr_identity_valid = read_golden_sun_obj_staging_attrs(
+                staging_address, &candidate.expected_attr0,
+                &candidate.expected_attr1, &candidate.expected_attr2);
+            return;
+        }
+    }
+    // The aggregate remains uncapped; only the short-lived correlation table
+    // can overflow.
+    ++stats.rejected_tracking_dropped;
+}
+
+void record_golden_sun_b328_rejected_sample(
+    const GoldenSunObjB328RejectedCandidate& candidate,
+    GoldenSunObjB328WriterRoute route,
+    const GoldenSunObjB328RejectedRoute& result) {
+    auto& stats = g_golden_sun_obj_b328_diagnostics;
+    if (stats.rejected_sample_count >= stats.rejected_samples.size()) {
+        ++stats.rejected_samples_dropped;
+        return;
+    }
+    auto& sample = stats.rejected_samples[stats.rejected_sample_count++];
+    sample.valid = true;
+    sample.route = route;
+    sample.outcome = result.outcome;
+    sample.classification = candidate.classification;
+    sample.mismatch_flags = candidate.mismatch_flags;
+    sample.frame = candidate.frame;
+    sample.writer_frame = result.writer_frame;
+    sample.auth_epoch = candidate.auth_epoch;
+    sample.staging_address = candidate.staging_address;
+    sample.writer_staging = result.writer_staging;
+    sample.operand = candidate.operand;
+    sample.call_depth = candidate.call_depth;
+    sample.call_return_pc = candidate.call_return_pc;
+    sample.writer_depth = result.writer_depth;
+    sample.writer_return_pc = result.writer_return_pc;
+    sample.f0_register_mask = result.f0_register_mask;
+    sample.f0_entry_seen = result.f0_entry_seen;
+    sample.f0_entry_frame = result.f0_entry_frame;
+    sample.f0_entry_depth = result.f0_entry_depth;
+    sample.f0_entry_return_pc = result.f0_entry_return_pc;
+    sample.f0_entry_staging = result.f0_entry_staging;
+    sample.expected_attr0 = candidate.expected_attr0;
+    sample.expected_attr1 = candidate.expected_attr1;
+    sample.expected_attr2 = candidate.expected_attr2;
+    sample.slot = result.slot;
+    sample.attr0 = result.attr0;
+    sample.attr1 = result.attr1;
+    sample.attr2 = result.attr2;
+}
+
+void record_golden_sun_b328_rejected_writer(
+    GoldenSunObjB328WriterRoute route, std::uint32_t writer_staging,
+    int slot, std::uint16_t attr0, std::uint16_t attr1, std::uint16_t attr2,
+    std::uint64_t writer_frame, std::uint32_t writer_depth,
+    std::uint32_t writer_return_pc, std::uint32_t f0_register_mask) {
+    if (!golden_sun_wide_diagnostics_enabled() ||
+        !golden_sun_expanded_obj_view_active()) return;
+    auto& stats = g_golden_sun_obj_b328_diagnostics;
+    const std::size_t route_index = static_cast<std::size_t>(route);
+    for (auto& candidate : stats.rejected) {
+        if (!candidate.valid || candidate.auth_epoch !=
+            g_golden_sun_field_auth_epoch) continue;
+        auto& result = candidate.routes[route_index];
+        if (result.outcome != GoldenSunObjB328WriterOutcome::Pending)
+            continue;
+        const bool same_frame = candidate.frame == writer_frame;
+        const bool same_context = same_frame &&
+            candidate.call_depth == writer_depth &&
+            candidate.call_return_pc == writer_return_pc;
+        std::uint32_t observed_f0_register_mask = f0_register_mask;
+        if (route == GoldenSunObjB328WriterRoute::F0) {
+            observed_f0_register_mask = 0u;
+            for (unsigned reg = 0; reg < 16u; ++reg) {
+                if (g_cpu.R[reg] == candidate.staging_address)
+                    observed_f0_register_mask |= 1u << reg;
+            }
+        }
+        const bool same_staging = route == GoldenSunObjB328WriterRoute::D4 &&
+            candidate.staging_address == writer_staging;
+        const bool f0_entry_identity = route == GoldenSunObjB328WriterRoute::F0 &&
+            result.f0_entry_seen &&
+            result.f0_entry_staging == candidate.staging_address;
+        const bool f0_entry_context = f0_entry_identity &&
+            result.f0_entry_frame == candidate.frame &&
+            result.f0_entry_depth == candidate.call_depth &&
+            result.f0_entry_return_pc == candidate.call_return_pc &&
+            same_context;
+        result.writer_seen = true;
+        result.writer_frame = writer_frame;
+        result.writer_depth = writer_depth;
+        result.writer_return_pc = writer_return_pc;
+        result.writer_staging = route == GoldenSunObjB328WriterRoute::F0 &&
+                result.f0_entry_seen ? result.f0_entry_staging : writer_staging;
+        result.slot = slot;
+        result.attr0 = attr0;
+        result.attr1 = attr1;
+        result.attr2 = attr2;
+        result.f0_register_mask = observed_f0_register_mask;
+        if (route == GoldenSunObjB328WriterRoute::D4 && same_staging &&
+            same_context) {
+            result.outcome = GoldenSunObjB328WriterOutcome::Consumed;
+        } else if (route == GoldenSunObjB328WriterRoute::F0 &&
+                   f0_entry_context) {
+            const bool attrs_match = candidate.attr_identity_valid &&
+                candidate.expected_attr0 == attr0 &&
+                candidate.expected_attr1 == attr1 &&
+                candidate.expected_attr2 == attr2;
+            result.outcome = attrs_match
+                ? GoldenSunObjB328WriterOutcome::Consumed
+                : GoldenSunObjB328WriterOutcome::AttrMismatch;
+        } else if (route == GoldenSunObjB328WriterRoute::F0 &&
+                   f0_entry_identity) {
+            result.outcome = GoldenSunObjB328WriterOutcome::ContextMismatch;
+        } else if (route == GoldenSunObjB328WriterRoute::F0 && same_frame) {
+            // A writer with no matching 030038EC entry is retained as
+            // observational evidence only.
+            result.outcome = GoldenSunObjB328WriterOutcome::IdentityUnproven;
+        } else if (same_frame || same_staging) {
+            result.outcome = GoldenSunObjB328WriterOutcome::Unrelated;
+        } else {
+            continue;
+        }
+        ++stats.rejected_outcomes[route_index][static_cast<std::size_t>(
+            result.outcome)];
+        record_golden_sun_b328_rejected_sample(candidate, route, result);
+    }
+}
+
+void record_golden_sun_b328_accepted_f0_sample(
+    const GoldenSunObjB328AcceptedCandidate& candidate) {
+    auto& stats = g_golden_sun_obj_b328_diagnostics;
+    if (stats.accepted_f0_sample_count >= stats.accepted_f0_samples.size()) {
+        ++stats.accepted_f0_samples_dropped;
+        return;
+    }
+    auto& sample = stats.accepted_f0_samples[
+        stats.accepted_f0_sample_count++];
+    sample.valid = true;
+    sample.outcome = candidate.f0_outcome;
+    sample.classification = candidate.classification;
+    sample.frame = candidate.frame;
+    sample.writer_frame = candidate.f0_writer_frame;
+    sample.auth_epoch = candidate.auth_epoch;
+    sample.staging_address = candidate.staging_address;
+    sample.operand = candidate.operand;
+    sample.call_depth = candidate.call_depth;
+    sample.call_return_pc = candidate.call_return_pc;
+    sample.writer_depth = candidate.f0_writer_depth;
+    sample.writer_return_pc = candidate.f0_writer_return_pc;
+    sample.target_address = candidate.f0_target_address;
+    sample.f0_entry_seen = candidate.f0_entry_seen;
+    sample.f0_entry_frame = candidate.f0_entry_frame;
+    sample.f0_entry_depth = candidate.f0_entry_depth;
+    sample.f0_entry_return_pc = candidate.f0_entry_return_pc;
+    sample.f0_entry_staging = candidate.f0_entry_staging;
+    sample.f0_register_mask = candidate.f0_register_mask;
+    sample.expected_attr0 = candidate.expected_attr0;
+    sample.expected_attr1 = candidate.expected_attr1;
+    sample.expected_attr2 = candidate.expected_attr2;
+    sample.slot = candidate.f0_slot;
+    sample.attr0 = candidate.f0_attr0;
+    sample.attr1 = candidate.f0_attr1;
+    sample.attr2 = candidate.f0_attr2;
+}
+
+void record_golden_sun_b328_accepted_f0_writer(
+    std::uint32_t target_address, int slot, std::uint16_t attr0,
+    std::uint16_t attr1,
+    std::uint16_t attr2, std::uint64_t writer_frame,
+    std::uint32_t writer_depth, std::uint32_t writer_return_pc) {
+    if (!golden_sun_wide_diagnostics_enabled() ||
+        !golden_sun_expanded_obj_view_active()) return;
+    auto& stats = g_golden_sun_obj_b328_diagnostics;
+    for (auto& candidate : stats.candidates) {
+        if (!candidate.valid || candidate.auth_epoch !=
+            g_golden_sun_field_auth_epoch || candidate.f0_outcome !=
+            GoldenSunObjB328WriterOutcome::Pending) continue;
+        const bool same_frame = candidate.frame == writer_frame;
+        const bool same_context = same_frame &&
+            candidate.call_depth == writer_depth &&
+            candidate.call_return_pc == writer_return_pc;
+        std::uint32_t register_mask = 0u;
+        for (unsigned reg = 0; reg < 16u; ++reg) {
+            if (g_cpu.R[reg] == candidate.staging_address)
+                register_mask |= 1u << reg;
+        }
+        const bool entry_identity = candidate.f0_entry_seen &&
+            candidate.f0_entry_staging == candidate.staging_address;
+        const bool entry_context = entry_identity &&
+            candidate.f0_entry_frame == candidate.frame &&
+            candidate.f0_entry_depth == candidate.call_depth &&
+            candidate.f0_entry_return_pc == candidate.call_return_pc &&
+            same_context;
+        candidate.f0_writer_seen = true;
+        candidate.f0_writer_frame = writer_frame;
+        candidate.f0_writer_depth = writer_depth;
+        candidate.f0_writer_return_pc = writer_return_pc;
+        candidate.f0_target_address = target_address;
+        candidate.f0_slot = slot;
+        candidate.f0_attr0 = attr0;
+        candidate.f0_attr1 = attr1;
+        candidate.f0_attr2 = attr2;
+        candidate.f0_register_mask = register_mask;
+        if (entry_context) {
+            const bool attrs_match = candidate.attr_identity_valid &&
+                candidate.expected_attr0 == attr0 &&
+                candidate.expected_attr1 == attr1 &&
+                candidate.expected_attr2 == attr2;
+            candidate.f0_outcome = attrs_match
+                ? GoldenSunObjB328WriterOutcome::Consumed
+                : GoldenSunObjB328WriterOutcome::AttrMismatch;
+        } else if (entry_identity) {
+            candidate.f0_outcome =
+                GoldenSunObjB328WriterOutcome::ContextMismatch;
+        } else if (same_frame) {
+            candidate.f0_outcome = GoldenSunObjB328WriterOutcome::Unrelated;
+        } else {
+            candidate.f0_writer_seen = false;
+            continue;
+        }
+        ++stats.accepted_f0_outcomes[static_cast<std::size_t>(
+            candidate.f0_outcome)];
+        record_golden_sun_b328_accepted_f0_sample(candidate);
+    }
+}
+
+bool golden_sun_experimental_record_identity(std::uint32_t staging,
+                                             std::uint32_t* record_base,
+                                             bool* shadow) {
+    constexpr std::uint32_t kRecordBase = 0x03002000u;
+    constexpr std::uint32_t kRecordEnd = 0x030022E0u;
+    constexpr std::uint32_t kRecordStride = 0x38u;
+    if (!record_base || !shadow || staging < kRecordBase ||
+        staging >= kRecordEnd) return false;
+    const std::uint32_t offset = staging - kRecordBase;
+    const std::uint32_t sub_offset = offset % kRecordStride;
+    if (sub_offset != 0u && sub_offset != 0x0Cu) return false;
+    *record_base = staging - sub_offset;
+    *shadow = sub_offset == 0x0Cu;
+    return true;
+}
+
+void remember_golden_sun_obj_f0_context(
+    std::uint64_t frame, std::uint32_t depth, std::uint32_t return_pc,
+    std::uint32_t staging, std::uint32_t record_base, bool shadow,
+    std::uint16_t attr0, std::uint16_t attr1, std::uint16_t attr2) {
+    if (g_golden_sun_obj_f0_context_frame != frame) {
+        g_golden_sun_obj_f0_contexts = {};
+        g_golden_sun_obj_f0_context_frame = frame;
+    }
+    GoldenSunObjF0Context* context = nullptr;
+    for (auto& candidate : g_golden_sun_obj_f0_contexts) {
+        if (candidate.valid && candidate.staging == staging &&
+            candidate.depth == depth && candidate.return_pc == return_pc) {
+            context = &candidate;
+            break;
+        }
+    }
+    if (!context) {
+        for (auto& candidate : g_golden_sun_obj_f0_contexts) {
+            if (!candidate.valid) {
+                context = &candidate;
+                break;
+            }
+        }
+    }
+    // More than one source in a frame is possible. If the bounded table ever
+    // fills, leave later writes unclassified instead of recycling an identity.
+    if (!context) return;
+    *context = {true, frame, depth, return_pc, staging, record_base, shadow,
+                attr0, attr1, attr2};
+}
+
+const GoldenSunObjF0Context* find_golden_sun_obj_f0_context(
+    std::uint64_t frame, std::uint32_t depth, std::uint32_t return_pc,
+    std::uint16_t attr0, std::uint16_t attr1, std::uint16_t attr2) {
+    if (g_golden_sun_obj_f0_context_frame != frame) return nullptr;
+    const GoldenSunObjF0Context* found = nullptr;
+    for (const auto& candidate : g_golden_sun_obj_f0_contexts) {
+        if (!candidate.valid || candidate.frame != frame ||
+            candidate.depth != depth || candidate.return_pc != return_pc ||
+            candidate.attr0 != attr0 || candidate.attr1 != attr1 ||
+            candidate.attr2 != attr2) continue;
+        if (found) return nullptr; // duplicate identity: fail closed
+        found = &candidate;
+    }
+    return found;
+}
+
+void trace_golden_sun_experimental_cull(
+    int slot, std::uint32_t source, std::uint32_t raw_x,
+    std::uint32_t raw_y, int resolved_x, int resolved_y, unsigned shape,
+    unsigned size, int width, int height, bool culled, const char* reason) {
+    if (!golden_sun_wide_diagnostics_enabled() || slot < 0 ||
+        static_cast<std::size_t>(slot) >= g_golden_sun_experimental_cull_last.size() ||
+        !reason) return;
+    auto& last = g_golden_sun_experimental_cull_last[
+        static_cast<std::size_t>(slot)];
+    const bool unchanged = last.valid && last.source == source &&
+        last.raw_x == raw_x && last.raw_y == raw_y &&
+        last.resolved_x == resolved_x && last.resolved_y == resolved_y &&
+        last.shape == shape && last.size == size && last.width == width &&
+        last.height == height && last.culled == culled && last.reason &&
+        std::strcmp(last.reason, reason) == 0;
+    if (unchanged) return;
+    last = {true, slot, source, raw_x, raw_y, resolved_x, resolved_y, shape,
+            size, width, height, culled, reason};
+    if (g_golden_sun_experimental_cull_logs >=
+            kGoldenSunExperimentalCullLogLimit) {
+        ++g_golden_sun_experimental_cull_logs_dropped;
+        return;
+    }
+    ++g_golden_sun_experimental_cull_logs;
+    std::fprintf(stderr,
+                 "[wide-obj-experimental-cull] frame=%llu slot=%d "
+                 "source=0x%08x raw=(%u,%u) resolved=(%d,%d) "
+                 "shape=%u size=%u pixels=%dx%d decision=%s reason=%s\n",
+                 static_cast<unsigned long long>(runtime_current_frame()),
+                 slot, source, raw_x, raw_y, resolved_x, resolved_y, shape,
+                 size, width, height, culled ? "culled" : "kept", reason);
+}
+
+void golden_sun_obj_f0_entry_capture(std::uint32_t entry_pc) {
+    // EC is the exact generated entry immediately before the LDM that
+    // destroys R6. The relocation-aware resolver authenticates its image and
+    // base before capture; rendering and guest state are never modified.
+    if (!golden_sun_func1dc8_writer_pc(
+            entry_pc, gsr::Func1dc8WriterRoute::EC) ||
+        (!golden_sun_wide_diagnostics_enabled() &&
+         !golden_sun_experimental_fixes_enabled()) ||
+        !golden_sun_expanded_obj_view_active()) return;
+    const std::uint64_t frame = runtime_current_frame();
+    const std::uint32_t depth = runtime_call_stack_depth();
+    const std::uint32_t return_pc = golden_sun_obj_call_return_pc(depth);
+    const std::uint32_t staging = g_cpu.R[6];
+    link_golden_sun_b328_parentless_ec(
+        frame, staging, depth, return_pc, entry_pc);
+    if (golden_sun_experimental_fixes_enabled()) {
+        std::uint16_t attr0 = 0, attr1 = 0, attr2 = 0;
+        std::uint32_t record_base = 0;
+        bool shadow = false;
+        if (read_golden_sun_obj_staging_attrs(staging, &attr0, &attr1,
+                                              &attr2) &&
+            golden_sun_experimental_record_identity(
+                staging, &record_base, &shadow)) {
+            remember_golden_sun_obj_f0_context(
+                frame, depth, return_pc, staging, record_base, shadow, attr0,
+                attr1, attr2);
+        }
+    }
+    // WIDE-01 body/shadow identity: EC fires unconditionally on every
+    // active object, every frame (unlike D4, which only fires on a
+    // successful, gated commit), and the ATTR-shaped bytes at this seam
+    // are still mid-update from other per-frame writers -- logging every
+    // EC entry flooded the cap and stalled scene transitions in an earlier
+    // pass of this diagnostic (see the dated note below). Admission is two
+    // narrow, bounded cases, not a general trace: (a) the small/fixed
+    // shadow-candidate signature (tile=0, shape=1, size=0) identified in
+    // WIDE-01_NPC_IDENTITY.md, and (b) a handful of record slots (index
+    // < kGoldenSunObjCommitOrderBodySlotLimit, computed directly from
+    // `staging` -- this is a body event, so `staging` is the record base
+    // with no +0x0C offset) -- added to capture independent body-sprite
+    // ground truth for the scroll-transform check in
+    // WIDE-01_NPC_IDENTITY.md, since D4's own attrs are read from the same
+    // record and cannot serve as ground truth for that question. Anything
+    // outside those two cases is silently skipped (not deduped -- never
+    // recorded at all), keeping volume bounded regardless of how often EC
+    // itself fires. Slot is unresolved at this seam (only known later, at
+    // F0), so this reports slot=-1, truthfully. Signed logical X/Y is
+    // likewise not available without threading through the D4 route's
+    // staging-provenance lookup; left invalid rather than approximated.
+    {
+        std::uint16_t ec_attr0 = 0, ec_attr1 = 0, ec_attr2 = 0;
+        if (read_golden_sun_obj_staging_attrs(staging, &ec_attr0, &ec_attr1,
+                                              &ec_attr2)) {
+            const std::uint16_t ec_tile = ec_attr2 & 0x3FFu;
+            const std::uint16_t ec_shape =
+                static_cast<std::uint16_t>((ec_attr0 >> 14) & 0x3u);
+            const std::uint16_t ec_size =
+                static_cast<std::uint16_t>((ec_attr1 >> 14) & 0x3u);
+            const bool ec_is_shadow_signature =
+                ec_tile == 0u && ec_shape == 1u && ec_size == 0u;
+            constexpr std::uint32_t kBodyRecordBase = 0x03002000u;
+            constexpr std::uint32_t kBodyRecordStride = 0x38u;
+            constexpr std::uint32_t kGoldenSunObjCommitOrderBodySlotLimit = 6u;
+            const bool ec_is_sampled_body_slot =
+                staging >= kBodyRecordBase &&
+                ((staging - kBodyRecordBase) % kBodyRecordStride) == 0u &&
+                ((staging - kBodyRecordBase) / kBodyRecordStride) <
+                    kGoldenSunObjCommitOrderBodySlotLimit;
+            if (ec_is_shadow_signature || ec_is_sampled_body_slot) {
+                note_golden_sun_obj_commit_order(
+                    GoldenSunObjCommitOrderRoute::EC, staging, -1, ec_attr0,
+                    ec_attr1, ec_attr2, false, 0, false, 0);
+            }
+        }
+    }
+    auto& stats = g_golden_sun_obj_b328_diagnostics;
+    for (auto& candidate : stats.candidates) {
+        if (!candidate.valid || candidate.auth_epoch !=
+            g_golden_sun_field_auth_epoch || candidate.f0_entry_seen ||
+            candidate.f0_outcome != GoldenSunObjB328WriterOutcome::Pending ||
+            candidate.staging_address != staging) continue;
+        candidate.f0_entry_seen = true;
+        candidate.f0_entry_frame = frame;
+        candidate.f0_entry_depth = depth;
+        candidate.f0_entry_return_pc = return_pc;
+        candidate.f0_entry_staging = staging;
+    }
+    for (auto& candidate : stats.rejected) {
+        if (!candidate.valid || candidate.auth_epoch !=
+            g_golden_sun_field_auth_epoch) continue;
+        auto& result = candidate.routes[static_cast<std::size_t>(
+            GoldenSunObjB328WriterRoute::F0)];
+        if (result.outcome != GoldenSunObjB328WriterOutcome::Pending ||
+            result.f0_entry_seen || candidate.staging_address != staging)
+            continue;
+        result.f0_entry_seen = true;
+        result.f0_entry_frame = frame;
+        result.f0_entry_depth = depth;
+        result.f0_entry_return_pc = return_pc;
+        result.f0_entry_staging = staging;
+    }
+}
+
+void golden_sun_oam_shadow_write_observer(std::uint32_t writer_pc,
+                                          std::uint32_t address,
+                                          std::uint32_t size) {
+    // F0's register identity is captured at the authenticated EC entry,
+    // before its LDM overwrites R6. The write observer only supplies committed
+    // slot/ATTR identity; correlation is completed against that snapshot.
+    // This function is also the WIDE-01 experimental off-screen cull safety
+    // net's hook point (see below), so it must run when either diagnostics
+    // or the "Experimental Fixes" toggle is on -- not diagnostics alone. All
+    // diagnostics-only work inside self-gates on
+    // golden_sun_wide_diagnostics_enabled() independently.
+    if ((!golden_sun_wide_diagnostics_enabled() &&
+         !golden_sun_experimental_fixes_enabled()) ||
+        !golden_sun_expanded_obj_view_active() ||
+        !golden_sun_func1dc8_writer_pc(
+            writer_pc, gsr::Func1dc8WriterRoute::F0) || size == 0u) return;
+    if (address < gsr::widescreen::kGoldenSunOamShadowStart ||
+        address >= gsr::widescreen::kGoldenSunOamShadowEnd ||
+        ((address - gsr::widescreen::kGoldenSunOamShadowStart) %
+            gsr::widescreen::kGoldenSunOamShadowSlotBytes) != 4u)
+        return;
+    const std::uint32_t offset = address -
+        gsr::widescreen::kGoldenSunOamShadowStart;
+    const int slot = static_cast<int>(offset /
+        gsr::widescreen::kGoldenSunOamShadowSlotBytes);
+    const std::uint32_t slot_address =
+        gsr::widescreen::kGoldenSunOamShadowStart +
+        static_cast<std::uint32_t>(slot) *
+            gsr::widescreen::kGoldenSunOamShadowSlotBytes;
+    // WIDE-01 experimental off-screen cull safety net (launcher's
+    // "Experimental Fixes" toggle only -- normal play, including plain
+    // widescreen diagnostics with the toggle off, is byte-for-byte
+    // unaffected). Applies to every committed OAM entry this observer sees,
+    // body and shadow alike, using the exact same rule and the exact same
+    // generous-but-wrap-safe margin either way -- there is no separate
+    // "is this a shadow" branch here, which is what keeps a body and its
+    // shadow from ever being culled as separate decisions: both are always
+    // committed via this same F0 route, so both always get evaluated by the
+    // identical predicate, and in practice never disagree because a shadow
+    // never sits far enough from its body to cross the margin alone. See
+    // docs/issues/WIDE-01_NPC_IDENTITY.md ("The off-screen rule") for the
+    // evidence this is built on: the just-read ATTR0/ATTR1 are already the
+    // on-screen coordinate (ground-truth confirmed, no scroll subtraction),
+    // so this reads directly from the bytes already fetched below rather
+    // than re-deriving anything from the 0x03002000 record -- it never
+    // touches that range, so the scene-load code-residency window documented
+    // in WIDE-01_ENTITY_PRODUCER_FINDINGS.md cannot affect it.
+    const auto writer_frame = runtime_current_frame();
+    const auto writer_depth = runtime_call_stack_depth();
+    const auto writer_return_pc = golden_sun_obj_call_return_pc(writer_depth);
+    const std::uint16_t committed_attr0 = bus_read_u16(slot_address);
+    const std::uint16_t committed_attr1 = bus_read_u16(slot_address + 2u);
+    const std::uint16_t committed_attr2 = bus_read_u16(slot_address + 4u);
+    if (golden_sun_wide_diagnostics_enabled()) {
+        // Capture the committed ATTR payload before the optional experimental
+        // culler can mark it hidden; diagnostics must describe the guest
+        // write, not our later presentation-only change.
+        link_golden_sun_b328_parentless_f0(
+            writer_frame, writer_depth, writer_return_pc, writer_pc,
+            slot_address, slot, bus_read_u16(slot_address),
+            bus_read_u16(slot_address + 2u),
+            bus_read_u16(slot_address + 4u));
+    }
+    if (golden_sun_experimental_fixes_enabled()) {
+        const std::uint16_t cull_attr0 = committed_attr0;
+        const std::uint16_t cull_attr1 = committed_attr1;
+        const std::uint16_t cull_attr2 = committed_attr2;
+        // Already disabled (or an empty/dormant entry) -- nothing to do.
+        // Matches the existing dormant-entry recognition in
+        // record_golden_sun_obj_y_transition above.
+        const bool cull_affine = (cull_attr0 & 0x0100u) != 0u;
+        const bool cull_already_disabled =
+            !cull_affine && (cull_attr0 & 0x0200u) != 0u;
+        if (!cull_already_disabled &&
+            !(cull_attr0 == 0u && cull_attr1 == 0u && cull_attr2 == 0u)) {
+            const unsigned cull_shape =
+                static_cast<unsigned>((cull_attr0 >> 14) & 0x3u);
+            const unsigned cull_size =
+                static_cast<unsigned>((cull_attr1 >> 14) & 0x3u);
+            int width = 0, height = 0;
+            const std::uint32_t raw_x = cull_attr1 & 0x1FFu;
+            const std::uint32_t raw_y = cull_attr0 & 0xFFu;
+            int resolved_x = 0, resolved_y = 0;
+            std::uint32_t source = 0;
+            bool should_cull = false;
+            const char* reason = "source-unavailable";
+            const bool dimensions_valid =
+                gsr::widescreen::golden_sun_obj_dimensions(
+                    cull_shape, cull_size, &width, &height);
+            const auto* context = find_golden_sun_obj_f0_context(
+                writer_frame, writer_depth, writer_return_pc, cull_attr0,
+                cull_attr1, cull_attr2);
+            if (!dimensions_valid) {
+                reason = "invalid-shape-size";
+            } else if (cull_affine) {
+                // Affine and double-size sprites need transformed bounds;
+                // leaving them visible is safer than estimating them.
+                reason = "affine-or-double-size";
+            } else {
+                bool source_is_shadow = false;
+                if (!context ||
+                    !golden_sun_experimental_record_identity(
+                        context->staging, &source, &source_is_shadow)) {
+                reason = "source-unavailable";
+                } else {
+                const std::uint32_t body_source = source;
+                auto* staging = find_golden_sun_obj_staging(body_source);
+                std::uint16_t body_attr0 = 0, body_attr1 = 0, body_attr2 = 0;
+                const bool body_attrs_valid = read_golden_sun_obj_staging_attrs(
+                    body_source, &body_attr0, &body_attr1, &body_attr2);
+                const bool body_dimensions_valid = body_attrs_valid &&
+                    gsr::widescreen::golden_sun_obj_dimensions(
+                        (body_attr0 >> 14) & 0x3u, (body_attr1 >> 14) & 0x3u,
+                        &width, &height);
+                const bool body_provenance_valid = staging && staging->valid &&
+                    staging->x_valid && staging->y_valid &&
+                    staging->auth_epoch == g_golden_sun_field_auth_epoch &&
+                    staging->frame == writer_frame && !((body_attr0 & 0x0100u) != 0u);
+                int checked_x = 0, checked_y = 0;
+                const bool body_raw_matches = body_provenance_valid &&
+                    gsr::widescreen::golden_sun_experimental_resolve_oam_x(
+                        body_attr1 & 0x1FFu, true, staging->logical_x,
+                        &checked_x) &&
+                    gsr::widescreen::golden_sun_experimental_resolve_oam_y(
+                        body_attr0 & 0xFFu, true, staging->logical_y,
+                        &checked_y);
+                const bool body_identity_matches = body_provenance_valid &&
+                    (source_is_shadow ||
+                     (body_attr0 == cull_attr0 && body_attr1 == cull_attr1 &&
+                      body_attr2 == cull_attr2));
+                if (!body_attrs_valid || !body_dimensions_valid ||
+                    !body_provenance_valid || !body_raw_matches ||
+                    !body_identity_matches) {
+                    reason = "placement-unavailable";
+                } else {
+                    resolved_x = staging->logical_x;
+                    resolved_y = staging->logical_y;
+                    should_cull =
+                        gsr::widescreen::golden_sun_experimental_sprite_fully_offscreen_top_left(
+                            resolved_x, resolved_y, width, height,
+                            g_golden_sun_wide_extra_left,
+                            g_golden_sun_wide_extra_right,
+                            g_golden_sun_wide_extra_top,
+                            g_golden_sun_wide_extra_bottom);
+                    reason = source_is_shadow ? "paired-body-placement"
+                                              : "exact-placement";
+                }
+                }
+            }
+            trace_golden_sun_experimental_cull(
+                slot, source, raw_x, raw_y, resolved_x, resolved_y, cull_shape,
+                cull_size, width, height, should_cull, reason);
+            if (should_cull) {
+                const std::uint16_t hidden_attr0 = static_cast<std::uint16_t>(
+                    cull_attr0 | static_cast<std::uint16_t>(0x0200u));
+                g_golden_sun_experimental_cull_write_in_progress = true;
+                bus_write_u16(slot_address, hidden_attr0);
+                g_golden_sun_experimental_cull_write_in_progress = false;
+            }
+        }
+    }
+    record_golden_sun_b328_accepted_f0_writer(
+        slot_address, slot, bus_read_u16(slot_address),
+        bus_read_u16(slot_address + 2u),
+        bus_read_u16(slot_address + 4u), writer_frame, writer_depth,
+        writer_return_pc);
+    record_golden_sun_b328_rejected_writer(
+        GoldenSunObjB328WriterRoute::F0, 0u, slot,
+        bus_read_u16(slot_address), bus_read_u16(slot_address + 2u),
+        bus_read_u16(slot_address + 4u), writer_frame, writer_depth,
+        writer_return_pc, 0u);
+    // WIDE-01 body/shadow identity: F0 fires on every committed OAM-shadow
+    // write for every active object, and ATTR0/ATTR1 carry the live raw
+    // Y/X, so an unfiltered trace changes almost every frame for every
+    // moving object -- logging it unconditionally flooded the cap and
+    // stalled scene transitions in an earlier pass of this diagnostic.
+    // D4 already gives a complete, low-volume trace of body writes with
+    // sequence numbers in the same shared per-frame counter, so this route
+    // is restricted to two narrow, bounded cases: (a) the small/fixed
+    // shadow-candidate signature (tile=0, shape=1, size=0) identified in
+    // WIDE-01_NPC_IDENTITY.md, and (b) a handful of destination OAM slots
+    // (index < kGoldenSunObjCommitOrderBodySlotLimit) -- added to capture
+    // independent, ground-truth body-sprite ATTR for the scroll-transform
+    // check in WIDE-01_NPC_IDENTITY.md, since D4's own attrs are read from
+    // the record itself and cannot serve as ground truth for that
+    // question. This destination-slot carve-out does not use the same
+    // numbering as the EC route's record-slot carve-out (OAM destination
+    // slots are reused/reassigned independently of record slots, per the
+    // existing findings), so the two do not guarantee a 1:1 pairing on
+    // the same object every time -- only frames where both happen to
+    // admit the same object are usable for that cross-check, and that is
+    // determined empirically in the doc, not assumed here. The originating
+    // source record address is not resolved at this seam (only the EC
+    // entry captured it); reported as source=0, never fabricated. Signed
+    // logical X/Y is likewise not available here (the ATTR bytes are
+    // already hardware-shaped, a different concept from the pre-truncation
+    // logical coordinate the D4 route reports).
+    {
+        const std::uint16_t f0_attr0 = bus_read_u16(slot_address);
+        const std::uint16_t f0_attr1 = bus_read_u16(slot_address + 2u);
+        const std::uint16_t f0_attr2 = bus_read_u16(slot_address + 4u);
+        const std::uint16_t f0_tile = f0_attr2 & 0x3FFu;
+        const std::uint16_t f0_shape =
+            static_cast<std::uint16_t>((f0_attr0 >> 14) & 0x3u);
+        const std::uint16_t f0_size =
+            static_cast<std::uint16_t>((f0_attr1 >> 14) & 0x3u);
+        const bool f0_is_shadow_signature =
+            f0_tile == 0u && f0_shape == 1u && f0_size == 0u;
+        constexpr int kGoldenSunObjCommitOrderBodySlotLimit = 6;
+        const bool f0_is_sampled_body_slot =
+            slot < kGoldenSunObjCommitOrderBodySlotLimit;
+        if (f0_is_shadow_signature || f0_is_sampled_body_slot) {
+            note_golden_sun_obj_commit_order(
+                GoldenSunObjCommitOrderRoute::F0, 0u, slot, f0_attr0,
+                f0_attr1, f0_attr2, false, 0, false, 0);
+        }
+    }
+}
+
+void expire_golden_sun_b328_rejected_candidates() {
+    auto& stats = g_golden_sun_obj_b328_diagnostics;
+    for (auto& candidate : stats.rejected) {
+        if (!candidate.valid) continue;
+        for (std::size_t route = 0; route < candidate.routes.size(); ++route) {
+            auto& result = candidate.routes[route];
+            if (result.outcome != GoldenSunObjB328WriterOutcome::Pending)
+                continue;
+            result.outcome = GoldenSunObjB328WriterOutcome::Expired;
+            ++stats.rejected_outcomes[route][static_cast<std::size_t>(
+                result.outcome)];
+            record_golden_sun_b328_rejected_sample(
+                candidate, static_cast<GoldenSunObjB328WriterRoute>(route),
+                result);
+        }
+        candidate.valid = false;
+    }
+    for (auto& candidate : stats.candidates) {
+        if (!candidate.valid) continue;
+        if (candidate.f0_outcome == GoldenSunObjB328WriterOutcome::Pending) {
+            candidate.f0_outcome = GoldenSunObjB328WriterOutcome::Expired;
+            ++stats.accepted_f0_outcomes[static_cast<std::size_t>(
+                candidate.f0_outcome)];
+            record_golden_sun_b328_accepted_f0_sample(candidate);
+        }
+        candidate.valid = false;
+    }
+}
+
+void record_golden_sun_b328_handoff(std::uint32_t staging_address,
+                                    std::uint64_t frame,
+                                    bool attr_identity_valid) {
+    if (!golden_sun_wide_diagnostics_enabled() ||
+        !golden_sun_expanded_obj_view_active() || !attr_identity_valid) return;
+    auto& stats = g_golden_sun_obj_b328_diagnostics;
+    for (auto it = stats.candidates.rbegin(); it != stats.candidates.rend();
+         ++it) {
+        if (!it->valid || it->handoff_seen ||
+            it->staging_address != staging_address || it->frame != frame ||
+            it->auth_epoch != g_golden_sun_field_auth_epoch) continue;
+        it->handoff_seen = true;
+        ++stats.handoffs[static_cast<std::size_t>(it->classification)];
+        return;
+    }
+}
+
+void report_golden_sun_b328_parentless_tokens(std::uint64_t frame,
+                                              const char* reason) {
+    if (!golden_sun_wide_diagnostics_enabled() || !reason) return;
+    for (const auto& token : g_golden_sun_obj_b328_parentless_tokens) {
+        if (!token.valid) continue;
+        std::fprintf(
+            stderr,
+            "[wide-obj-y-parentless-token] frame=%llu auth_epoch=%llu "
+            "reason=%s sequence=%llu b328_entry_pc=0x%08x "
+            "staging=0x%08x operand=%d r6=0x%08x r7=0x%08x depth=%u "
+            "return_pc=0x%08x attr_valid=%u attr0=0x%04x attr1=0x%04x "
+            "attr2=0x%04x ec_seen=%u ec_entry_pc=0x%08x ec_r6=0x%08x "
+            "ec_r7=0x%08x ec_source=0x%08x ec_reason=%s f0_seen=%u "
+            "f0_entry_pc=0x%08x f0_r6=0x%08x f0_r7=0x%08x "
+            "f0_source=0x%08x target=0x%08x slot=%d f0_attr0=0x%04x "
+            "f0_attr1=0x%04x f0_attr2=0x%04x raw_y=%u f0_reason=%s\n",
+            static_cast<unsigned long long>(frame),
+            static_cast<unsigned long long>(token.auth_epoch), reason,
+            static_cast<unsigned long long>(token.sequence), token.entry_pc,
+            token.staging, token.operand, token.r6, token.r7,
+            token.call_depth, token.return_pc, token.attr_valid ? 1u : 0u,
+            static_cast<unsigned>(token.attr0),
+            static_cast<unsigned>(token.attr1),
+            static_cast<unsigned>(token.attr2), token.ec_seen ? 1u : 0u,
+            token.ec_entry_pc, token.ec_r6, token.ec_r7, token.ec_source,
+            token.ec_reason, token.f0_seen ? 1u : 0u, token.f0_entry_pc,
+            token.f0_r6, token.f0_r7, token.f0_source, token.f0_target,
+            token.f0_slot, static_cast<unsigned>(token.f0_attr0),
+            static_cast<unsigned>(token.f0_attr1),
+            static_cast<unsigned>(token.f0_attr2),
+            static_cast<unsigned>(token.f0_attr0 & 0xFFu), token.f0_reason);
+    }
+    std::fprintf(stderr,
+                 "[wide-obj-y-parentless-token-summary] frame=%llu "
+                 "auth_epoch=%llu reason=%s dropped=%llu\n",
+                 static_cast<unsigned long long>(frame),
+                 static_cast<unsigned long long>(g_golden_sun_field_auth_epoch),
+                 reason,
+                 static_cast<unsigned long long>(
+                     g_golden_sun_obj_b328_parentless_dropped));
+}
+
+void report_golden_sun_obj_b328_diagnostics(std::uint64_t frame,
+                                            const char* reason) {
+    if (!golden_sun_wide_diagnostics_enabled()) return;
+    auto& stats = g_golden_sun_obj_b328_diagnostics;
+    report_golden_sun_b328_parentless_tokens(frame, reason);
+    expire_golden_sun_b328_rejected_candidates();
+    for (auto& candidate : stats.candidates) {
+        if (!candidate.valid) continue;
+        if (!candidate.handoff_seen) {
+            ++stats.no_handoff[static_cast<std::size_t>(
+                candidate.classification)];
+        }
+        candidate.valid = false;
+    }
+    std::fprintf(stderr,
+                 "[wide-obj-y-b328-summary] frame=%llu auth_epoch=%llu "
+                 "reason=%s candidates=%llu exact=%llu mismatch=%llu "
+                 "no_parent=%llu mismatch_frame=%llu mismatch_depth=%llu "
+                 "mismatch_return=%llu accepted_exact=%llu accepted_mismatch=%llu "
+                 "accepted_no_parent=%llu handoff_exact=%llu "
+                 "handoff_mismatch=%llu handoff_no_parent=%llu "
+                 "no_handoff_exact=%llu no_handoff_mismatch=%llu "
+                 "no_handoff_no_parent=%llu tracking_dropped=%llu "
+                 "samples=%zu samples_dropped=%llu\n",
+                 static_cast<unsigned long long>(frame),
+                 static_cast<unsigned long long>(g_golden_sun_field_auth_epoch),
+                 reason,
+                 static_cast<unsigned long long>(stats.classifications[0] +
+                                                 stats.classifications[1] +
+                                                 stats.classifications[2]),
+                 static_cast<unsigned long long>(stats.classifications[0]),
+                 static_cast<unsigned long long>(stats.classifications[1]),
+                 static_cast<unsigned long long>(stats.classifications[2]),
+                 static_cast<unsigned long long>(stats.mismatch_frame),
+                 static_cast<unsigned long long>(stats.mismatch_call_depth),
+                 static_cast<unsigned long long>(stats.mismatch_return_pc),
+                 static_cast<unsigned long long>(stats.accepted[0]),
+                 static_cast<unsigned long long>(stats.accepted[1]),
+                 static_cast<unsigned long long>(stats.accepted[2]),
+                 static_cast<unsigned long long>(stats.handoffs[0]),
+                 static_cast<unsigned long long>(stats.handoffs[1]),
+                 static_cast<unsigned long long>(stats.handoffs[2]),
+                 static_cast<unsigned long long>(stats.no_handoff[0]),
+                 static_cast<unsigned long long>(stats.no_handoff[1]),
+                 static_cast<unsigned long long>(stats.no_handoff[2]),
+                 static_cast<unsigned long long>(stats.accepted_tracking_dropped),
+                 stats.sample_count,
+                 static_cast<unsigned long long>(stats.samples_dropped));
+    std::fprintf(
+        stderr,
+        "[wide-obj-y-b328-writer-summary] frame=%llu auth_epoch=%llu "
+        "rejected=%llu d4_consumed=%llu d4_unrelated=%llu "
+        "d4_expired=%llu f0_consumed=%llu f0_unrelated=%llu "
+        "f0_identity_unproven=%llu f0_expired=%llu "
+        "f0_context_mismatch=%llu f0_attr_mismatch=%llu tracking_dropped=%llu "
+        "samples=%zu samples_dropped=%llu\n",
+        static_cast<unsigned long long>(frame),
+        static_cast<unsigned long long>(g_golden_sun_field_auth_epoch),
+        static_cast<unsigned long long>(stats.rejected_total),
+        static_cast<unsigned long long>(stats.rejected_outcomes[0][1]),
+        static_cast<unsigned long long>(stats.rejected_outcomes[0][2]),
+        static_cast<unsigned long long>(stats.rejected_outcomes[0][4]),
+        static_cast<unsigned long long>(stats.rejected_outcomes[1][1]),
+        static_cast<unsigned long long>(stats.rejected_outcomes[1][2]),
+        static_cast<unsigned long long>(stats.rejected_outcomes[1][3]),
+        static_cast<unsigned long long>(stats.rejected_outcomes[1][4]),
+        static_cast<unsigned long long>(stats.rejected_outcomes[1][5]),
+        static_cast<unsigned long long>(stats.rejected_outcomes[1][6]),
+        static_cast<unsigned long long>(stats.rejected_tracking_dropped),
+        stats.rejected_sample_count,
+        static_cast<unsigned long long>(stats.rejected_samples_dropped));
+    for (std::size_t i = 0; i < stats.rejected_sample_count; ++i) {
+        const auto& sample = stats.rejected_samples[i];
+        std::fprintf(
+            stderr,
+            "[wide-obj-y-b328-writer-sample] frame=%llu writer_frame=%llu "
+            "auth_epoch=%llu route=%s outcome=%s classification=%s "
+            "mismatch_flags=0x%x "
+            "staging=0x%08x writer_staging=0x%08x operand=%d "
+            "depth=%u return_pc=0x%08x writer_depth=%u "
+            "writer_return_pc=0x%08x slot=%d attr0=0x%04x attr1=0x%04x "
+            "attr2=0x%04x f0_register_mask=0x%04x "
+            "f0_entry_seen=%u f0_entry_frame=%llu f0_entry_depth=%u "
+            "f0_entry_return_pc=0x%08x f0_entry_staging=0x%08x "
+            "expected_attr0=0x%04x expected_attr1=0x%04x expected_attr2=0x%04x\n",
+            static_cast<unsigned long long>(sample.frame),
+            static_cast<unsigned long long>(sample.writer_frame),
+            static_cast<unsigned long long>(sample.auth_epoch),
+            golden_sun_obj_b328_writer_route_name(sample.route),
+            golden_sun_obj_b328_writer_outcome_name(sample.outcome),
+            golden_sun_obj_b328_parent_classification_name(
+                sample.classification), sample.mismatch_flags,
+            sample.staging_address,
+            sample.writer_staging, sample.operand, sample.call_depth,
+            sample.call_return_pc, sample.writer_depth,
+            sample.writer_return_pc, sample.slot,
+            static_cast<unsigned>(sample.attr0),
+            static_cast<unsigned>(sample.attr1),
+            static_cast<unsigned>(sample.attr2),
+            static_cast<unsigned>(sample.f0_register_mask),
+            sample.f0_entry_seen ? 1u : 0u,
+            static_cast<unsigned long long>(sample.f0_entry_frame),
+            sample.f0_entry_depth, sample.f0_entry_return_pc,
+            sample.f0_entry_staging,
+            static_cast<unsigned>(sample.expected_attr0),
+            static_cast<unsigned>(sample.expected_attr1),
+            static_cast<unsigned>(sample.expected_attr2));
+    }
+    std::fprintf(
+        stderr,
+        "[wide-obj-y-b328-accepted-f0-summary] frame=%llu "
+        "auth_epoch=%llu accepted=%llu consumed=%llu unrelated=%llu "
+        "expired=%llu context_mismatch=%llu attr_mismatch=%llu "
+        "tracking_dropped=%llu samples=%zu samples_dropped=%llu\n",
+        static_cast<unsigned long long>(frame),
+        static_cast<unsigned long long>(g_golden_sun_field_auth_epoch),
+        static_cast<unsigned long long>(stats.accepted_f0_outcomes[1] +
+                                         stats.accepted_f0_outcomes[2] +
+                                         stats.accepted_f0_outcomes[4] +
+                                         stats.accepted_f0_outcomes[5] +
+                                         stats.accepted_f0_outcomes[6]),
+        static_cast<unsigned long long>(stats.accepted_f0_outcomes[1]),
+        static_cast<unsigned long long>(stats.accepted_f0_outcomes[2]),
+        static_cast<unsigned long long>(stats.accepted_f0_outcomes[4]),
+        static_cast<unsigned long long>(stats.accepted_f0_outcomes[5]),
+        static_cast<unsigned long long>(stats.accepted_f0_outcomes[6]),
+        static_cast<unsigned long long>(stats.accepted_f0_tracking_dropped),
+        stats.accepted_f0_sample_count,
+        static_cast<unsigned long long>(stats.accepted_f0_samples_dropped));
+    for (std::size_t i = 0; i < stats.accepted_f0_sample_count; ++i) {
+        const auto& sample = stats.accepted_f0_samples[i];
+        std::fprintf(
+            stderr,
+            "[wide-obj-y-b328-accepted-f0-sample] frame=%llu "
+            "writer_frame=%llu auth_epoch=%llu outcome=%s "
+            "classification=%s staging=0x%08x operand=%d "
+            "depth=%u return_pc=0x%08x writer_depth=%u "
+            "writer_return_pc=0x%08x target=0x%08x slot=%d "
+            "attr0=0x%04x attr1=0x%04x "
+            "attr2=0x%04x f0_register_mask=0x%04x f0_entry_seen=%u "
+            "f0_entry_frame=%llu f0_entry_depth=%u "
+            "f0_entry_return_pc=0x%08x f0_entry_staging=0x%08x "
+            "expected_attr0=0x%04x expected_attr1=0x%04x "
+            "expected_attr2=0x%04x\n",
+            static_cast<unsigned long long>(sample.frame),
+            static_cast<unsigned long long>(sample.writer_frame),
+            static_cast<unsigned long long>(sample.auth_epoch),
+            golden_sun_obj_b328_writer_outcome_name(sample.outcome),
+            golden_sun_obj_b328_parent_classification_name(
+            sample.classification), sample.staging_address, sample.operand,
+            sample.call_depth, sample.call_return_pc, sample.writer_depth,
+            sample.writer_return_pc, sample.target_address, sample.slot,
+            static_cast<unsigned>(sample.attr0),
+            static_cast<unsigned>(sample.attr1),
+            static_cast<unsigned>(sample.attr2), sample.f0_register_mask,
+            sample.f0_entry_seen ? 1u : 0u,
+            static_cast<unsigned long long>(sample.f0_entry_frame),
+            sample.f0_entry_depth, sample.f0_entry_return_pc,
+            sample.f0_entry_staging,
+            static_cast<unsigned>(sample.expected_attr0),
+            static_cast<unsigned>(sample.expected_attr1),
+            static_cast<unsigned>(sample.expected_attr2));
+    }
+    static constexpr const char* kMismatchNames[] = {
+        "frame", "call-depth", "return-pc"};
+    for (std::size_t i = 0; i < stats.sample_count; ++i) {
+        const auto& sample = stats.samples[i];
+        std::fprintf(stderr,
+                     "[wide-obj-y-b328-sample] frame=%llu auth_epoch=%llu "
+                     "classification=%s staging=0x%08x operand=%d "
+                     "mismatch=",
+                     static_cast<unsigned long long>(sample.frame),
+                     static_cast<unsigned long long>(g_golden_sun_field_auth_epoch),
+                     golden_sun_obj_b328_parent_classification_name(
+                         sample.classification), sample.staging_address,
+                     sample.operand);
+        bool first = true;
+        for (unsigned bit = 0; bit < 3u; ++bit) {
+            if ((sample.mismatch_flags & (1u << bit)) == 0u) continue;
+            std::fprintf(stderr, "%s%s", first ? "" : ",",
+                         kMismatchNames[bit]);
+            first = false;
+        }
+        if (first) std::fputs("none", stderr);
+        std::fprintf(stderr,
+                     " parent_frame=%llu parent_depth=%u parent_return_pc=0x%08x\n",
+                     static_cast<unsigned long long>(sample.parent_frame),
+                     sample.parent_call_depth, sample.parent_return_pc);
+    }
+}
+
+bool read_golden_sun_obj_stack_word(std::uint32_t sp, std::uint32_t offset,
+                                    std::uint32_t* out) {
+    constexpr std::uint32_t kIwramStart = 0x03000000u;
+    constexpr std::uint32_t kIwramEnd = 0x03008000u;
+    if (!out || (sp & 3u) != 0u || (offset != 4u && offset != 0x18u) ||
+        sp < kIwramStart || sp > kIwramEnd - 4u - offset) return false;
+    *out = bus_read_u32(sp + offset);
+    return true;
+}
+
+void record_golden_sun_signed_y_cull(std::uint32_t pc,
+                                     std::int32_t operand) {
+    if (!golden_sun_expanded_obj_view_active() ||
+        (pc != 0x0800B3E6u && pc != 0x0800B3ECu &&
+         pc != 0x0800C702u && pc != 0x0800C708u)) return;
+    GoldenSunObjSignedCullObservation observation{};
+    observation.valid = true;
+    observation.frame = runtime_current_frame();
+    observation.pc = pc;
+    observation.operand = operand;
+    observation.r7 = g_cpu.R[7];
+    observation.r10 = g_cpu.R[10];
+    observation.r11 = g_cpu.R[11];
+    observation.sp = g_cpu.R[13];
+    observation.lr = g_cpu.R[14];
+    observation.call_depth = runtime_call_stack_depth();
+    observation.call_return_pc = golden_sun_obj_call_return_pc(
+        observation.call_depth);
+    observation.sequence = ++g_golden_sun_obj_signed_cull_sequence;
+    g_golden_sun_obj_signed_cull_observations[
+        pc == 0x0800B3E6u ? 0u : pc == 0x0800B3ECu ? 1u
+        : pc == 0x0800C702u ? 2u : 3u] = observation;
+}
+
+GoldenSunObjYCorrelation capture_golden_sun_obj_y_correlation(
+    std::int32_t operand) {
+    GoldenSunObjYCorrelation result{};
+    if (!golden_sun_expanded_obj_view_active() || operand < 160 ||
+        operand > 199) return result;
+    result.valid = true;
+    result.b328_pc = 0x0800B328u;
+    result.b328_operand = operand;
+    result.b328_r1 = g_cpu.R[1];
+    result.b328_r3 = g_cpu.R[3];
+    result.b328_r11 = g_cpu.R[11];
+    result.b328_r6 = g_cpu.R[6];
+    result.b328_r7 = g_cpu.R[7];
+    result.b328_sp = g_cpu.R[13];
+    result.b328_lr = g_cpu.R[14];
+    result.b328_call_depth = runtime_call_stack_depth();
+    result.b328_call_return_pc = golden_sun_obj_call_return_pc(
+        result.b328_call_depth);
+    result.stack_inputs_valid =
+        read_golden_sun_obj_stack_word(g_cpu.R[13], 4u,
+                                       &result.b328_stack_sp_plus4) &&
+        read_golden_sun_obj_stack_word(g_cpu.R[13], 0x18u,
+                                       &result.b328_stack_sp_plus18);
+    for (const auto& parent : g_golden_sun_obj_b27e_parent_routes) {
+        if (parent.valid && parent.staging_address == result.b328_r7 &&
+            parent.frame == runtime_current_frame() &&
+            parent.call_depth == result.b328_call_depth &&
+            parent.call_return_pc == result.b328_call_return_pc) {
+            result.parent = parent;
+            break;
+        }
+    }
+    const std::uint32_t pcs[] = {
+        0x0800B3E6u, 0x0800B3ECu, 0x0800C702u, 0x0800C708u};
+    for (std::size_t i = 0; i < result.preceding.size(); ++i) {
+        const auto& candidate = g_golden_sun_obj_signed_cull_observations[i];
+        if (candidate.valid && candidate.frame == runtime_current_frame() &&
+            candidate.call_depth == result.b328_call_depth &&
+            candidate.call_return_pc == result.b328_call_return_pc &&
+            candidate.sequence <= g_golden_sun_obj_signed_cull_sequence) {
+            result.preceding[i] = candidate;
+        } else {
+            result.preceding[i].pc = pcs[i];
+        }
+    }
+    return result;
+}
+
+void trace_golden_sun_obj_y_cull_decision(
+    std::uint32_t original_decision, std::uint32_t final_decision,
+    bool overridden, std::int32_t operand) {
+    // Only the newly visible bottom band reaches this diagnostic. The
+    // staging address is the transient object identity available before OAM
+    // handoff; the register and call fields make parentless routes explicit
+    // without retaining guest payload bytes.
+    if (!golden_sun_wide_diagnostics_enabled() ||
+        !golden_sun_expanded_obj_view_active() || operand < 160 ||
+        operand > 199) return;
+    const auto correlation = capture_golden_sun_obj_y_correlation(operand);
+    GoldenSunObjYCullDecisionKey key{};
+    key.staging_address = g_cpu.R[7];
+    key.frame = runtime_current_frame();
+    key.operand = operand;
+    key.original_decision = original_decision;
+    key.final_decision = final_decision;
+    key.r1 = g_cpu.R[1];
+    key.r3 = g_cpu.R[3];
+    key.r11 = g_cpu.R[11];
+    for (const auto& seen : g_golden_sun_obj_y_cull_decision_keys) {
+        if (seen.valid && seen.staging_address == key.staging_address &&
+            seen.frame == key.frame && seen.operand == key.operand &&
+            seen.original_decision == key.original_decision &&
+            seen.final_decision == key.final_decision && seen.r1 == key.r1 &&
+            seen.r3 == key.r3 && seen.r11 == key.r11) return;
+    }
+    unsigned staging_records = 0;
+    for (const auto& seen : g_golden_sun_obj_y_cull_decision_keys) {
+        if (seen.valid && seen.staging_address == key.staging_address)
+            ++staging_records;
+    }
+    if (g_golden_sun_obj_y_cull_decision_logs_in_epoch >=
+            kGoldenSunObjYCorrelationLogLimitPerEpoch ||
+        staging_records >= kGoldenSunObjYCullDecisionPerStagingLimit) {
+        ++g_golden_sun_obj_y_cull_decision_logs_dropped;
+        return;
+    }
+    for (auto& seen : g_golden_sun_obj_y_cull_decision_keys) {
+        if (!seen.valid) {
+            seen = key;
+            seen.valid = true;
+            break;
+        }
+    }
+    ++g_golden_sun_obj_y_cull_decision_logs_in_epoch;
+    const auto& parent = correlation.parent;
+    std::fprintf(
+        stderr,
+        "[wide-obj-y-cull-decision] frame=%llu auth_epoch=%llu "
+        "staging=0x%08x operand=%d original=%u final=%u overridden=%u "
+        "r1=0x%08x r3=0x%08x r6=0x%08x r7=0x%08x r10=0x%08x "
+        "r11=0x%08x sp=0x%08x lr=0x%08x depth=%u return_pc=0x%08x "
+        "stack_valid=%u stack_sp4=0x%08x stack_sp18=0x%08x "
+        "parent_valid=%u parent_frame=%llu parent_operand=%d "
+        "parent_original=%u parent_final=%u parent_overridden=%u "
+        "parent_r7=0x%08x dropped=%llu\n",
+        static_cast<unsigned long long>(runtime_current_frame()),
+        static_cast<unsigned long long>(g_golden_sun_field_auth_epoch),
+        key.staging_address, operand, original_decision, final_decision,
+        overridden ? 1u : 0u, g_cpu.R[1], g_cpu.R[3], g_cpu.R[6], g_cpu.R[7],
+        g_cpu.R[10], g_cpu.R[11], g_cpu.R[13], g_cpu.R[14],
+        runtime_call_stack_depth(),
+        golden_sun_obj_call_return_pc(runtime_call_stack_depth()),
+        correlation.stack_inputs_valid ? 1u : 0u,
+        correlation.b328_stack_sp_plus4, correlation.b328_stack_sp_plus18,
+        parent.valid ? 1u : 0u,
+        static_cast<unsigned long long>(parent.frame), parent.operand,
+        parent.original_decision, parent.final_decision,
+        parent.overridden ? 1u : 0u, parent.r7,
+        static_cast<unsigned long long>(
+            g_golden_sun_obj_y_cull_decision_logs_dropped));
+}
+
+void trace_golden_sun_obj_y_correlation(
+    const GoldenSunObjYCorrelation& correlation, std::uint32_t staging_address,
+    int slot, std::uint16_t attr0, std::uint16_t attr1,
+    std::uint16_t attr2) {
+    if (!correlation.valid || !golden_sun_expanded_obj_view_active() || slot < 0 ||
+        static_cast<std::size_t>(slot) >=
+            g_golden_sun_obj_y_correlation_slot_logs.size()) return;
+    GoldenSunObjYCorrelationKey key{};
+    key.staging_address = staging_address;
+    key.slot = slot;
+    key.b328_operand = correlation.b328_operand;
+    key.b328_r1 = correlation.b328_r1;
+    key.b328_r3 = correlation.b328_r3;
+    key.b328_r11 = correlation.b328_r11;
+    key.stack_sp_plus4 = correlation.b328_stack_sp_plus4;
+    key.stack_sp_plus18 = correlation.b328_stack_sp_plus18;
+    key.attr0 = attr0;
+    key.attr1 = attr1;
+    key.attr2 = attr2;
+    for (std::size_t i = 0; i < key.cull_sequences.size(); ++i)
+        key.cull_sequences[i] = correlation.preceding[i].valid
+            ? correlation.preceding[i].sequence : 0u;
+    for (const auto& seen : g_golden_sun_obj_y_correlation_keys) {
+        if (seen.valid && seen.staging_address == key.staging_address &&
+            seen.slot == key.slot &&
+            seen.b328_operand == key.b328_operand && seen.attr0 == key.attr0 &&
+            seen.b328_r1 == key.b328_r1 && seen.b328_r3 == key.b328_r3 &&
+            seen.b328_r11 == key.b328_r11 &&
+            seen.stack_sp_plus4 == key.stack_sp_plus4 &&
+            seen.stack_sp_plus18 == key.stack_sp_plus18 &&
+            seen.attr1 == key.attr1 && seen.attr2 == key.attr2 &&
+            seen.cull_sequences == key.cull_sequences) return;
+    }
+    unsigned staging_records = 0;
+    for (const auto& seen : g_golden_sun_obj_y_correlation_keys) {
+        if (seen.valid && seen.staging_address == staging_address)
+            ++staging_records;
+    }
+    if (g_golden_sun_obj_y_correlation_slot_logs[static_cast<std::size_t>(slot)] >=
+            kGoldenSunObjYCorrelationPerSlotLimit ||
+        staging_records >= kGoldenSunObjYCorrelationPerStagingLimit ||
+        g_golden_sun_obj_y_correlation_logs_in_epoch >=
+            kGoldenSunObjYCorrelationLogLimitPerEpoch) {
+        ++g_golden_sun_obj_y_correlation_logs_dropped;
+        return;
+    }
+    for (auto& seen : g_golden_sun_obj_y_correlation_keys) {
+        if (!seen.valid) {
+            seen = key;
+            seen.valid = true;
+            break;
+        }
+    }
+    ++g_golden_sun_obj_y_correlation_slot_logs[static_cast<std::size_t>(slot)];
+    ++g_golden_sun_obj_y_correlation_logs_in_epoch;
+    std::fprintf(stderr,
+        "[wide-obj-y-cull-correlation] frame=%llu auth_epoch=%llu "
+        "b328_pc=0x%08x b328_operand=%d b328_r1=0x%08x b328_r3=0x%08x "
+        "b328_r11=0x%08x stack_valid=%u stack_sp4=0x%08x stack_sp18=0x%08x "
+        "b328_r6=0x%08x b328_r7=0x%08x "
+        "b328_sp=0x%08x b328_lr=0x%08x depth=%u return_pc=0x%08x "
+        "staging=0x%08x slot=%d attr0=0x%04x attr1=0x%04x attr2=0x%04x "
+        "parent_valid=%u parent_pc=0x%08x parent_operand=%d "
+        "parent_original=%u parent_overridden=%u parent_final=%u "
+        "parent_r7=0x%08x parent_r10=0x%08x parent_r11=0x%08x "
+        "parent_sp=0x%08x parent_lr=0x%08x parent_depth=%u "
+        "parent_return_pc=0x%08x dropped=%llu\n",
+        static_cast<unsigned long long>(runtime_current_frame()),
+        static_cast<unsigned long long>(g_golden_sun_field_auth_epoch),
+        correlation.b328_pc, correlation.b328_operand, correlation.b328_r1,
+        correlation.b328_r3, correlation.b328_r11,
+        correlation.stack_inputs_valid ? 1u : 0u,
+        correlation.b328_stack_sp_plus4, correlation.b328_stack_sp_plus18,
+        correlation.b328_r6, correlation.b328_r7, correlation.b328_sp,
+        correlation.b328_lr,
+        correlation.b328_call_depth, correlation.b328_call_return_pc,
+        staging_address, slot, static_cast<unsigned>(attr0),
+        static_cast<unsigned>(attr1), static_cast<unsigned>(attr2),
+        correlation.parent.valid ? 1u : 0u, correlation.parent.pc,
+        correlation.parent.operand, correlation.parent.original_decision,
+        correlation.parent.overridden ? 1u : 0u,
+        correlation.parent.final_decision, correlation.parent.r7,
+        correlation.parent.r10, correlation.parent.r11, correlation.parent.sp,
+        correlation.parent.lr, correlation.parent.call_depth,
+        correlation.parent.call_return_pc,
+        static_cast<unsigned long long>(g_golden_sun_obj_y_correlation_logs_dropped));
+}
+
+void trace_golden_sun_obj_y_jump(
+    int slot, int raw_y, int logical_y,
+    const GoldenSunObjPlacementProvenance& provenance,
+    std::uint16_t attr0, std::uint16_t attr1, std::uint16_t attr2) {
+    // A large accepted-Y transition is the signature of a recycled slot or
+    // an accidental modulo-256 interpretation. Keep this automatic and
+    // bounded so it remains useful when the broad WIDE probe is disabled.
+    if (!golden_sun_expanded_obj_view_active() || slot < 0 ||
+        static_cast<std::size_t>(slot) >=
+            g_golden_sun_obj_y_accepted_state.size()) return;
+    auto& previous = g_golden_sun_obj_y_accepted_state[
+        static_cast<std::size_t>(slot)];
+    const auto frame = runtime_current_frame();
+    if (previous.valid) {
+        const int delta = logical_y - static_cast<int>(previous.logical_y);
+        const int magnitude = delta < 0 ? -delta : delta;
+        if (magnitude >= 64) {
+            if (g_golden_sun_obj_y_jump_logs_in_epoch >=
+                kGoldenSunObjYJumpLogLimitPerEpoch) {
+                ++g_golden_sun_obj_y_jump_logs_dropped;
+            } else {
+                ++g_golden_sun_obj_y_jump_logs_in_epoch;
+                std::fprintf(
+                    stderr,
+                    "[wide-obj-y-jump] frame=%llu previous_frame=%llu "
+                    "auth_epoch=%llu slot=%d delta=%d "
+                    "previous_raw_y=%u raw_y=%d previous_logical_y=%d "
+                    "logical_y=%d previous_writer_branch_pc=0x%08x "
+                    "writer_branch_pc=0x%08x previous_target_address=0x%08x "
+                    "target_address=0x%08x previous_generation=%llu "
+                    "writer_generation=%llu previous_attr0=0x%04x "
+                    "attr0=0x%04x previous_attr1=0x%04x attr1=0x%04x "
+                    "previous_attr2=0x%04x attr2=0x%04x\n",
+                    static_cast<unsigned long long>(frame),
+                    static_cast<unsigned long long>(previous.frame),
+                    static_cast<unsigned long long>(g_golden_sun_field_auth_epoch),
+                    slot, delta, static_cast<unsigned>(previous.raw_y), raw_y,
+                    static_cast<int>(previous.logical_y), logical_y,
+                    previous.writer_branch_pc, provenance.writer_branch_pc,
+                    previous.target_address, provenance.target_address,
+                    static_cast<unsigned long long>(previous.writer_generation),
+                    static_cast<unsigned long long>(provenance.writer_generation),
+                    static_cast<unsigned>(previous.attr0),
+                    static_cast<unsigned>(attr0),
+                    static_cast<unsigned>(previous.attr1),
+                    static_cast<unsigned>(attr1),
+                    static_cast<unsigned>(previous.attr2),
+                    static_cast<unsigned>(attr2));
+            }
+        }
+    }
+    previous.valid = true;
+    previous.raw_y = static_cast<std::uint8_t>(raw_y);
+    previous.logical_y = static_cast<std::int16_t>(logical_y);
+    previous.frame = frame;
+    previous.writer_branch_pc = provenance.writer_branch_pc;
+    previous.target_address = provenance.target_address;
+    previous.writer_generation = provenance.writer_generation;
+    previous.attr0 = attr0;
+    previous.attr1 = attr1;
+    previous.attr2 = attr2;
+}
+
+void trace_golden_sun_obj_y_alias(
+    const char* reason, int slot, int raw_y, int logical_y,
+    const GoldenSunObjPlacementProvenance& provenance,
+    std::uint16_t attr0, std::uint16_t attr1, std::uint16_t attr2,
+    bool canonical_rejection) {
+    // This is the one bounded diagnostic that must remain visible even when
+    // the broad WIDE-01 probe is off. Keep it tied strictly to the geometry
+    // whose signed-Y path it diagnoses, with no scene/authentication gate.
+    if (!golden_sun_expanded_obj_view_active() || slot < 0 ||
+        static_cast<std::size_t>(slot) >=
+            g_golden_sun_obj_y_alias_last_frame.size() ||
+        (!canonical_rejection &&
+         !gsr::widescreen::golden_sun_obj_y_alias_candidate(
+             raw_y, logical_y))) return;
+    const std::uint64_t frame = runtime_current_frame();
+    auto& last_frame = canonical_rejection
+        ? g_golden_sun_obj_y_canonical_last_frame[static_cast<std::size_t>(slot)]
+        : g_golden_sun_obj_y_alias_last_frame[static_cast<std::size_t>(slot)];
+    if (last_frame == frame) return;
+    last_frame = frame;
+    if (g_golden_sun_obj_y_alias_logs_in_epoch >=
+        kGoldenSunObjYAliasLogLimitPerEpoch) {
+        ++g_golden_sun_obj_y_alias_logs_dropped;
+        return;
+    }
+    ++g_golden_sun_obj_y_alias_logs_in_epoch;
+    std::fprintf(
+        stderr,
+        "[wide-obj-y-alias] frame=%llu provenance_frame=%llu "
+        "auth_epoch=%llu reason=%s slot=%d raw_y=%d logical_y=%d "
+        "writer_branch_pc=0x%08x target_address=0x%08x "
+        "writer_generation=%llu attr0=0x%04x attr1=0x%04x attr2=0x%04x\n",
+        static_cast<unsigned long long>(frame),
+        static_cast<unsigned long long>(provenance.frame),
+        static_cast<unsigned long long>(g_golden_sun_field_auth_epoch), reason,
+        slot, raw_y, logical_y, provenance.writer_branch_pc,
+        provenance.target_address,
+        static_cast<unsigned long long>(provenance.writer_generation),
+        static_cast<unsigned>(attr0), static_cast<unsigned>(attr1),
+        static_cast<unsigned>(attr2));
+}
+
+void trace_golden_sun_obj_y_edge_alias(
+    int slot, std::uint32_t target_address, std::uint64_t frame,
+    std::uint64_t auth_epoch, std::uint16_t attr0, std::uint16_t attr1,
+    std::uint16_t attr2) {
+    ++g_golden_sun_obj_y_edge_alias_activations;
+    if (!golden_sun_wide_diagnostics_enabled()) return;
+    std::fprintf(stderr,
+                 "[wide-obj-y-edge-alias] frame=%llu auth_epoch=%llu "
+                 "slot=%d target=0x%08x raw_y=159 logical_y=-97 "
+                 "attr0=0x%04x attr1=0x%04x attr2=0x%04x activations=%llu\n",
+                 static_cast<unsigned long long>(frame),
+                 static_cast<unsigned long long>(auth_epoch), slot,
+                 target_address, static_cast<unsigned>(attr0),
+                 static_cast<unsigned>(attr1), static_cast<unsigned>(attr2),
+                 static_cast<unsigned long long>(
+                     g_golden_sun_obj_y_edge_alias_activations));
+}
 
 void begin_golden_sun_field_auth_epoch();
 
@@ -236,6 +2790,20 @@ bool golden_sun_wide_diagnostics_enabled() {
     return enabled;
 }
 
+// WIDE-01 experimental off-screen cull safety net. GBARECOMP_EXPERIMENTAL_FIXES
+// is the launcher's "Experimental Fixes" checkbox (src/launcher_main.cpp),
+// always sent explicitly (0 or 1), same discipline as the diagnostics kill
+// switch above. Default off; normal play is byte-for-byte unaffected. See
+// src/widescreen_policy.h (golden_sun_experimental_sprite_fully_offscreen)
+// and docs/issues/WIDE-01_NPC_IDENTITY.md for what this gates.
+bool golden_sun_experimental_fixes_enabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("GBARECOMP_EXPERIMENTAL_FIXES");
+        return env != nullptr && env[0] != '\0' && env[0] != '0';
+    }();
+    return enabled;
+}
+
 struct GoldenSunFieldMapCensus {
     std::uint64_t auth_epoch = 0;
     std::uint32_t map_crc = 0;
@@ -243,8 +2811,28 @@ struct GoldenSunFieldMapCensus {
 };
 std::vector<GoldenSunFieldMapCensus> g_golden_sun_wide_field_map_census;
 std::uint64_t g_golden_sun_wide_field_map_trace_frame = UINT64_MAX;
-std::uint64_t g_golden_sun_field_auth_epoch = 0;
+bool g_golden_sun_palace_table_authorized = false;
+bool g_golden_sun_palace_table_invalidated = false;
+bool g_golden_sun_palace_table_auth_attempted = false;
+gsr::widescreen::GoldenSunPalaceActiveRegion
+    g_golden_sun_palace_active_region;
+std::array<std::uint16_t, 6> g_golden_sun_palace_region_scroll{};
+bool g_golden_sun_palace_region_scroll_valid = false;
+bool g_golden_sun_palace_region_build_attempted = false;
+unsigned g_golden_sun_obj_y_provenance_logs_in_epoch = 0;
 using GoldenSunWidePolicyReason = gsr::widescreen::GoldenSunWidePolicyReason;
+
+void invalidate_golden_sun_palace_table_authorization();
+bool refresh_golden_sun_palace_table_authorization();
+
+void reset_golden_sun_palace_active_region() {
+    if (g_golden_sun_palace_region_scroll_valid ||
+        g_golden_sun_palace_region_build_attempted) {
+        g_golden_sun_palace_active_region.reset();
+    }
+    g_golden_sun_palace_region_scroll_valid = false;
+    g_golden_sun_palace_region_build_attempted = false;
+}
 
 // Payload-free provider accounting separates a missing/invalid atlas source
 // from a successful replacement. The existing map census proves which table
@@ -258,6 +2846,7 @@ struct GoldenSunFieldProviderTrace {
     std::uint64_t unavailable = 0;
     std::uint64_t precondition_rejects = 0;
     std::uint64_t boundary_rejects = 0;
+    std::uint64_t palace_region_rejects = 0;
     std::uint64_t raw_unavailable = 0;
     std::uint64_t lookup_misses = 0;
     std::int32_t min_x = INT32_MAX;
@@ -267,6 +2856,20 @@ struct GoldenSunFieldProviderTrace {
 };
 std::array<GoldenSunFieldProviderTrace, 4>
     g_golden_sun_field_provider_trace{};
+GoldenSunPalaceMarginDiagnostics g_golden_sun_palace_margin_diagnostics{};
+
+struct GoldenSunFieldMapIdAttribution {
+    std::uint16_t map_id = 0;
+    std::uint64_t replacements = 0;
+};
+
+// A bounded top-of-observed set per layer and margin region. This records no
+// map/table payload and avoids a 4x4x4096 hot-path counter matrix.
+std::array<std::array<std::array<GoldenSunFieldMapIdAttribution,
+                                  kGoldenSunFieldMapIdAttributionLimit>, 4>, 4>
+    g_golden_sun_field_map_id_attribution{};
+std::array<std::array<std::uint64_t, 4>, 4>
+    g_golden_sun_field_map_id_attribution_overflow{};
 GoldenSunWidePolicyReason g_golden_sun_wide_policy_last_reason =
     GoldenSunWidePolicyReason::UnsupportedMode;
 bool g_golden_sun_wide_policy_seen = false;
@@ -622,6 +3225,359 @@ void report_golden_sun_field_producers(const char* reason) {
            g_golden_sun_field_raw_producer_overflow);
 }
 
+// WIDE-01 entity-producer census: bounded IWRAM write census for the
+// observed 0x38-stride object staging array at 0x03002000..0x030022E0.
+// Diagnostics-only, deduped by (address, pc, size), capped per epoch, and
+// reset with the same auth-epoch boundaries as the field producer trace
+// above. Produces nothing unless widescreen diagnostics are enabled; never
+// consulted by gameplay/render code.
+constexpr std::uint32_t kGoldenSunObjRecordCensusStart = 0x03002000u;
+constexpr std::uint32_t kGoldenSunObjRecordCensusEnd = 0x030022E0u;
+// The 64-entry cap truncated (Bilibin overflow ~20005, Palace ~2912 write
+// *events*, not unique keys -- overflow increments per rejected write, not
+// per distinct key). The address range is exactly 0x2E0 = 736 bytes; the
+// worst pattern measured so far is one writer identity per byte (Palace's
+// sequential fill) and a handful of distinct (pc,size) writers per byte in
+// the steady-state field case. 4096 covers 736 bytes x up to ~5 distinct
+// (pc,size) identities per byte with headroom, while staying a few hundred
+// KB and a bounded linear scan restricted to writes inside this one 736-byte
+// window (never the hot path for the rest of guest memory).
+constexpr std::size_t kGoldenSunObjRecordCensusLimit = 4096u;
+struct GoldenSunObjRecordCensusStat {
+    bool used = false;
+    std::uint32_t address = 0;
+    std::uint32_t pc = 0;
+    std::uint32_t size = 0;
+    std::uint64_t writes = 0;
+    std::uint64_t first_frame = UINT64_MAX;
+    std::uint64_t last_frame = UINT64_MAX;
+};
+std::array<GoldenSunObjRecordCensusStat, kGoldenSunObjRecordCensusLimit>
+    g_golden_sun_obj_record_census{};
+unsigned g_golden_sun_obj_record_census_overflow = 0;
+
+void reset_golden_sun_obj_record_census() {
+    g_golden_sun_obj_record_census = {};
+    g_golden_sun_obj_record_census_overflow = 0;
+}
+
+void note_golden_sun_obj_record_write(std::uint32_t pc, std::uint32_t address,
+                                      std::uint32_t size) {
+    if (size == 0u) return;
+    const std::uint64_t first = address;
+    const std::uint64_t last = static_cast<std::uint64_t>(address) + size;
+    if (last <= kGoldenSunObjRecordCensusStart ||
+        first >= kGoldenSunObjRecordCensusEnd) return;
+    const std::uint64_t frame = runtime_current_frame();
+    GoldenSunObjRecordCensusStat* stat = nullptr;
+    for (auto& candidate : g_golden_sun_obj_record_census) {
+        if (candidate.used && candidate.address == address &&
+            candidate.pc == pc && candidate.size == size) {
+            stat = &candidate;
+            break;
+        }
+    }
+    if (!stat) {
+        for (auto& candidate : g_golden_sun_obj_record_census) {
+            if (!candidate.used) {
+                candidate = {};
+                candidate.used = true;
+                candidate.address = address;
+                candidate.pc = pc;
+                candidate.size = size;
+                stat = &candidate;
+                break;
+            }
+        }
+    }
+    if (!stat) {
+        ++g_golden_sun_obj_record_census_overflow;
+        return;
+    }
+    ++stat->writes;
+    stat->first_frame = std::min(stat->first_frame, frame);
+    stat->last_frame = stat->writes == 1u ? frame
+                                          : std::max(stat->last_frame, frame);
+}
+
+void report_golden_sun_obj_record_census(const char* reason) {
+    if (!golden_sun_wide_diagnostics_enabled() || !reason) return;
+    for (const auto& stat : g_golden_sun_obj_record_census) {
+        if (!stat.used) continue;
+        std::fprintf(
+            stderr,
+            "[wide-obj-record-writer] auth_epoch=%llu reason=%s "
+            "addr=0x%08x pc=0x%08x size=%u writes=%llu frames=%llu..%llu\n",
+            static_cast<unsigned long long>(g_golden_sun_field_auth_epoch),
+            reason, stat.address, stat.pc, stat.size,
+            static_cast<unsigned long long>(stat.writes),
+            static_cast<unsigned long long>(stat.first_frame),
+            static_cast<unsigned long long>(stat.last_frame));
+    }
+    if (g_golden_sun_obj_record_census_overflow != 0u) {
+        std::fprintf(stderr,
+                     "[wide-obj-record-writer-overflow] auth_epoch=%llu "
+                     "reason=%s overflow=%u\n",
+                     static_cast<unsigned long long>(
+                         g_golden_sun_field_auth_epoch),
+                     reason, g_golden_sun_obj_record_census_overflow);
+    }
+}
+
+// WIDE-01 entity-producer census: bounded value-event trace for the same
+// 0x38-stride record, restricted to relative offsets 0x00..0x13 of each
+// slot -- the region under test for a signed X/Y correlation against
+// [wide-obj-stage]/[wide-obj-handoff]. The offset window is layout-relative
+// (not tied to any specific map), so it applies unchanged to a different
+// town using the same record shape. Values logged here are decoded guest
+// game state (small integers/coordinates), not ROM/asset payload bytes.
+// Diagnostics-only, capped, and reset with the same epoch boundary as the
+// rest of this census.
+constexpr std::uint32_t kGoldenSunObjRecordValueOffsetEnd = 0x14u;
+constexpr std::size_t kGoldenSunObjRecordValueLimit = 4096u;
+struct GoldenSunObjRecordValueEvent {
+    std::uint64_t frame = 0;
+    std::uint32_t address = 0;
+    std::uint32_t pc = 0;
+    std::uint32_t size = 0;
+    std::uint32_t value = 0;
+};
+std::array<GoldenSunObjRecordValueEvent, kGoldenSunObjRecordValueLimit>
+    g_golden_sun_obj_record_value_events{};
+std::size_t g_golden_sun_obj_record_value_count = 0;
+std::uint64_t g_golden_sun_obj_record_value_dropped = 0;
+
+void reset_golden_sun_obj_record_value_events() {
+    g_golden_sun_obj_record_value_count = 0;
+    g_golden_sun_obj_record_value_dropped = 0;
+}
+
+void note_golden_sun_obj_record_value(std::uint32_t pc, std::uint32_t address,
+                                      std::uint32_t size) {
+    if (address < kGoldenSunObjRecordCensusStart) return;
+    if (address >= kGoldenSunObjRecordCensusEnd) return;
+    const std::uint32_t offset_in_slot =
+        (address - kGoldenSunObjRecordCensusStart) % 0x38u;
+    if (offset_in_slot >= kGoldenSunObjRecordValueOffsetEnd) return;
+    if (g_golden_sun_obj_record_value_count >=
+            kGoldenSunObjRecordValueLimit) {
+        ++g_golden_sun_obj_record_value_dropped;
+        return;
+    }
+    std::uint32_t value = 0;
+    switch (size) {
+        case 1u: value = bus_read_u8(address); break;
+        case 2u: value = bus_read_u16(address); break;
+        case 4u: value = bus_read_u32(address); break;
+        default: return;
+    }
+    auto& event = g_golden_sun_obj_record_value_events[
+        g_golden_sun_obj_record_value_count++];
+    event.frame = runtime_current_frame();
+    event.address = address;
+    event.pc = pc;
+    event.size = size;
+    event.value = value;
+}
+
+void report_golden_sun_obj_record_values(const char* reason) {
+    if (!golden_sun_wide_diagnostics_enabled() || !reason) return;
+    for (std::size_t i = 0; i < g_golden_sun_obj_record_value_count; ++i) {
+        const auto& event = g_golden_sun_obj_record_value_events[i];
+        std::fprintf(
+            stderr,
+            "[wide-obj-record-value] auth_epoch=%llu reason=%s frame=%llu "
+            "addr=0x%08x pc=0x%08x size=%u value=0x%08x\n",
+            static_cast<unsigned long long>(g_golden_sun_field_auth_epoch),
+            reason, static_cast<unsigned long long>(event.frame),
+            event.address, event.pc, event.size, event.value);
+    }
+    if (g_golden_sun_obj_record_value_dropped != 0u) {
+        std::fprintf(stderr,
+                     "[wide-obj-record-value-overflow] auth_epoch=%llu "
+                     "reason=%s dropped=%llu\n",
+                     static_cast<unsigned long long>(
+                         g_golden_sun_field_auth_epoch),
+                     reason, static_cast<unsigned long long>(
+                         g_golden_sun_obj_record_value_dropped));
+    }
+}
+
+// WIDE-01 body/shadow identity: bounded per-frame write-order trace of the
+// OAM-shadow commit, across all three Func_1dc8 writer routes (D4/EC/F0 --
+// golden_sun_obj_staging_handoff, golden_sun_obj_f0_entry_capture, and
+// golden_sun_oam_shadow_write_observer respectively; see
+// src/relocatable_writer_policy.h for the route offsets). Records each
+// committed write in the exact order the guest performs it within a frame,
+// tagged with its route, so a body write and its shadow write for the same
+// in-game entity can later be matched by adjacent sequence numbers within
+// one frame regardless of which route produced them. Diagnostics-only,
+// deduped against the immediately preceding entry for the same (route,
+// slot) pair (skips frames where that slot's committed source/ATTR/
+// coordinates are unchanged from the previous frame on that same route --
+// this is the "only log frames where the set of active slots changes"
+// bound), capped, and reset at the same auth-epoch boundaries as the rest
+// of this census. Never consulted by gameplay/render code. See
+// docs/issues/WIDE-01_NPC_IDENTITY.md.
+// (GoldenSunObjCommitOrderRoute is forward-declared near the top of this
+// file, alongside note_golden_sun_obj_commit_order.)
+constexpr const char* golden_sun_obj_commit_order_route_name(
+    GoldenSunObjCommitOrderRoute route) {
+    switch (route) {
+        case GoldenSunObjCommitOrderRoute::D4: return "D4";
+        case GoldenSunObjCommitOrderRoute::EC: return "EC";
+        case GoldenSunObjCommitOrderRoute::F0: return "F0";
+    }
+    return "?";
+}
+// 256 was sized for the D4 route alone (3 events dropped once EC/F0 were
+// added in a follow-up pass); 512 covers all three routes with headroom
+// while staying well under the per-epoch volume that caused the
+// synchronous-fprintf transition stalls documented in
+// WIDE-01_ENTITY_PRODUCER_FINDINGS.md ("Performance").
+constexpr std::size_t kGoldenSunObjCommitOrderLimit = 512u;
+constexpr std::size_t kGoldenSunObjCommitOrderSlots = 128u;
+constexpr std::size_t kGoldenSunObjCommitOrderRouteCount = 3u;
+struct GoldenSunObjCommitOrderEvent {
+    std::uint64_t frame = 0;
+    std::uint32_t sequence = 0;
+    std::uint32_t source = 0;
+    int slot = -1;
+    GoldenSunObjCommitOrderRoute route = GoldenSunObjCommitOrderRoute::D4;
+    std::uint16_t attr0 = 0;
+    std::uint16_t attr1 = 0;
+    std::uint16_t attr2 = 0;
+    std::int16_t logical_x = 0;
+    std::int16_t logical_y = 0;
+    bool x_valid = false;
+    bool y_valid = false;
+    bool used = false;
+};
+std::array<GoldenSunObjCommitOrderEvent, kGoldenSunObjCommitOrderLimit>
+    g_golden_sun_obj_commit_order_events{};
+std::size_t g_golden_sun_obj_commit_order_count = 0;
+std::uint64_t g_golden_sun_obj_commit_order_dropped = 0;
+std::uint64_t g_golden_sun_obj_commit_order_frame = UINT64_MAX;
+std::uint32_t g_golden_sun_obj_commit_order_sequence_in_frame = 0;
+// Last committed identity per (route, OAM slot), used only to dedupe
+// repeat writes; never consulted by gameplay/render code.
+std::array<std::array<GoldenSunObjCommitOrderEvent, kGoldenSunObjCommitOrderSlots>,
+           kGoldenSunObjCommitOrderRouteCount>
+    g_golden_sun_obj_commit_order_last_by_route_slot{};
+
+void reset_golden_sun_obj_commit_order() {
+    g_golden_sun_obj_commit_order_count = 0;
+    g_golden_sun_obj_commit_order_dropped = 0;
+    g_golden_sun_obj_commit_order_frame = UINT64_MAX;
+    g_golden_sun_obj_commit_order_sequence_in_frame = 0;
+    g_golden_sun_obj_commit_order_last_by_route_slot = {};
+}
+
+void note_golden_sun_obj_commit_order(GoldenSunObjCommitOrderRoute route,
+                                      std::uint32_t source, int slot,
+                                      std::uint16_t attr0,
+                                      std::uint16_t attr1,
+                                      std::uint16_t attr2, bool x_valid,
+                                      std::int16_t logical_x, bool y_valid,
+                                      std::int16_t logical_y) {
+    if (!golden_sun_wide_diagnostics_enabled()) return;
+    if (slot >= static_cast<int>(kGoldenSunObjCommitOrderSlots)) return;
+    // EC fires before the destination OAM slot is resolved (that only
+    // becomes known at the later F0 write), so it reports slot=-1 --
+    // truthfully "not yet assigned", never fabricated. Dedupe such entries
+    // by a deterministic bucket derived from the source record address
+    // instead of by slot; this is bookkeeping only; the reported event
+    // still carries the real slot value (-1) unchanged.
+    const std::size_t dedupe_index = slot >= 0
+        ? static_cast<std::size_t>(slot)
+        : static_cast<std::size_t>((source >> 3) %
+                                    kGoldenSunObjCommitOrderSlots);
+    const std::uint64_t frame = runtime_current_frame();
+    if (frame != g_golden_sun_obj_commit_order_frame) {
+        g_golden_sun_obj_commit_order_frame = frame;
+        g_golden_sun_obj_commit_order_sequence_in_frame = 0;
+    }
+    const std::uint32_t sequence =
+        g_golden_sun_obj_commit_order_sequence_in_frame++;
+    auto& last = g_golden_sun_obj_commit_order_last_by_route_slot[
+        static_cast<std::size_t>(route)][dedupe_index];
+    // D4 fires only on a gated, successful commit (already low-volume), so
+    // it keeps the fine-grained equality check (logs every real coordinate
+    // change). EC/F0 are restricted to the shadow-candidate signature
+    // (tile=0/shape=1/size=0) at their call sites, but a *moving* shadow's
+    // raw ATTR0/ATTR1 (Y/X) still changes almost every frame, which would
+    // defeat a fine-grained check the same way the unfiltered routes did --
+    // this flooded the cap and stalled scene transitions in an earlier
+    // pass. For EC/F0, dedupe coarsely on (route, dedupe_index) alone: log
+    // only the first frame this object is seen in the epoch (or the first
+    // frame after any absence), not every per-frame position update. That
+    // is still enough to answer "does this route ever carry the shadow
+    // signature, and where in write order" -- the fine per-frame offset
+    // tracking that question also wants comes from D4's own logical X/Y,
+    // already fully sampled.
+    const bool unchanged = route == GoldenSunObjCommitOrderRoute::D4
+        ? (last.used && last.route == route && last.slot == slot &&
+           last.source == source && last.attr0 == attr0 &&
+           last.attr1 == attr1 && last.attr2 == attr2 &&
+           last.x_valid == x_valid && last.y_valid == y_valid &&
+           last.logical_x == logical_x && last.logical_y == logical_y)
+        : (last.used && last.route == route);
+    GoldenSunObjCommitOrderEvent event;
+    event.frame = frame;
+    event.sequence = sequence;
+    event.source = source;
+    event.slot = slot;
+    event.route = route;
+    event.attr0 = attr0;
+    event.attr1 = attr1;
+    event.attr2 = attr2;
+    event.logical_x = logical_x;
+    event.logical_y = logical_y;
+    event.x_valid = x_valid;
+    event.y_valid = y_valid;
+    event.used = true;
+    last = event;
+    if (unchanged) return;
+    if (g_golden_sun_obj_commit_order_count >=
+            kGoldenSunObjCommitOrderLimit) {
+        ++g_golden_sun_obj_commit_order_dropped;
+        return;
+    }
+    g_golden_sun_obj_commit_order_events[
+        g_golden_sun_obj_commit_order_count++] = event;
+}
+
+void report_golden_sun_obj_commit_order(const char* reason) {
+    if (!golden_sun_wide_diagnostics_enabled() || !reason) return;
+    for (std::size_t i = 0; i < g_golden_sun_obj_commit_order_count; ++i) {
+        const auto& event = g_golden_sun_obj_commit_order_events[i];
+        std::fprintf(
+            stderr,
+            "[wide-obj-commit-order] auth_epoch=%llu reason=%s frame=%llu "
+            "sequence=%u route=%s source=0x%08x slot=%d attr0=0x%04x "
+            "attr1=0x%04x attr2=0x%04x x_valid=%u logical_x=%d y_valid=%u "
+            "logical_y=%d\n",
+            static_cast<unsigned long long>(g_golden_sun_field_auth_epoch),
+            reason, static_cast<unsigned long long>(event.frame),
+            event.sequence,
+            golden_sun_obj_commit_order_route_name(event.route),
+            event.source, event.slot, static_cast<unsigned>(event.attr0),
+            static_cast<unsigned>(event.attr1),
+            static_cast<unsigned>(event.attr2), event.x_valid ? 1u : 0u,
+            static_cast<int>(event.logical_x), event.y_valid ? 1u : 0u,
+            static_cast<int>(event.logical_y));
+    }
+    if (g_golden_sun_obj_commit_order_dropped != 0u) {
+        std::fprintf(stderr,
+                     "[wide-obj-commit-order-overflow] auth_epoch=%llu "
+                     "reason=%s dropped=%llu\n",
+                     static_cast<unsigned long long>(
+                         g_golden_sun_field_auth_epoch),
+                     reason, static_cast<unsigned long long>(
+                         g_golden_sun_obj_commit_order_dropped));
+    }
+}
+
 std::uint64_t g_golden_sun_field_epoch_map_writes = 0;
 std::uint64_t g_golden_sun_field_epoch_raw_writes = 0;
 std::uint64_t g_golden_sun_field_epoch_map_dma_writes = 0;
@@ -642,6 +3598,25 @@ bool golden_sun_field_table_overlap(std::uint32_t address,
     if (hi <= lo) return false;
     *out_bytes = hi - lo;
     return true;
+}
+
+void invalidate_golden_sun_palace_table_authorization() {
+    g_golden_sun_palace_table_authorized = false;
+    g_golden_sun_palace_table_invalidated = true;
+    reset_golden_sun_palace_active_region();
+}
+
+void invalidate_golden_sun_palace_table_if_overlapping(
+    std::uint32_t address, std::uint32_t size) {
+    std::uint64_t overlap = 0;
+    if (golden_sun_field_table_overlap(
+            address, size, kGoldenSunFieldMapAddress,
+            kGoldenSunFieldMapAddress + 0x10000u, &overlap) ||
+        golden_sun_field_table_overlap(
+            address, size, kGoldenSunFieldRawAddress,
+            kGoldenSunFieldRawAddress + 0x8000u, &overlap)) {
+        invalidate_golden_sun_palace_table_authorization();
+    }
 }
 
 void record_golden_sun_field_table_write(std::uint32_t address,
@@ -732,11 +3707,24 @@ void golden_sun_wide_dma_descriptor_observer(
     int channel, std::uint32_t pc, std::uint32_t source,
     std::uint32_t destination, std::uint32_t bytes, std::uint16_t control,
     int start_mode) {
-    if (!golden_sun_wide_diagnostics_enabled()) return;
+    // The descriptor observer runs immediately before the DMA transfer. At
+    // this point the shadow is the complete image that is about to become
+    // visible OAM, while later shadow writes must wait for the next handoff.
+    // Publish only this exact measured 1024-byte transfer; partial/unrelated
+    // DMAs must never make pending provenance visible.
+    if (gsr::widescreen::golden_sun_obj_provenance_dma_handoff(
+            source, destination, bytes, control)) {
+        g_golden_sun_obj_visible_provenance =
+            g_golden_sun_obj_pending_provenance;
+    }
     std::uint32_t first = 0;
     std::uint32_t span = 0;
     if (!golden_sun_dma_destination_bounds(
             destination, bytes, control, &first, &span)) return;
+    // A DMA copy is still a table write for Palace authorization, even when
+    // diagnostics are disabled and no authored-cell bits are changed.
+    invalidate_golden_sun_palace_table_if_overlapping(first, span);
+    if (!golden_sun_wide_diagnostics_enabled()) return;
     const std::uint64_t frame = runtime_current_frame();
     const auto record = [&](const char* table_name,
                             std::uint32_t table_start,
@@ -786,6 +3774,71 @@ std::uint32_t golden_sun_field_table_crc(const std::uint8_t* ewram,
                                          std::size_t offset,
                                          std::size_t bytes) {
     return ewram ? gba::crc32(ewram + offset, bytes) : 0u;
+}
+
+bool refresh_golden_sun_palace_table_authorization() {
+    if (!g_golden_sun_mode0_split_scroll) {
+        g_golden_sun_palace_table_authorized = false;
+        return false;
+    }
+    if (g_golden_sun_palace_table_invalidated ||
+        g_golden_sun_palace_table_auth_attempted) {
+        return g_golden_sun_palace_table_authorized;
+    }
+    // Fingerprint once after a complete clean split-scroll frame. Subsequent
+    // scanlines rely on the CPU/DMA table-write invalidation observers; CRC is
+    // deliberately not part of the per-scanline provider path.
+    g_golden_sun_palace_table_auth_attempted = true;
+    const gba::GbaBus* bus = gbarecomp::active_bus();
+    if (!bus) {
+        g_golden_sun_palace_table_authorized = false;
+        return false;
+    }
+    const std::uint8_t* ewram = bus->ewram_ptr();
+    const std::uint32_t map_crc = golden_sun_field_table_crc(
+        ewram, kGoldenSunFieldMapOffset, kGoldenSunFieldMapBytes);
+    const std::uint32_t raw_crc = golden_sun_field_table_crc(
+        ewram, kGoldenSunFieldRawOffset, kGoldenSunFieldRawBytes);
+    const bool fingerprint_match =
+        gsr::widescreen::golden_sun_palace_table_fingerprint_matches(
+            map_crc, raw_crc);
+    g_golden_sun_palace_table_authorized = fingerprint_match;
+    if (!fingerprint_match) {
+        // A mismatch is evidence that this is not the measured Palace table.
+        // Latch the failure for this scene/authentication epoch.
+        g_golden_sun_palace_table_invalidated = true;
+    }
+    return g_golden_sun_palace_table_authorized;
+}
+
+bool prepare_golden_sun_palace_active_region(
+    const gba::GbaBus* bus, const std::uint8_t* io) {
+    if (!bus || !io || !g_golden_sun_mode0_split_scroll ||
+        !g_golden_sun_palace_table_authorized) {
+        return false;
+    }
+    const std::array<std::uint16_t, 6> scroll{{
+        gsr::widescreen::read_io16(io, 0x14u),
+        gsr::widescreen::read_io16(io, 0x16u),
+        gsr::widescreen::read_io16(io, 0x18u),
+        gsr::widescreen::read_io16(io, 0x1Au),
+        gsr::widescreen::read_io16(io, 0x1Cu),
+        gsr::widescreen::read_io16(io, 0x1Eu),
+    }};
+    if (!g_golden_sun_palace_region_scroll_valid ||
+        g_golden_sun_palace_region_scroll != scroll) {
+        g_golden_sun_palace_active_region.reset();
+        g_golden_sun_palace_region_scroll = scroll;
+        g_golden_sun_palace_region_scroll_valid = true;
+        g_golden_sun_palace_region_build_attempted = false;
+    }
+    if (!g_golden_sun_palace_region_build_attempted) {
+        g_golden_sun_palace_region_build_attempted = true;
+        g_golden_sun_palace_active_region.build(
+            g_golden_sun_wide_line_dispcnt, io, 0x20u, bus->ewram_ptr(),
+            256u * 1024u, true);
+    }
+    return true;
 }
 
 void trace_golden_sun_field_map(const std::uint8_t* ewram) {
@@ -1001,37 +4054,112 @@ void trace_golden_sun_wide_policy(std::uint16_t dispcnt,
 
 void report_golden_sun_field_provider_trace(std::uint64_t frame,
                                             const char* reason);
+void report_golden_sun_palace_margin_diagnostics(std::uint64_t frame,
+                                                 const char* reason);
+void report_golden_sun_obj_y_steady_state_diagnostics(std::uint64_t frame,
+                                                     const char* reason);
+void report_golden_sun_obj_y_transition_diagnostics(std::uint64_t frame,
+                                                    const char* reason);
 
-using GoldenSunLiteralTrace = gsr::widescreen::GoldenSunLiteralTraceStats;
+const char* golden_sun_field_margin_region(int hw_x, int screen_y,
+                                           std::size_t* out_region) {
+    std::size_t region = 3u; // bottom (the normal provider margin case)
+    const char* name = "bottom";
+    // Vertical rows span the whole output width, so classify them before the
+    // horizontal sides; corners remain attributable to their vertical row.
+    if (screen_y < 0) {
+        region = 2u;
+        name = "top";
+    } else if (screen_y >= static_cast<int>(gsr::widescreen::kNativeHeight)) {
+        region = 3u;
+        name = "bottom";
+    } else if (hw_x < 0) {
+        region = 0u;
+        name = "left";
+    } else if (hw_x >= static_cast<int>(gsr::widescreen::kNativeWidth)) {
+        region = 1u;
+        name = "right";
+    }
+    if (out_region) *out_region = region;
+    return name;
+}
 
-std::array<GoldenSunLiteralTrace, 2> g_golden_sun_literal_trace{{
-    {gsr::widescreen::kFieldListXUpperLiteralPc},
-    {gsr::widescreen::kFieldListYLowerLiteralPc},
-}};
+void record_golden_sun_field_map_id_attribution(
+    int bg, int hw_x, int screen_y,
+    const gsr::widescreen::GoldenSunFieldTilemapMetadata& metadata) {
+    if (!golden_sun_wide_diagnostics_enabled() || bg < 0 || bg >= 4 ||
+        !metadata.has_raw_entry) return;
+    std::size_t region = 0;
+    golden_sun_field_margin_region(hw_x, screen_y, &region);
+    auto& entries = g_golden_sun_field_map_id_attribution[
+        static_cast<std::size_t>(bg)][region];
+    for (auto& entry : entries) {
+        if (entry.replacements != 0u && entry.map_id == metadata.map_id) {
+            ++entry.replacements;
+            return;
+        }
+    }
+    for (auto& entry : entries) {
+        if (entry.replacements == 0u) {
+            entry.map_id = metadata.map_id;
+            entry.replacements = 1u;
+            return;
+        }
+    }
+    ++g_golden_sun_field_map_id_attribution_overflow[
+        static_cast<std::size_t>(bg)][region];
+}
 
-void report_golden_sun_literal_trace(std::uint64_t frame,
-                                     const char* reason) {
-    if (!golden_sun_wide_diagnostics_enabled() || !reason) return;
-    for (const auto& stat : g_golden_sun_literal_trace) {
-        const std::uint32_t min_original = stat.calls != 0u
-            ? stat.min_original : 0u;
-        std::fprintf(
-            stderr,
-            "[wide-literal] frame=%llu auth_epoch=%llu reason=%s "
-            "pc=0x%08x calls=%llu overrides=%llu gate_rejects=%llu "
-            "compare_rejects=%llu original=0x%08x..0x%08x\n",
-            static_cast<unsigned long long>(frame),
-            static_cast<unsigned long long>(g_golden_sun_field_auth_epoch),
-            reason, stat.pc, static_cast<unsigned long long>(stat.calls),
-            static_cast<unsigned long long>(stat.overrides),
-            static_cast<unsigned long long>(stat.gate_rejects),
-            static_cast<unsigned long long>(stat.compare_rejects),
-            min_original, stat.calls != 0u ? stat.max_original : 0u);
+void report_golden_sun_field_map_id_attribution(std::uint64_t frame,
+                                                const char* reason) {
+    if (!golden_sun_wide_diagnostics_enabled()) return;
+    static constexpr const char* kRegions[] = {
+        "left", "right", "top", "bottom"};
+    for (std::size_t bg = 0; bg < 4u; ++bg) {
+        for (std::size_t region = 0; region < 4u; ++region) {
+            const auto& entries = g_golden_sun_field_map_id_attribution[bg][region];
+            bool any = g_golden_sun_field_map_id_attribution_overflow[bg][region] != 0u;
+            for (const auto& entry : entries) any |= entry.replacements != 0u;
+            if (!any) continue;
+            std::fprintf(stderr,
+                         "[wide-field-map-id] frame=%llu auth_epoch=%llu "
+                         "reason=%s bg=%zu region=%s overflow=%llu ids=",
+                         static_cast<unsigned long long>(frame),
+                         static_cast<unsigned long long>(g_golden_sun_field_auth_epoch),
+                         reason, bg, kRegions[region],
+                         static_cast<unsigned long long>(
+                             g_golden_sun_field_map_id_attribution_overflow[bg][region]));
+            bool first = true;
+            for (const auto& entry : entries) {
+                if (entry.replacements == 0u) continue;
+                std::fprintf(stderr, "%s%03x:%llu", first ? "" : ",",
+                             entry.map_id,
+                             static_cast<unsigned long long>(entry.replacements));
+                first = false;
+            }
+            std::fputc('\n', stderr);
+        }
     }
 }
 
+void write_golden_sun_wide_scroll_trace_csv();
+
 void report_golden_sun_wide_diagnostics_at_exit() {
     if (!golden_sun_wide_diagnostics_enabled()) return;
+    std::fprintf(stderr,
+        "[wide-obj-experimental-cull-summary] logs=%u dropped=%llu\n",
+        g_golden_sun_experimental_cull_logs,
+        static_cast<unsigned long long>(
+            g_golden_sun_experimental_cull_logs_dropped));
+    std::fprintf(stderr,
+        "[wide-obj-writer-summary] recognized=%llu identity_mismatch=%llu "
+        "unknown_variant=%llu\n",
+        static_cast<unsigned long long>(
+            g_golden_sun_func1dc8_writer_recognized),
+        static_cast<unsigned long long>(
+            g_golden_sun_func1dc8_writer_identity_mismatch),
+        static_cast<unsigned long long>(
+            g_golden_sun_func1dc8_writer_unknown_variant));
     if (g_golden_sun_margin_diagnostic_callbacks != 0u) {
         std::fprintf(
             stderr,
@@ -1078,6 +4206,29 @@ void report_golden_sun_wide_diagnostics_at_exit() {
         oam_dma.last_used_slots, oam_dma.last_visible_slots,
         oam_dma.last_nonzero_slots, oam_dma.last_raw_x_ge_240,
         oam_dma.last_raw_y_ge_160);
+    gba::vram_trace::OamAttr0TraceStats attr0{};
+    gba::vram_trace::get_oam_attr0_trace_stats(&attr0);
+    std::fprintf(stderr,
+        "[oam-attr0-summary] post_copies=%llu candidates=%llu exact_192=%llu "
+        "other=%llu unseen=%llu groups_dropped=%llu groups=",
+        static_cast<unsigned long long>(attr0.post_copies),
+        static_cast<unsigned long long>(attr0.candidate_slots),
+        static_cast<unsigned long long>(attr0.exact_192_slots),
+        static_cast<unsigned long long>(attr0.other_slots),
+        static_cast<unsigned long long>(attr0.unseen_slots),
+        static_cast<unsigned long long>(attr0.groups_dropped));
+    for (std::uint32_t i = 0; i < attr0.group_count; ++i) {
+        const auto& g = attr0.groups[i];
+        const char* kind = g.kind == gba::vram_trace::OamAttr0WriterKind::Cpu
+            ? "cpu" : (g.kind == gba::vram_trace::OamAttr0WriterKind::Dma
+                ? "dma" : "unseen");
+        std::fprintf(stderr, "%s%u:%s:0x%08x:%u..%u/%u:g%llu:c%llu",
+            i == 0u ? "" : ";", static_cast<unsigned>(g.raw_y), kind,
+            g.writer_pc, g.slot_first, g.slot_last, g.slot_count,
+            static_cast<unsigned long long>(g.generation),
+            static_cast<unsigned long long>(g.cycle));
+    }
+    std::fputc('\n', stderr);
     std::fprintf(
         stderr,
         "[wide-policy-summary] frame=%llu transitions=%llu logged=%llu "
@@ -1090,8 +4241,16 @@ void report_golden_sun_wide_diagnostics_at_exit() {
         golden_sun_wide_policy_reason_name(g_golden_sun_wide_policy_last_reason),
         g_golden_sun_wide_policy_last_flags);
     report_golden_sun_field_provider_trace(runtime_current_frame(), "exit");
+    report_golden_sun_palace_margin_diagnostics(runtime_current_frame(), "exit");
+    report_golden_sun_obj_b328_diagnostics(runtime_current_frame(), "exit");
+    report_golden_sun_obj_y_transition_diagnostics(runtime_current_frame(), "exit");
+    report_golden_sun_obj_y_steady_state_diagnostics(runtime_current_frame(), "exit");
+    report_golden_sun_field_map_id_attribution(runtime_current_frame(), "exit");
     report_golden_sun_field_producers("exit");
-    report_golden_sun_literal_trace(runtime_current_frame(), "exit");
+    report_golden_sun_obj_record_census("exit");
+    report_golden_sun_obj_record_values("exit");
+    report_golden_sun_obj_commit_order("exit");
+    write_golden_sun_wide_scroll_trace_csv();
     std::fprintf(
         stderr,
         "[wide-field-table-summary] map_writes=%llu map_bytes=%llu "
@@ -1133,7 +4292,7 @@ void report_golden_sun_wide_diagnostics_at_exit() {
 }
 
 void report_golden_sun_field_provider_trace(std::uint64_t frame,
-                                            const char* reason) {
+                                             const char* reason) {
     if (!golden_sun_wide_diagnostics_enabled()) return;
     for (std::size_t bg = 0; bg < g_golden_sun_field_provider_trace.size();
          ++bg) {
@@ -1148,7 +4307,7 @@ void report_golden_sun_field_provider_trace(std::uint64_t frame,
             "[wide-field-provider] frame=%llu auth_epoch=%llu reason=%s "
             "bg=%zu calls=%llu equal=%llu split=%llu replacements=%llu "
             "unavailable=%llu precondition=%llu boundary=%llu raw=%llu "
-            "lookup_miss=%llu coord=%d..%d,%d..%d\n",
+            "palace_region=%llu lookup_miss=%llu coord=%d..%d,%d..%d\n",
             static_cast<unsigned long long>(frame),
             static_cast<unsigned long long>(g_golden_sun_field_auth_epoch),
             reason, bg, static_cast<unsigned long long>(stat.calls),
@@ -1159,9 +4318,337 @@ void report_golden_sun_field_provider_trace(std::uint64_t frame,
             static_cast<unsigned long long>(stat.precondition_rejects),
             static_cast<unsigned long long>(stat.boundary_rejects),
             static_cast<unsigned long long>(stat.raw_unavailable),
+            static_cast<unsigned long long>(stat.palace_region_rejects),
             static_cast<unsigned long long>(stat.lookup_misses), min_x,
             max_x, min_y, max_y);
     }
+}
+
+void report_golden_sun_palace_margin_diagnostics(std::uint64_t frame,
+                                                 const char* reason) {
+    if (!golden_sun_wide_diagnostics_enabled()) return;
+    static constexpr const char* kRegions[] = {
+        "left", "right", "top", "bottom"};
+    const auto& diagnostic = g_golden_sun_palace_margin_diagnostics;
+    for (std::size_t bg = 0; bg < GoldenSunPalaceMarginDiagnostics::kBgCount;
+         ++bg) {
+        for (std::size_t region = 0;
+             region < GoldenSunPalaceMarginDiagnostics::kRegionCount;
+             ++region) {
+            for (std::size_t outcome = 0;
+                 outcome < GoldenSunPalaceMarginDiagnostics::kOutcomeCount;
+                 ++outcome) {
+                const std::uint64_t count =
+                    diagnostic.counts[bg][region][outcome];
+                if (count == 0u) continue;
+                std::fprintf(
+                    stderr,
+                    "[wide-palace-margin] frame=%llu auth_epoch=%llu "
+                    "reason=%s bg=%zu region=%s outcome=%s count=%llu\n",
+                    static_cast<unsigned long long>(frame),
+                    static_cast<unsigned long long>(
+                        g_golden_sun_field_auth_epoch),
+                    reason, bg + 1u, kRegions[region],
+                    golden_sun_palace_margin_outcome_name(
+                        static_cast<GoldenSunPalaceMarginOutcome>(outcome)),
+                    static_cast<unsigned long long>(count));
+            }
+        }
+    }
+    for (std::size_t i = 0; i < diagnostic.sample_count; ++i) {
+        const auto& sample = diagnostic.samples[i];
+        static constexpr const char* kSampleRegions[] = {
+            "left", "right", "top", "bottom"};
+        std::fprintf(
+            stderr,
+            "[wide-palace-margin-sample] frame=%llu auth_epoch=%llu "
+            "reason=%s bg=%u region=%s outcome=%s hw_x=%d screen_y=%d "
+            "metadata=%u map_x=%u map_y=%u map_id=0x%03x\n",
+            static_cast<unsigned long long>(frame),
+            static_cast<unsigned long long>(g_golden_sun_field_auth_epoch),
+            reason, static_cast<unsigned>(sample.bg),
+            kSampleRegions[sample.region],
+            golden_sun_palace_margin_outcome_name(sample.outcome),
+            static_cast<int>(sample.hw_x), static_cast<int>(sample.screen_y),
+            sample.metadata_valid ? 1u : 0u,
+            static_cast<unsigned>(sample.map_x),
+            static_cast<unsigned>(sample.map_y),
+            static_cast<unsigned>(sample.map_id));
+    }
+    std::fprintf(stderr,
+                 "[wide-palace-margin-summary] frame=%llu auth_epoch=%llu "
+                 "reason=%s samples=%zu dropped=%llu\n",
+                 static_cast<unsigned long long>(frame),
+                 static_cast<unsigned long long>(g_golden_sun_field_auth_epoch),
+                 reason, diagnostic.sample_count,
+                 static_cast<unsigned long long>(diagnostic.samples_dropped));
+}
+
+void report_golden_sun_obj_y_transition_diagnostics(std::uint64_t frame,
+                                                   const char* reason) {
+    if (!golden_sun_wide_diagnostics_enabled()) return;
+    for (std::size_t r = 0; r < static_cast<std::size_t>(
+             GoldenSunObjYTransitionReason::Count); ++r) {
+        for (std::size_t region = 0; region < static_cast<std::size_t>(
+                 GoldenSunObjYTransitionRegion::Count); ++region) {
+            for (std::size_t resolution = 0; resolution < static_cast<std::size_t>(
+                     GoldenSunObjYTransitionResolution::Count); ++resolution) {
+                const auto count = g_golden_sun_obj_y_transition_counts
+                    [r][region][resolution];
+                if (count == 0u) continue;
+                std::fprintf(stderr,
+                    "[wide-obj-y-transition-summary] frame=%llu "
+                    "auth_epoch=%llu reason=%s resolution=%s region=%s "
+                    "count=%llu\n",
+                    static_cast<unsigned long long>(frame),
+                    static_cast<unsigned long long>(g_golden_sun_field_auth_epoch),
+                    golden_sun_obj_y_transition_reason_name(
+                        static_cast<GoldenSunObjYTransitionReason>(r)),
+                    golden_sun_obj_y_transition_resolution_name(
+                        static_cast<GoldenSunObjYTransitionResolution>(resolution)),
+                    golden_sun_obj_y_transition_region_name(
+                        static_cast<GoldenSunObjYTransitionRegion>(region)),
+                    static_cast<unsigned long long>(count));
+            }
+        }
+    }
+    for (unsigned bucket = 0; bucket < kGoldenSunObjYTransitionBucketCount;
+         ++bucket) {
+        const auto transition_bucket =
+            static_cast<GoldenSunObjYTransitionBucket>(bucket);
+        for (unsigned i = 0;
+             i < g_golden_sun_obj_y_transition_sample_counts[bucket]; ++i) {
+        const auto& sample = g_golden_sun_obj_y_transition_samples[bucket][i];
+        std::fprintf(stderr,
+            "[wide-obj-y-transition-sample] bucket=%s frame=%llu "
+            "auth_epoch=%llu "
+            "slot=%d raw_y=%d canonical_y=%d output_y=%d resolution=%s "
+            "reason=%s region=%s attr0=0x%04x attr1=0x%04x attr2=0x%04x "
+            "expected_attr0=0x%04x expected_attr1=0x%04x expected_attr2=0x%04x "
+            "expected_target=0x%08x provenance_frame=%llu "
+            "provenance_epoch=%llu target=0x%08x "
+            "writer_pc=0x%08x writer_generation=%llu\n",
+            golden_sun_obj_y_transition_bucket_name(transition_bucket),
+            static_cast<unsigned long long>(sample.frame),
+            static_cast<unsigned long long>(g_golden_sun_field_auth_epoch),
+            sample.slot, sample.raw_y, sample.canonical_y, sample.output_y,
+            golden_sun_obj_y_transition_resolution_name(sample.resolution),
+            golden_sun_obj_y_transition_reason_name(sample.reason),
+            golden_sun_obj_y_transition_region_name(sample.region),
+            sample.attr0, sample.attr1, sample.attr2,
+            sample.expected_attr0, sample.expected_attr1, sample.expected_attr2,
+            sample.expected_target,
+            static_cast<unsigned long long>(sample.provenance_frame),
+            static_cast<unsigned long long>(sample.provenance_epoch),
+            sample.target_address, sample.writer_pc,
+            static_cast<unsigned long long>(sample.writer_generation));
+        }
+    }
+    std::fprintf(stderr,
+        "[wide-obj-y-transition] frame=%llu auth_epoch=%llu reason=%s "
+        "raw_y=159..199 dedup=active-candidate-identity+slot-target "
+        "active_candidate_canonical_samples=%u cap=%u dropped=%llu "
+        "signed_bottom_samples=%u cap=%u dropped=%llu "
+        "outcome_transition_samples=%u cap=%u dropped=%llu\n",
+        static_cast<unsigned long long>(frame),
+        static_cast<unsigned long long>(g_golden_sun_field_auth_epoch), reason,
+        g_golden_sun_obj_y_transition_sample_counts[static_cast<std::size_t>(
+            GoldenSunObjYTransitionBucket::ActiveCandidateCanonical)],
+        kGoldenSunObjYTransitionSampleLimit,
+        static_cast<unsigned long long>(g_golden_sun_obj_y_transition_samples_dropped[
+            static_cast<std::size_t>(GoldenSunObjYTransitionBucket::ActiveCandidateCanonical)]),
+        g_golden_sun_obj_y_transition_sample_counts[static_cast<std::size_t>(
+            GoldenSunObjYTransitionBucket::SignedBottom)],
+        kGoldenSunObjYTransitionSampleLimit,
+        static_cast<unsigned long long>(g_golden_sun_obj_y_transition_samples_dropped[
+            static_cast<std::size_t>(GoldenSunObjYTransitionBucket::SignedBottom)]),
+        g_golden_sun_obj_y_transition_sample_counts[static_cast<std::size_t>(
+            GoldenSunObjYTransitionBucket::OutcomeTransition)],
+        kGoldenSunObjYTransitionSampleLimit,
+        static_cast<unsigned long long>(g_golden_sun_obj_y_transition_samples_dropped[
+            static_cast<std::size_t>(GoldenSunObjYTransitionBucket::OutcomeTransition)]));
+}
+
+void report_golden_sun_obj_y_steady_state_diagnostics(std::uint64_t frame,
+                                                     const char* reason) {
+    if (!golden_sun_wide_diagnostics_enabled()) return;
+    std::uint64_t total_calls = 0;
+    std::uint64_t total_192 = 0;
+    for (std::size_t slot = 0; slot < g_golden_sun_obj_y_slot_diagnostics.size(); ++slot) {
+        const auto& stat = g_golden_sun_obj_y_slot_diagnostics[slot];
+        if (stat.calls == 0u) continue;
+        total_calls += stat.calls;
+        total_192 += stat.raw_192;
+        std::fprintf(stderr,
+                     "[wide-obj-y-slot] frame=%llu auth_epoch=%llu reason=%s "
+                     "slot=%zu calls=%llu raw_160_191=%llu raw_192=%llu "
+                     "raw_193_199=%llu raw_200_255=%llu outcomes=",
+                     static_cast<unsigned long long>(frame),
+                     static_cast<unsigned long long>(g_golden_sun_field_auth_epoch),
+                     reason, slot, static_cast<unsigned long long>(stat.calls),
+                     static_cast<unsigned long long>(stat.raw_160_191),
+                     static_cast<unsigned long long>(stat.raw_192),
+                     static_cast<unsigned long long>(stat.raw_193_199),
+                     static_cast<unsigned long long>(stat.raw_200_255));
+        bool first = true;
+        for (std::size_t i = 0; i < stat.outcomes.size(); ++i) {
+            if (stat.outcomes[i] == 0u) continue;
+            std::fprintf(stderr, "%s%s:%llu", first ? "" : ",",
+                         golden_sun_obj_y_outcome_name(
+                             static_cast<GoldenSunObjYOutcome>(i)),
+                         static_cast<unsigned long long>(stat.outcomes[i]));
+            first = false;
+        }
+        std::fputc('\n', stderr);
+    }
+    std::fprintf(stderr,
+                 "[wide-obj-y-summary] frame=%llu auth_epoch=%llu reason=%s "
+                 "slots=%zu calls=%llu exact_192=%llu "
+                 "alias_records=%u alias_dropped=%llu "
+                 "edge_alias_activations=%llu "
+                 "steady_state_only=1 transition_records_excluded=1\n",
+                 static_cast<unsigned long long>(frame),
+                 static_cast<unsigned long long>(g_golden_sun_field_auth_epoch),
+                 reason, g_golden_sun_obj_y_slot_diagnostics.size(),
+                 static_cast<unsigned long long>(total_calls),
+                 static_cast<unsigned long long>(total_192),
+                 g_golden_sun_obj_y_alias_logs_in_epoch,
+                 static_cast<unsigned long long>(
+                     g_golden_sun_obj_y_alias_logs_dropped),
+                 static_cast<unsigned long long>(
+                     g_golden_sun_obj_y_edge_alias_activations));
+}
+
+// WIDE-01 parallax hypothesis capture (temporary): does each BG layer's
+// scroll hold a constant offset/ratio to the gameplay layer within a room,
+// observable live from hardware scroll registers alone? Gated by the same
+// GBARECOMP_VRAM_MAP_TRACE toggle as the rest of this file; off by default,
+// zero cost when disabled. One row per authentic visible frame (not per
+// scanline -- the margin-policy callback fires once per raster line). A
+// fixed-size ring bounds the CSV to at most kGoldenSunWideScrollTraceCap
+// frames (~5.5 minutes at 60 fps) so a play session cannot grow this file
+// without limit; oldest rows are dropped first.
+constexpr std::size_t kGoldenSunWideScrollTraceCap = 20000u;
+
+struct GoldenSunWideScrollTraceRow {
+    std::uint64_t frame = 0;
+    std::uint16_t dispcnt = 0;
+    std::uint16_t bg0cnt = 0;
+    std::uint16_t bg1cnt = 0;
+    std::uint16_t bg2cnt = 0;
+    std::uint16_t bg3cnt = 0;
+    std::uint16_t bg0_hofs = 0;
+    std::uint16_t bg0_vofs = 0;
+    std::uint16_t bg1_hofs = 0;
+    std::uint16_t bg1_vofs = 0;
+    std::uint16_t bg2_hofs = 0;
+    std::uint16_t bg2_vofs = 0;
+    std::uint16_t bg3_hofs = 0;
+    std::uint16_t bg3_vofs = 0;
+    std::uint8_t margin_reason = 0;
+    std::uint8_t split_reason = 0;
+    std::uint8_t flags = 0;
+    std::uint32_t map_crc = 0;
+    std::uint32_t raw_crc = 0;
+    std::uint64_t auth_epoch = 0;
+};
+std::array<GoldenSunWideScrollTraceRow, kGoldenSunWideScrollTraceCap>
+    g_golden_sun_wide_scroll_trace{};
+std::uint64_t g_golden_sun_wide_scroll_trace_count = 0;
+std::uint64_t g_golden_sun_wide_scroll_trace_last_frame = UINT64_MAX;
+
+// Record at most one row per frame, using the field-map census helper
+// already used elsewhere in this file (golden_sun_field_table_crc over the
+// same EWRAM offsets as trace_golden_sun_field_map / the Palace fingerprint)
+// so this adds no new identity scheme.
+void trace_golden_sun_wide_scroll_row(std::uint16_t dispcnt,
+                                      const std::uint8_t* io,
+                                      GoldenSunWidePolicyReason reason,
+                                      GoldenSunWidePolicyReason split_reason,
+                                      unsigned flags) {
+    if (!golden_sun_wide_diagnostics_enabled() || !io) return;
+    const std::uint64_t frame = runtime_current_frame();
+    if (frame == g_golden_sun_wide_scroll_trace_last_frame) return;
+    g_golden_sun_wide_scroll_trace_last_frame = frame;
+    std::uint32_t map_crc = 0;
+    std::uint32_t raw_crc = 0;
+    if (const gba::GbaBus* bus = gbarecomp::active_bus()) {
+        const std::uint8_t* ewram = bus->ewram_ptr();
+        map_crc = golden_sun_field_table_crc(
+            ewram, kGoldenSunFieldMapOffset, kGoldenSunFieldMapBytes);
+        raw_crc = golden_sun_field_table_crc(
+            ewram, kGoldenSunFieldRawOffset, kGoldenSunFieldRawBytes);
+    }
+    GoldenSunWideScrollTraceRow row{};
+    row.frame = frame;
+    row.dispcnt = dispcnt;
+    row.bg0cnt = gsr::widescreen::read_io16(io, 0x08u);
+    row.bg1cnt = gsr::widescreen::read_io16(io, 0x0Au);
+    row.bg2cnt = gsr::widescreen::read_io16(io, 0x0Cu);
+    row.bg3cnt = gsr::widescreen::read_io16(io, 0x0Eu);
+    row.bg0_hofs = gsr::widescreen::read_io16(io, 0x10u);
+    row.bg0_vofs = gsr::widescreen::read_io16(io, 0x12u);
+    row.bg1_hofs = gsr::widescreen::read_io16(io, 0x14u);
+    row.bg1_vofs = gsr::widescreen::read_io16(io, 0x16u);
+    row.bg2_hofs = gsr::widescreen::read_io16(io, 0x18u);
+    row.bg2_vofs = gsr::widescreen::read_io16(io, 0x1Au);
+    row.bg3_hofs = gsr::widescreen::read_io16(io, 0x1Cu);
+    row.bg3_vofs = gsr::widescreen::read_io16(io, 0x1Eu);
+    row.margin_reason = static_cast<std::uint8_t>(reason);
+    row.split_reason = static_cast<std::uint8_t>(split_reason);
+    row.flags = static_cast<std::uint8_t>(flags);
+    row.map_crc = map_crc;
+    row.raw_crc = raw_crc;
+    row.auth_epoch = g_golden_sun_field_auth_epoch;
+    g_golden_sun_wide_scroll_trace[
+        g_golden_sun_wide_scroll_trace_count % kGoldenSunWideScrollTraceCap] =
+        row;
+    ++g_golden_sun_wide_scroll_trace_count;
+}
+
+// Bounded ring flush, same discipline as hang_trace.csv in
+// gbarecomp/src/runtime/runtime_bus_bridge.cpp: metadata-only rows written
+// once at exit from the always-collected in-memory ring.
+void write_golden_sun_wide_scroll_trace_csv() {
+    if (!golden_sun_wide_diagnostics_enabled() ||
+        g_golden_sun_wide_scroll_trace_count == 0u) return;
+    FILE* f = std::fopen("wide_scroll_trace.csv", "w");
+    if (!f) return;
+    std::fprintf(f,
+        "frame,dispcnt,bg0cnt,bg1cnt,bg2cnt,bg3cnt,"
+        "bg0_hofs,bg0_vofs,bg1_hofs,bg1_vofs,bg2_hofs,bg2_vofs,"
+        "bg3_hofs,bg3_vofs,margin_reason,split_reason,flags,"
+        "map_crc,raw_crc,auth_epoch\n");
+    const std::uint64_t count = std::min<std::uint64_t>(
+        g_golden_sun_wide_scroll_trace_count, kGoldenSunWideScrollTraceCap);
+    const std::uint64_t start = g_golden_sun_wide_scroll_trace_count > count
+        ? g_golden_sun_wide_scroll_trace_count % kGoldenSunWideScrollTraceCap
+        : 0u;
+    for (std::uint64_t i = 0; i < count; ++i) {
+        const auto& row = g_golden_sun_wide_scroll_trace[
+            (start + i) % kGoldenSunWideScrollTraceCap];
+        std::fprintf(f,
+            "%llu,0x%04x,0x%04x,0x%04x,0x%04x,0x%04x,"
+            "0x%04x,0x%04x,0x%04x,0x%04x,0x%04x,0x%04x,0x%04x,0x%04x,"
+            "%s,%s,0x%x,0x%08x,0x%08x,%llu\n",
+            static_cast<unsigned long long>(row.frame), row.dispcnt,
+            row.bg0cnt, row.bg1cnt, row.bg2cnt, row.bg3cnt,
+            row.bg0_hofs, row.bg0_vofs, row.bg1_hofs, row.bg1_vofs,
+            row.bg2_hofs, row.bg2_vofs, row.bg3_hofs, row.bg3_vofs,
+            golden_sun_wide_policy_reason_name(
+                static_cast<GoldenSunWidePolicyReason>(row.margin_reason)),
+            golden_sun_wide_policy_reason_name(
+                static_cast<GoldenSunWidePolicyReason>(row.split_reason)),
+            row.flags, row.map_crc, row.raw_crc,
+            static_cast<unsigned long long>(row.auth_epoch));
+    }
+    std::fclose(f);
+    std::fprintf(stderr,
+        "[wide-scroll-trace] wrote wide_scroll_trace.csv (%llu of %llu "
+        "frame rows, ring cap %zu)\n",
+        static_cast<unsigned long long>(count),
+        static_cast<unsigned long long>(g_golden_sun_wide_scroll_trace_count),
+        kGoldenSunWideScrollTraceCap);
 }
 
 void maybe_report_golden_sun_cull_trace();
@@ -1206,20 +4693,28 @@ unsigned golden_sun_wide_margin_policy_callback(
     g_golden_sun_mode0_field =
         reason == GoldenSunWidePolicyReason::AuthorizedMode0;
     g_golden_sun_mode0_split_scroll = split_frame_authorized;
-    // The metatile table's "authored" bitmap is keyed to this exact scene
-    // signal: every area entry passes through a non-field frame (loading,
-    // fade, or a differently-classified scene), so clearing here on the way
-    // out reliably invalidates stale content before the new area's row/
-    // column writers repopulate it. Edge-detected so the (2KiB) clear runs
-    // once per transition, not every non-field scanline.
-    if (!g_golden_sun_mode0_field) {
-        if (!g_golden_sun_field_authored_reset_done) {
-            g_golden_sun_field_authored.reset();
-            begin_golden_sun_field_auth_epoch();
-            g_golden_sun_field_authored_reset_done = true;
-        }
+    if (!split_frame_authorized) {
+        const bool had_palace_cache =
+            g_golden_sun_palace_table_authorized ||
+            g_golden_sun_palace_region_scroll_valid ||
+            g_golden_sun_palace_region_build_attempted;
+        g_golden_sun_palace_table_authorized = false;
+        if (had_palace_cache) reset_golden_sun_palace_active_region();
     } else {
-        g_golden_sun_field_authored_reset_done = false;
+        refresh_golden_sun_palace_table_authorization();
+    }
+    // The metatile table's "authored" bitmap is keyed to this exact scene
+    // signal. Clear it on every field/split/non-field transition so restored
+    // contents cannot authorize a new scene.
+    const GoldenSunFieldAuthScene auth_scene =
+        g_golden_sun_mode0_field
+            ? GoldenSunFieldAuthScene::EqualScroll
+            : split_row ? GoldenSunFieldAuthScene::SplitScroll
+                        : GoldenSunFieldAuthScene::None;
+    if (auth_scene != g_golden_sun_field_auth_scene) {
+        g_golden_sun_field_authored.reset();
+        begin_golden_sun_field_auth_epoch();
+        g_golden_sun_field_auth_scene = auth_scene;
     }
     // Func_b168 is measured in both the equal-scroll field and the two stable
     // Palace intervals. Keep object authorization narrower than generic Mode 0
@@ -1229,6 +4724,7 @@ unsigned golden_sun_wide_margin_policy_callback(
     const GoldenSunWidePolicyReason effective_reason = split_frame_authorized
         ? split_reason : reason;
     trace_golden_sun_wide_policy(dispcnt, io, flags, effective_reason);
+    trace_golden_sun_wide_scroll_row(dispcnt, io, reason, split_reason, flags);
     return flags;
 }
 
@@ -1236,7 +4732,8 @@ int golden_sun_wide_tilemap_provider(int bg, int hw_x, int screen_y,
                                      std::uint16_t* out_entry) {
     const gba::GbaBus* bus = gbarecomp::active_bus();
     const bool equal_scroll_field = g_golden_sun_mode0_field;
-    const bool split_scroll_palace = g_golden_sun_mode0_split_scroll;
+    const bool split_scroll_palace = g_golden_sun_mode0_split_scroll &&
+        g_golden_sun_palace_table_authorized;
 
     GoldenSunFieldProviderTrace* trace = nullptr;
     if (golden_sun_wide_diagnostics_enabled() && bg >= 0 && bg < 4) {
@@ -1280,11 +4777,18 @@ int golden_sun_wide_tilemap_provider(int bg, int hw_x, int screen_y,
         return reject(true, false, false, false);
     }
     trace_golden_sun_field_map(bus->ewram_ptr());
+    if (split_scroll_palace) {
+        // The active-region cache is constructed only after the exact Palace
+        // table fingerprint has authorized this scene.  A missing seed or a
+        // stale cache therefore fails closed for every Palace layer.
+        prepare_golden_sun_palace_active_region(
+            bus, g_golden_sun_wide_line_io.data());
+    }
 
     if (equal_scroll_field) {
-        // If BG3 says this coordinate is un-authored, suppress every equal-
-        // scroll field BG here. Otherwise BG1/BG2 can expose unrelated atlas
-        // tiles underneath the rejected BG3 sample.
+        // BG3 remains the cross-layer boundary oracle for equal-scroll field
+        // maps. Authored ownership is intentionally not required here because
+        // restored tables may have no post-restore bitmap bits.
         std::uint16_t boundary_entry = 0;
         gsr::widescreen::GoldenSunFieldTilemapMetadata boundary_metadata;
         const bool boundary_resolved =
@@ -1293,7 +4797,7 @@ int golden_sun_wide_tilemap_provider(int bg, int hw_x, int screen_y,
                 g_golden_sun_wide_line_io.data(),
                 g_golden_sun_wide_line_io.size(), bus->ewram_ptr(),
                 256u * 1024u, 3, hw_x, screen_y, &boundary_entry,
-                &boundary_metadata);  // authored-gate disabled: see below.
+                &boundary_metadata, nullptr);
         if (gsr::widescreen::golden_sun_field_atlas_unavailable(
                 boundary_metadata)) {
             return reject(false, true, true, false);
@@ -1301,6 +4805,9 @@ int golden_sun_wide_tilemap_provider(int bg, int hw_x, int screen_y,
 
         if (bg == 3) {
             if (boundary_resolved) *out_entry = boundary_entry;
+            if (boundary_resolved)
+                record_golden_sun_field_map_id_attribution(
+                    bg, hw_x, screen_y, boundary_metadata);
             return boundary_resolved ? replace()
                                      : reject(false, false, false, true);
         }
@@ -1313,12 +4820,42 @@ int golden_sun_wide_tilemap_provider(int bg, int hw_x, int screen_y,
                 g_golden_sun_wide_line_io.size(), bus->ewram_ptr(),
                 256u * 1024u, bg, hw_x, screen_y, out_entry, &metadata,
                 nullptr, false, split_scroll_palace);
+    const auto record_palace = [&](GoldenSunPalaceMarginOutcome outcome) {
+        if (split_scroll_palace)
+            g_golden_sun_palace_margin_diagnostics.record(
+                bg, hw_x, screen_y, outcome, metadata,
+                resolved || metadata.has_raw_entry);
+    };
     // Equal-scroll BG3 is the cross-layer boundary oracle above. Palace's
     // split-scroll class deliberately does not use BG3 for BG1/BG2; every
     // layer still rejects its own measured unavailable source and bad bounds.
     if (gsr::widescreen::golden_sun_field_atlas_unavailable(metadata)) {
+        if (split_scroll_palace)
+            record_palace(metadata.map_id == gsr::widescreen::kGoldenSunPalaceNoMapId
+                              ? GoldenSunPalaceMarginOutcome::RejectedFill
+                              : GoldenSunPalaceMarginOutcome::RejectedRaw);
         return reject(false, false, true, false);
     }
+    if (split_scroll_palace &&
+        !g_golden_sun_palace_active_region.reachable(
+            bg, metadata.map_x, metadata.map_y)) {
+        record_palace(metadata.map_id == gsr::widescreen::kGoldenSunPalaceNoMapId
+                          ? GoldenSunPalaceMarginOutcome::RejectedFill
+                          : GoldenSunPalaceMarginOutcome::RejectedMask);
+        if (trace) ++trace->palace_region_rejects;
+        return reject(false, true, false, false);
+    }
+    if (split_scroll_palace && resolved) {
+        record_palace(g_golden_sun_palace_active_region.seeded(
+                          bg, metadata.map_x, metadata.map_y)
+                          ? GoldenSunPalaceMarginOutcome::AcceptedNativeSeed
+                          : GoldenSunPalaceMarginOutcome::AcceptedConnected);
+    } else if (split_scroll_palace) {
+        record_palace(GoldenSunPalaceMarginOutcome::RejectedLookup);
+    }
+    if (resolved)
+        record_golden_sun_field_map_id_attribution(
+            bg, hw_x, screen_y, metadata);
     return resolved ? replace() : reject(false, false, false, true);
 }
 
@@ -1362,84 +4899,535 @@ int golden_sun_wide_obj_x_provider(int raw_x, int* out_x) {
 }
 
 void clear_golden_sun_obj_y_provenance() {
-    g_golden_sun_obj_y_provenance.fill({});
+    g_golden_sun_obj_pending_provenance.fill({});
+    g_golden_sun_obj_visible_provenance.fill({});
+    g_golden_sun_obj_staging_provenance.fill({});
+    g_golden_sun_obj_f0_contexts.fill({});
+    g_golden_sun_obj_f0_context_frame = UINT64_MAX;
+    g_golden_sun_obj_y_edge_alias_state.fill({});
+    g_golden_sun_experimental_cull_last.fill({});
+    g_golden_sun_experimental_cull_logs = 0;
+    g_golden_sun_experimental_cull_logs_dropped = 0;
 }
 
-void record_golden_sun_obj_y_provenance(std::uint32_t instruction_pc,
-                                        std::uint32_t pre_truncation_y) {
-    if (!g_ws_active || !g_golden_sun_expanded_obj_scene ||
-        g_golden_sun_wide_extra_bottom == 0u ||
-        (instruction_pc != 0x0800B27Cu &&
-         instruction_pc != 0x0800B326u)) {
-        return;
+GoldenSunObjStagingProvenance* find_golden_sun_obj_staging(
+    std::uint32_t staging_address) {
+    for (auto& candidate : g_golden_sun_obj_staging_provenance) {
+        if (candidate.valid && candidate.staging_address == staging_address)
+            return &candidate;
     }
-    const int limit = gsr::widescreen::golden_sun_field_obj_bottom_cull_limit(
-        g_golden_sun_wide_extra_bottom);
-    if (pre_truncation_y < gsr::widescreen::kNativeHeight ||
-        pre_truncation_y > static_cast<std::uint32_t>(limit)) {
-        return;
+    return nullptr;
+}
+
+GoldenSunObjStagingProvenance* allocate_golden_sun_obj_staging(
+    std::uint32_t staging_address) {
+    if (auto* existing = find_golden_sun_obj_staging(staging_address))
+        return existing;
+    for (auto& candidate : g_golden_sun_obj_staging_provenance) {
+        if (!candidate.valid) {
+            candidate.staging_address = staging_address;
+            return &candidate;
+        }
     }
-    const std::uint64_t address = static_cast<std::uint64_t>(g_cpu.R[7]) +
-        (instruction_pc == 0x0800B27Cu ? 16u : 4u);
-    if (address > UINT32_MAX) return;
-    const int slot = gsr::widescreen::golden_sun_oam_shadow_slot(
-        static_cast<std::uint32_t>(address));
+    // The guest normally uses only a small prefix of this bounded table. If
+    // it ever fills, recycle the oldest entry rather than aliasing a record.
+    auto* oldest = &g_golden_sun_obj_staging_provenance.front();
+    for (auto& candidate : g_golden_sun_obj_staging_provenance) {
+        if (candidate.frame < oldest->frame) oldest = &candidate;
+    }
+    *oldest = {};
+    oldest->staging_address = staging_address;
+    return oldest;
+}
+
+void record_golden_sun_obj_staging(std::uint32_t instruction_pc,
+                                   bool x_axis, int logical_coordinate) {
+    if (!golden_sun_expanded_obj_view_active()) return;
+    auto* staging = allocate_golden_sun_obj_staging(g_cpu.R[7]);
+    if (!staging) return;
+    staging->valid = true;
+    staging->frame = runtime_current_frame();
+    staging->auth_epoch = g_golden_sun_field_auth_epoch;
+    if (x_axis) {
+        staging->x_valid = true;
+        staging->logical_x = static_cast<std::int16_t>(logical_coordinate);
+        staging->x_writer_branch_pc = instruction_pc;
+    } else {
+        staging->y_valid = true;
+        staging->logical_y = static_cast<std::int16_t>(logical_coordinate);
+        staging->y_writer_branch_pc = instruction_pc;
+        if (instruction_pc == 0x0800B328u && logical_coordinate >= 160 &&
+            logical_coordinate <= 199) {
+            staging->y_correlation = capture_golden_sun_obj_y_correlation(
+                logical_coordinate);
+        } else {
+            staging->y_correlation = {};
+        }
+    }
+    if (golden_sun_wide_diagnostics_enabled() &&
+        g_golden_sun_obj_y_provenance_logs_in_epoch <
+            kGoldenSunObjYProvenanceLogLimitPerEpoch) {
+        ++g_golden_sun_obj_y_provenance_logs_in_epoch;
+        std::fprintf(stderr,
+                     "[wide-obj-stage] frame=%llu auth_epoch=%llu "
+                     "branch_pc=0x%08x axis=%c staging=0x%08x logical=%d\n",
+                     static_cast<unsigned long long>(staging->frame),
+                     static_cast<unsigned long long>(staging->auth_epoch),
+                     instruction_pc, x_axis ? 'x' : 'y',
+                     staging->staging_address, logical_coordinate);
+    }
+}
+
+void clear_golden_sun_obj_staging(std::uint32_t staging_address) {
+    if (auto* staging = find_golden_sun_obj_staging(staging_address))
+        *staging = {};
+}
+
+bool read_golden_sun_obj_staging_attrs(std::uint32_t address,
+                                       std::uint16_t* attr0,
+                                       std::uint16_t* attr1,
+                                       std::uint16_t* attr2) {
+    constexpr std::uint32_t kIwramStart = 0x03000000u;
+    constexpr std::uint32_t kIwramEnd = 0x03008000u;
+    constexpr std::uint32_t kRecordBytes = 12u;
+    if (!attr0 || !attr1 || !attr2 || (address & 3u) != 0u ||
+        address < kIwramStart || address > kIwramEnd - kRecordBytes)
+        return false;
+    const std::uint32_t record_word1 = bus_read_u32(address + 4u);
+    const std::uint32_t record_word2 = bus_read_u32(address + 8u);
+    *attr0 = static_cast<std::uint16_t>(record_word1 & 0xFFFFu);
+    *attr1 = static_cast<std::uint16_t>(record_word1 >> 16);
+    *attr2 = static_cast<std::uint16_t>(record_word2 & 0xFFFFu);
+    return true;
+}
+
+void golden_sun_obj_staging_handoff(std::uint32_t entry_pc) {
+    // D4 loads {R6,R7,R8} from the staging record in R6, then its following
+    // store writes R7/R8 to the OAM-shadow destination in R0.
+    if (!golden_sun_func1dc8_writer_pc(
+            entry_pc, gsr::Func1dc8WriterRoute::D4) ||
+        !golden_sun_expanded_obj_view_active())
+        return;
+    const std::uint32_t staging_address = g_cpu.R[6];
+    const int slot = gsr::widescreen::golden_sun_oam_shadow_slot(g_cpu.R[0]);
+    std::uint16_t observed_attr0 = 0;
+    std::uint16_t observed_attr1 = 0;
+    std::uint16_t observed_attr2 = 0;
+    const bool observed_attrs_valid = read_golden_sun_obj_staging_attrs(
+        staging_address, &observed_attr0, &observed_attr1, &observed_attr2);
+    record_golden_sun_b328_rejected_writer(
+        GoldenSunObjB328WriterRoute::D4, staging_address, slot,
+        observed_attr0, observed_attr1, observed_attr2,
+        runtime_current_frame(), runtime_call_stack_depth(),
+        golden_sun_obj_call_return_pc(runtime_call_stack_depth()), 0u);
+    auto* staging = find_golden_sun_obj_staging(staging_address);
+    if (!staging || !staging->valid || staging->auth_epoch !=
+        g_golden_sun_field_auth_epoch ||
+        staging->frame != runtime_current_frame()) return;
     if (slot < 0 || static_cast<std::size_t>(slot) >=
-                         g_golden_sun_obj_y_provenance.size()) {
-        return;
+                         g_golden_sun_obj_pending_provenance.size()) return;
+    auto& output = g_golden_sun_obj_pending_provenance[
+        static_cast<std::size_t>(slot)];
+
+    // The authenticated D4 entry executes `ldmia r6!, {r6,r7,r8}` before its
+    // following store
+    // R7/R8 as the two OAM words. Read that exact 12-byte IWRAM record at the
+    // entry seam, with bounds/alignment checks, so the provenance cannot be
+    // reused for a later slot occupant. Word 0 is the record's working value;
+    // words 1/2 are ATTR0|ATTR1 and ATTR2|padding respectively.
+    std::uint16_t expected_attr0 = observed_attr0;
+    std::uint16_t expected_attr1 = observed_attr1;
+    std::uint16_t expected_attr2 = observed_attr2;
+    const bool oam_identity_valid = observed_attrs_valid;
+    output.valid = staging->x_valid || staging->y_valid;
+    output.x_valid = staging->x_valid;
+    output.y_valid = staging->y_valid;
+    output.logical_x = staging->logical_x;
+    output.logical_y = staging->logical_y;
+    output.frame = staging->frame;
+    output.auth_epoch = staging->auth_epoch;
+    output.writer_branch_pc = staging->y_writer_branch_pc;
+    output.target_address = g_cpu.R[0];
+    output.writer_generation = 0;
+    output.oam_identity_valid = oam_identity_valid;
+    output.expected_attr0 = expected_attr0;
+    output.expected_attr1 = expected_attr1;
+    output.expected_attr2 = expected_attr2;
+    record_golden_sun_b328_handoff(
+        staging_address, staging->frame, oam_identity_valid);
+    note_golden_sun_obj_commit_order(
+        GoldenSunObjCommitOrderRoute::D4, staging_address, slot,
+        expected_attr0, expected_attr1, expected_attr2, staging->x_valid,
+        staging->logical_x, staging->y_valid, staging->logical_y);
+    if (oam_identity_valid) {
+        trace_golden_sun_obj_y_correlation(
+            staging->y_correlation, staging_address, slot, expected_attr0,
+            expected_attr1, expected_attr2);
     }
-    GoldenSunObjYProvenance& provenance =
-        g_golden_sun_obj_y_provenance[static_cast<std::size_t>(slot)];
-    provenance.valid = true;
-    provenance.raw_y = static_cast<std::uint8_t>(pre_truncation_y);
-    provenance.frame = runtime_current_frame();
-    provenance.auth_epoch = g_golden_sun_field_auth_epoch;
+    if (golden_sun_wide_diagnostics_enabled() &&
+        g_golden_sun_obj_y_provenance_logs_in_epoch <
+            kGoldenSunObjYProvenanceLogLimitPerEpoch) {
+        ++g_golden_sun_obj_y_provenance_logs_in_epoch;
+        std::fprintf(stderr,
+                     "[wide-obj-handoff] frame=%llu auth_epoch=%llu "
+                     "staging=0x%08x destination=0x%08x slot=%d "
+                     "x_valid=%u logical_x=%d y_valid=%u logical_y=%d\n",
+                     static_cast<unsigned long long>(runtime_current_frame()),
+                     static_cast<unsigned long long>(g_golden_sun_field_auth_epoch),
+                     staging_address, g_cpu.R[0], slot,
+                     staging->x_valid ? 1u : 0u,
+                     static_cast<int>(staging->logical_x),
+                     staging->y_valid ? 1u : 0u,
+                     static_cast<int>(staging->logical_y));
+    }
+}
+
+void trace_golden_sun_obj_y_attempt(std::uint32_t instruction_pc,
+                                    const char* reason,
+                                    std::uint32_t candidate_y,
+                                    std::uint32_t address,
+                                    bool address_valid, int slot) {
+    if (!golden_sun_wide_diagnostics_enabled() ||
+        g_golden_sun_obj_y_provenance_logs_in_epoch >=
+            kGoldenSunObjYProvenanceLogLimitPerEpoch) return;
+    ++g_golden_sun_obj_y_provenance_logs_in_epoch;
+    std::fprintf(stderr,
+                 "[wide-obj-y] frame=%llu auth_epoch=%llu reason=%s "
+                 "branch_pc=0x%08x r7=0x%08x address=0x%08x "
+                 "address_valid=%u slot=%d candidate_y=%u scene=%u "
+                 "geometry=active:%u,top:%u,bottom:%u\n",
+                 static_cast<unsigned long long>(runtime_current_frame()),
+                 static_cast<unsigned long long>(g_golden_sun_field_auth_epoch),
+                 reason, instruction_pc, g_cpu.R[7], address,
+                 address_valid ? 1u : 0u, slot, candidate_y,
+                 g_golden_sun_expanded_obj_scene ? 1u : 0u,
+                 g_ws_active ? 1u : 0u, g_golden_sun_wide_extra_top,
+                 g_golden_sun_wide_extra_bottom);
+}
+
+int golden_sun_obj_oam_truncated(int logical, int bits) {
+    const int modulus = 1 << bits;
+    int result = logical % modulus;
+    if (result < 0) result += modulus;
+    return result;
+}
+
+void record_golden_sun_obj_y_transition(
+    int slot, int raw_y, int canonical_y, int output_y,
+    GoldenSunObjYTransitionResolution resolution,
+    GoldenSunObjYTransitionReason reason,
+    const GoldenSunObjPlacementProvenance& provenance,
+    std::uint16_t attr0, std::uint16_t attr1, std::uint16_t attr2) {
+    if (!golden_sun_wide_diagnostics_enabled() || raw_y < 159 ||
+        raw_y > 199 || slot < 0 || static_cast<std::size_t>(slot) >=
+            gsr::widescreen::kGoldenSunOamShadowSlotCount) return;
+    const auto region = golden_sun_obj_y_transition_region(output_y);
+    auto& count = g_golden_sun_obj_y_transition_counts[
+        static_cast<std::size_t>(reason)][static_cast<std::size_t>(region)]
+        [static_cast<std::size_t>(resolution)];
+    ++count;
+
+    // ATTR0=0 and the hardware disabled bit identify empty/disabled OAM;
+    // 0x00C0 is the measured dormant entry. Do not spend reserved evidence
+    // budget on those slots, while retaining the uncapped aggregate above.
+    const bool affine = (attr0 & 0x0100u) != 0u;
+    const bool disabled = !affine && (attr0 & 0x0200u) != 0u;
+    if ((attr0 == 0u && attr1 == 0u && attr2 == 0u) ||
+        attr0 == 0x00C0u || disabled)
+        return;
+
+    const std::uint32_t expected_target =
+        gsr::widescreen::kGoldenSunOamShadowStart +
+        static_cast<std::uint32_t>(slot) *
+            gsr::widescreen::kGoldenSunOamShadowSlotBytes;
+    GoldenSunObjYTransitionSample sample{};
+    sample.valid = true;
+    sample.frame = runtime_current_frame();
+    sample.slot = slot;
+    sample.raw_y = raw_y;
+    sample.canonical_y = canonical_y;
+    sample.output_y = output_y;
+    sample.resolution = resolution;
+    sample.reason = reason;
+    sample.region = region;
+    sample.attr0 = attr0;
+    sample.attr1 = attr1;
+    sample.attr2 = attr2;
+    sample.expected_attr0 = provenance.expected_attr0;
+    sample.expected_attr1 = provenance.expected_attr1;
+    sample.expected_attr2 = provenance.expected_attr2;
+    sample.expected_target = expected_target;
+    sample.provenance_frame = provenance.frame;
+    sample.provenance_epoch = provenance.auth_epoch;
+    sample.target_address = provenance.target_address;
+    sample.writer_pc = provenance.writer_branch_pc;
+    sample.writer_generation = provenance.writer_generation;
+
+    const GoldenSunObjYTransitionIdentity identity{
+        true, slot, expected_target, attr0, attr1, attr2,
+        provenance.expected_attr0, provenance.expected_attr1,
+        provenance.expected_attr2};
+    const auto identity_matches = [](const GoldenSunObjYTransitionIdentity& a,
+                                     const GoldenSunObjYTransitionIdentity& b) {
+        return a.valid && b.valid && a.slot == b.slot &&
+            a.target == b.target && a.attr0 == b.attr0 &&
+            a.attr1 == b.attr1 && a.attr2 == b.attr2 &&
+            a.expected_attr0 == b.expected_attr0 &&
+            a.expected_attr1 == b.expected_attr1 &&
+            a.expected_attr2 == b.expected_attr2;
+    };
+    const auto append_sample = [&](GoldenSunObjYTransitionBucket bucket) {
+        const auto bucket_index = static_cast<std::size_t>(bucket);
+        auto& sample_count = g_golden_sun_obj_y_transition_sample_counts[
+            bucket_index];
+        if (sample_count >= kGoldenSunObjYTransitionSampleLimit) {
+            ++g_golden_sun_obj_y_transition_samples_dropped[bucket_index];
+            return;
+        }
+        g_golden_sun_obj_y_transition_samples[bucket_index][sample_count++] =
+            sample;
+    };
+
+    // Buckets A and B are first-sample-per stable hardware identity. Their
+    // independent caps ensure top-wrap candidates cannot starve signed-bottom
+    // evidence.
+    const auto append_first_identity = [&](GoldenSunObjYTransitionBucket bucket) {
+        const auto seen_index = bucket ==
+            GoldenSunObjYTransitionBucket::ActiveCandidateCanonical ? 0u : 1u;
+        for (unsigned i = 0; i < g_golden_sun_obj_y_transition_seen_counts[
+                 seen_index]; ++i) {
+            if (identity_matches(g_golden_sun_obj_y_transition_seen[seen_index][i],
+                                 identity)) return;
+        }
+        auto& seen_count = g_golden_sun_obj_y_transition_seen_counts[seen_index];
+        if (seen_count < kGoldenSunObjYTransitionSampleLimit)
+            g_golden_sun_obj_y_transition_seen[seen_index][seen_count++] = identity;
+        append_sample(bucket);
+    };
+
+    if (resolution == GoldenSunObjYTransitionResolution::Canonical) {
+        append_first_identity(
+            GoldenSunObjYTransitionBucket::ActiveCandidateCanonical);
+    } else if (resolution == GoldenSunObjYTransitionResolution::Signed &&
+               region == GoldenSunObjYTransitionRegion::Bottom) {
+        append_first_identity(GoldenSunObjYTransitionBucket::SignedBottom);
+    }
+
+    // Bucket C records changes between canonical fallback and signed-bottom
+    // outcomes for the same slot/target. It intentionally does not define a
+    // semantic NPC identity beyond measured hardware fields.
+    if (resolution == GoldenSunObjYTransitionResolution::Canonical ||
+        (resolution == GoldenSunObjYTransitionResolution::Signed &&
+         region == GoldenSunObjYTransitionRegion::Bottom)) {
+        bool previous_found = false;
+        GoldenSunObjYTransitionOutcomeState* state = nullptr;
+        for (auto& candidate : g_golden_sun_obj_y_transition_outcome_states) {
+            if (candidate.valid && candidate.slot == slot &&
+                candidate.target == expected_target) {
+                state = &candidate;
+                previous_found = true;
+                break;
+            }
+        }
+        if (!state) {
+            for (auto& candidate : g_golden_sun_obj_y_transition_outcome_states) {
+                if (!candidate.valid) {
+                    candidate.valid = true;
+                    candidate.slot = slot;
+                    candidate.target = expected_target;
+                    state = &candidate;
+                    break;
+                }
+            }
+        }
+        if (state) {
+            if (previous_found && state->resolution != resolution)
+                append_sample(GoldenSunObjYTransitionBucket::OutcomeTransition);
+            state->resolution = resolution;
+        }
+    }
+}
+
+bool golden_sun_expanded_obj_view_active() {
+    return g_ws_active && gsr::widescreen::golden_sun_expanded_view_active(
+        gsr::widescreen::kExpandedWidth, gsr::widescreen::kExpandedHeight,
+        g_golden_sun_wide_extra_left, g_golden_sun_wide_extra_right,
+        g_golden_sun_wide_extra_top, g_golden_sun_wide_extra_bottom);
+}
+
+int golden_sun_wide_obj_attr_x_provider(int oam_index,
+                                        std::uint16_t attr0,
+                                        std::uint16_t attr1,
+                                        std::uint16_t attr2,
+                                        int* out_x) {
+    (void)attr0;
+    if (!golden_sun_expanded_obj_view_active() || !out_x || oam_index < 0 ||
+        static_cast<std::size_t>(oam_index) >=
+            g_golden_sun_obj_visible_provenance.size()) return 0;
+    const auto& provenance = g_golden_sun_obj_visible_provenance[
+        static_cast<std::size_t>(oam_index)];
+    const int raw_x = static_cast<int>(attr1 & 0x01FFu);
+    if (!provenance.valid || !provenance.x_valid ||
+        provenance.auth_epoch != g_golden_sun_field_auth_epoch ||
+        !gsr::widescreen::golden_sun_obj_provenance_attrs_match(
+            provenance.oam_identity_valid, provenance.expected_attr0,
+            provenance.expected_attr1, provenance.expected_attr2,
+            attr0, attr1, attr2) ||
+        golden_sun_obj_oam_truncated(provenance.logical_x, 9) != raw_x) return 0;
+    *out_x = provenance.logical_x;
+    return 1;
 }
 
 int golden_sun_wide_obj_attr_y_provider(int oam_index,
                                         std::uint16_t attr0,
-                                        std::uint16_t,
-                                        std::uint16_t,
+                                        std::uint16_t attr1,
+                                        std::uint16_t attr2,
                                         int* out_y) {
-    if (!g_ws_active || !g_golden_sun_expanded_obj_scene || !out_y ||
-        oam_index < 0 || static_cast<std::size_t>(oam_index) >=
-                              g_golden_sun_obj_y_provenance.size() ||
-        g_golden_sun_wide_extra_bottom == 0u) {
-        return 0;
-    }
+    const std::uint32_t diag_pc = 0u;
     const int raw_y = static_cast<int>(attr0 & 0x00FFu);
-    if (!gsr::widescreen::golden_sun_field_obj_y_expanded(
-            raw_y, g_golden_sun_wide_extra_top,
-            g_golden_sun_wide_extra_bottom)) {
+    if (!golden_sun_expanded_obj_view_active()) {
+        g_golden_sun_obj_y_edge_alias_state = {};
+        trace_golden_sun_obj_y_attempt(diag_pc, "scene-disabled",
+                                       attr0 & 0x00FFu, 0u, false, oam_index);
         return 0;
     }
-    const GoldenSunObjYProvenance& provenance =
-        g_golden_sun_obj_y_provenance[static_cast<std::size_t>(oam_index)];
-    if (!provenance.valid ||
-        !gsr::widescreen::golden_sun_obj_provenance_frame_fresh(
-            provenance.frame, runtime_current_frame()) ||
-        provenance.auth_epoch != g_golden_sun_field_auth_epoch ||
-        provenance.raw_y != static_cast<std::uint8_t>(raw_y)) {
+    const auto record_obj = [&](GoldenSunObjYOutcome outcome) {
+        record_golden_sun_obj_y_outcome(oam_index, raw_y, outcome);
+    };
+    if (!out_y) {
+        record_obj(GoldenSunObjYOutcome::OutputUnavailable);
+        trace_golden_sun_obj_y_attempt(diag_pc, "output-unavailable",
+                                       attr0 & 0x00FFu, 0u, false, oam_index);
         return 0;
     }
-    *out_y = raw_y;
-    return 1;
+    if (oam_index < 0 || static_cast<std::size_t>(oam_index) >=
+                              g_golden_sun_obj_visible_provenance.size()) {
+        trace_golden_sun_obj_y_attempt(diag_pc, "slot-rejected",
+                                       attr0 & 0x00FFu, 0u, false, oam_index);
+        return 0;
+    }
+    auto& provenance = g_golden_sun_obj_visible_provenance[
+        static_cast<std::size_t>(oam_index)];
+    const bool alias_candidate =
+        gsr::widescreen::golden_sun_obj_y_alias_candidate(
+            raw_y, provenance.logical_y);
+    if (alias_candidate) {
+        gba::vram_trace::OamAttr0Provenance attr_provenance{};
+        if (gba::vram_trace::get_oam_attr0_provenance(
+            static_cast<std::size_t>(oam_index), &attr_provenance)) {
+            provenance.writer_generation = attr_provenance.generation;
+        }
+    }
+    const bool provenance_epoch_matches =
+        provenance.auth_epoch == g_golden_sun_field_auth_epoch;
+    const bool provenance_raw_matches =
+        golden_sun_obj_oam_truncated(provenance.logical_y, 8) == raw_y;
+    const bool provenance_identity_matches =
+        gsr::widescreen::golden_sun_obj_provenance_attrs_match(
+            provenance.oam_identity_valid, provenance.expected_attr0,
+            provenance.expected_attr1, provenance.expected_attr2,
+            attr0, attr1, attr2);
+    const bool signed_provenance_matches =
+        provenance.valid && provenance.y_valid && provenance_epoch_matches &&
+        provenance_raw_matches && provenance_identity_matches;
+    const std::uint32_t expected_target =
+        gsr::widescreen::kGoldenSunOamShadowStart +
+        static_cast<std::uint32_t>(oam_index) *
+            gsr::widescreen::kGoldenSunOamShadowSlotBytes;
+    const bool affine = (attr0 & 0x0100u) != 0u;
+    const bool sprite_disabled = !affine && (attr0 & 0x0200u) != 0u;
+    const bool sprite_empty = attr0 == 0u && attr1 == 0u && attr2 == 0u;
+    const bool sprite_dormant = attr0 == 0x00C0u;
+    if (oam_index >= 0 && static_cast<std::size_t>(oam_index) <
+                              g_golden_sun_obj_y_edge_alias_state.size()) {
+        const auto sample = gsr::widescreen::GoldenSunObjYEdgeAliasSample{
+            true, !(sprite_disabled || sprite_empty || sprite_dormant),
+            signed_provenance_matches, oam_index, expected_target,
+            g_golden_sun_field_auth_epoch, runtime_current_frame(), raw_y,
+            raw_y >= 160 ? raw_y - 256 : raw_y, attr0, attr1, attr2};
+        auto& alias_state = g_golden_sun_obj_y_edge_alias_state[
+            static_cast<std::size_t>(oam_index)];
+        const auto alias_step =
+            gsr::widescreen::golden_sun_obj_y_edge_alias_step(
+                alias_state, sample);
+        alias_state = alias_step.state;
+        if (alias_step.activated) {
+            *out_y = -97;
+            trace_golden_sun_obj_y_edge_alias(
+                oam_index, expected_target, runtime_current_frame(),
+                g_golden_sun_field_auth_epoch, attr0, attr1, attr2);
+            return 1;
+        }
+    }
+    if (golden_sun_wide_diagnostics_enabled() && raw_y >= 159 &&
+        raw_y <= 199) {
+        const int canonical_y = raw_y >= 160 ? raw_y - 256 : raw_y;
+        const auto resolution = signed_provenance_matches
+            ? GoldenSunObjYTransitionResolution::Signed
+            : GoldenSunObjYTransitionResolution::Canonical;
+        const auto reason = classify_golden_sun_obj_y_transition(
+            provenance, runtime_current_frame(), g_golden_sun_field_auth_epoch,
+            gsr::widescreen::kGoldenSunOamShadowStart +
+                static_cast<std::uint32_t>(oam_index) *
+                    gsr::widescreen::kGoldenSunOamShadowSlotBytes,
+            raw_y, attr0, attr1, attr2);
+        record_golden_sun_obj_y_transition(
+            oam_index, raw_y, canonical_y,
+            signed_provenance_matches ? provenance.logical_y : canonical_y,
+            resolution, reason, provenance, attr0, attr1, attr2);
+    }
+    switch (gsr::widescreen::golden_sun_obj_y_resolution(
+        signed_provenance_matches)) {
+    case gsr::widescreen::GoldenSunObjYResolution::SignedProvenance:
+        *out_y = provenance.logical_y;
+        record_obj(GoldenSunObjYOutcome::AcceptedProvenance);
+        trace_golden_sun_obj_y_jump(
+            oam_index, raw_y, provenance.logical_y, provenance,
+            attr0, attr1, attr2);
+        trace_golden_sun_obj_y_alias(
+            provenance.logical_y < 0 ? "accepted-negative" :
+                                      "accepted-positive",
+            oam_index, raw_y, provenance.logical_y,
+            provenance, attr0, attr1, attr2, false);
+        return 1;
+    case gsr::widescreen::GoldenSunObjYResolution::Canonical:
+        record_obj(GoldenSunObjYOutcome::ProvenanceMissing);
+        if (provenance.valid && provenance.y_valid &&
+            gsr::widescreen::golden_sun_obj_y_alias_candidate(
+                raw_y, provenance.logical_y)) {
+            const char* reason = !provenance_epoch_matches
+                ? "canonical-provenance-stale-epoch"
+                : !provenance_raw_matches
+                ? "canonical-provenance-y-mismatch"
+                : !provenance_identity_matches
+                ? "canonical-provenance-oam-mismatch"
+                : "canonical-provenance-rejected";
+            trace_golden_sun_obj_y_alias(
+                reason, oam_index, raw_y, provenance.logical_y, provenance,
+                attr0, attr1, attr2, true);
+        }
+        return 0;
+    }
+    // Keep compilers that do not treat enum switches as exhaustive happy.
+    record_obj(GoldenSunObjYOutcome::ProvenanceMissing);
+    return 0;
 }
 
 struct GoldenSunCullTrace {
     std::uint32_t pc;
     // `calls` is the raw routed-PC count. It is intentionally recorded before
-    // the Mode-0/authentication guard so transition calls cannot disappear.
+    // the strict 360x240 policy guard so inactive modes remain visible.
     std::uint64_t calls = 0;
-    std::uint64_t overrides = 0;
-    std::uint64_t gate_rejects = 0;
+    std::uint64_t bypasses = 0;
+    std::uint64_t inactive_rejects = 0;
     std::int32_t min_coord = INT32_MAX;
     std::int32_t max_coord = INT32_MIN;
 };
 
-std::array<GoldenSunCullTrace, 6> g_golden_sun_cull_trace{{
-    {0x0800B27Cu}, {0x0800B322u}, {0x0800B326u},
-    {0x0800B3CAu}, {0x0800B3D6u}, {0x0800B3EAu},
+std::array<GoldenSunCullTrace, 10> g_golden_sun_cull_trace{{
+    {0x0800B27Eu}, {0x0800B324u}, {0x0800B328u},
+    {0x0800B3D2u}, {0x0800B3DCu}, {0x0800B3E6u}, {0x0800B3ECu},
+    {0x0800C6FAu}, {0x0800C702u}, {0x0800C708u},
 }};
 
 std::uint64_t g_golden_sun_cull_last_report_frame = UINT64_MAX;
@@ -1447,26 +5435,24 @@ std::uint64_t g_golden_sun_cull_last_report_frame = UINT64_MAX;
 void report_golden_sun_cull_trace(std::uint64_t frame,
                                   const char* reason) {
     if (!golden_sun_wide_diagnostics_enabled()) return;
-    // Emit every reviewed site, including zeroes. A zero for B3CA/B3D6/B3EA
-    // is evidence about the raw route rather than an artifact of the policy
-    // guard suppressing its counter.
+    // Emit every reviewed branch, including zeroes. A zero is evidence about
+    // the raw route rather than an artifact of the strict policy guard.
     for (const auto& stat : g_golden_sun_cull_trace) {
         const std::int32_t min_coord = stat.calls != 0u ? stat.min_coord : 0;
         const std::int32_t max_coord = stat.calls != 0u ? stat.max_coord : 0;
         std::fprintf(
             stderr,
-            "[wide-cull] frame=%llu auth_epoch=%llu reason=%s "
-            "pc=0x%08x calls=%llu overrides=%llu gate_rejects=%llu "
+            "[wide-branch] frame=%llu auth_epoch=%llu reason=%s "
+            "pc=0x%08x calls=%llu bypasses=%llu inactive_rejects=%llu "
             "coord=%d..%d\n",
             static_cast<unsigned long long>(frame),
             static_cast<unsigned long long>(g_golden_sun_field_auth_epoch),
             reason, stat.pc,
             static_cast<unsigned long long>(stat.calls),
-            static_cast<unsigned long long>(stat.overrides),
-            static_cast<unsigned long long>(stat.gate_rejects), min_coord,
+            static_cast<unsigned long long>(stat.bypasses),
+            static_cast<unsigned long long>(stat.inactive_rejects), min_coord,
             max_coord);
     }
-    report_golden_sun_literal_trace(frame, reason);
 }
 
 void begin_golden_sun_field_auth_epoch() {
@@ -1475,22 +5461,43 @@ void begin_golden_sun_field_auth_epoch() {
                                      "auth-epoch-end");
         report_golden_sun_field_provider_trace(runtime_current_frame(),
                                                "auth-epoch-end");
+        report_golden_sun_palace_margin_diagnostics(runtime_current_frame(),
+                                                    "auth-epoch-end");
+        report_golden_sun_obj_b328_diagnostics(runtime_current_frame(),
+                                               "auth-epoch-end");
+        report_golden_sun_obj_y_transition_diagnostics(
+            runtime_current_frame(), "auth-epoch-end");
+        report_golden_sun_obj_y_steady_state_diagnostics(runtime_current_frame(),
+                                                         "auth-epoch-end");
+        report_golden_sun_field_map_id_attribution(runtime_current_frame(),
+                                                   "auth-epoch-end");
         report_golden_sun_field_producers("auth-epoch-end");
+        report_golden_sun_obj_record_census("auth-epoch-end");
+        report_golden_sun_obj_record_values("auth-epoch-end");
+        report_golden_sun_obj_commit_order("auth-epoch-end");
     }
     clear_golden_sun_obj_y_provenance();
+    g_golden_sun_obj_y_provenance_logs_in_epoch = 0;
+    reset_golden_sun_obj_y_alias_diagnostics();
     reset_golden_sun_field_producers();
+    reset_golden_sun_obj_record_census();
+    reset_golden_sun_obj_record_value_events();
+    reset_golden_sun_obj_commit_order();
     g_golden_sun_field_provider_trace = {};
+    g_golden_sun_palace_margin_diagnostics.reset();
+    g_golden_sun_obj_y_slot_diagnostics = {};
+    g_golden_sun_field_map_id_attribution = {};
+    g_golden_sun_field_map_id_attribution_overflow = {};
     for (auto& stat : g_golden_sun_cull_trace) {
         const std::uint32_t pc = stat.pc;
         stat = {};
         stat.pc = pc;
     }
-    for (auto& stat : g_golden_sun_literal_trace) {
-        const std::uint32_t pc = stat.pc;
-        stat = {};
-        stat.pc = pc;
-    }
     ++g_golden_sun_field_auth_epoch;
+    g_golden_sun_palace_table_authorized = false;
+    g_golden_sun_palace_table_invalidated = false;
+    g_golden_sun_palace_table_auth_attempted = false;
+    reset_golden_sun_palace_active_region();
     g_golden_sun_field_epoch_map_writes = 0;
     g_golden_sun_field_epoch_raw_writes = 0;
     g_golden_sun_field_epoch_map_dma_writes = 0;
@@ -1498,6 +5505,9 @@ void begin_golden_sun_field_auth_epoch() {
     g_golden_sun_field_table_cpu_logs_in_epoch = 0;
     g_golden_sun_field_table_dma_logs_in_epoch = 0;
     const bool vram_rearmed = gba::vram_trace::rearm_bounded_window();
+    // OAM ATTR0 provenance is window-local just like the VRAM writer trace;
+    // do not let a prior authenticated scene contaminate the next handoff.
+    gba::vram_trace::reset_oam_trace_window();
     if (golden_sun_wide_diagnostics_enabled()) {
         std::fprintf(stderr,
                      "[wide-auth-epoch] frame=%llu auth_epoch=%llu "
@@ -1536,7 +5546,7 @@ void report_golden_sun_cull_trace_at_exit() {
 
 void record_golden_sun_cull_trace(std::uint32_t pc) {
     if (!golden_sun_wide_diagnostics_enabled()) return;
-    const int site = gsr::widescreen::golden_sun_cull_site_index(pc);
+    const int site = gsr::widescreen::golden_sun_viewport_branch_site_index(pc);
     if (site < 0 || static_cast<std::size_t>(site) >=
                          g_golden_sun_cull_trace.size()) {
         return;
@@ -1545,141 +5555,188 @@ void record_golden_sun_cull_trace(std::uint32_t pc) {
         static_cast<std::size_t>(site)];
     ++stat.calls;
     std::int32_t coord = 0;
-    if (pc == 0x0800B322u) coord = static_cast<std::int32_t>(g_cpu.R[4]);
-    else if (pc == 0x0800B27Cu || pc == 0x0800B326u)
+    if (pc == 0x0800B324u) coord = static_cast<std::int32_t>(g_cpu.R[4]);
+    else if (pc == 0x0800B27Eu || pc == 0x0800B328u)
         coord = static_cast<std::int32_t>(g_cpu.R[6]);
-    else if (pc == 0x0800B3D6u || pc == 0x0800B3EAu)
+    else if (pc == 0x0800B3D2u || pc == 0x0800B3DCu ||
+             pc == 0x0800B3E6u || pc == 0x0800B3ECu)
         coord = static_cast<std::int32_t>(g_cpu.R[3]);
+    else if (pc == 0x0800C6FAu)
+        coord = static_cast<std::int32_t>(g_cpu.R[3]);
+    else if (pc == 0x0800C702u || pc == 0x0800C708u)
+        coord = static_cast<std::int32_t>(g_cpu.R[2]);
     stat.min_coord = std::min(stat.min_coord, coord);
     stat.max_coord = std::max(stat.max_coord, coord);
 }
 
-void record_golden_sun_cull_gate_reject(std::uint32_t pc) {
+void record_golden_sun_cull_inactive_reject(std::uint32_t pc) {
     if (!golden_sun_wide_diagnostics_enabled()) return;
-    const int site = gsr::widescreen::golden_sun_cull_site_index(pc);
+    const int site = gsr::widescreen::golden_sun_viewport_branch_site_index(pc);
     if (site < 0 || static_cast<std::size_t>(site) >=
                          g_golden_sun_cull_trace.size()) {
         return;
     }
-    ++g_golden_sun_cull_trace[static_cast<std::size_t>(site)].gate_rejects;
+    ++g_golden_sun_cull_trace[static_cast<std::size_t>(site)].inactive_rejects;
 }
 
-void record_golden_sun_cull_override(std::uint32_t pc) {
+void record_golden_sun_cull_bypass(std::uint32_t pc) {
     if (!golden_sun_wide_diagnostics_enabled()) return;
-    const int site = gsr::widescreen::golden_sun_cull_site_index(pc);
+    const int site = gsr::widescreen::golden_sun_viewport_branch_site_index(pc);
     if (site < 0 || static_cast<std::size_t>(site) >=
                          g_golden_sun_cull_trace.size()) {
         return;
     }
-    ++g_golden_sun_cull_trace[static_cast<std::size_t>(site)].overrides;
+    ++g_golden_sun_cull_trace[static_cast<std::size_t>(site)].bypasses;
 }
 
-// Func_b168's final field-object cull is the THUMB `cmp r4,#239` at this
-// exact ROM PC. The recompiler config routes only that immediate through the
-// hook; every other compare remains a literal. The margin policy's live
-// Mode-0 field bit is the same scene authentication used by the BG provider,
-// so battle/UI/transition objects retain the guest cutoff.
-int golden_sun_wide_obj_cull_immediate(std::uint32_t instruction_pc,
-                                       std::uint32_t original_value,
-                                       std::uint32_t* out_value) {
-    constexpr std::uint32_t kFieldObjXCullPc = 0x0800B322u;
-    // Count the exact configured route before the policy guard. The raw
-    // invocation count is diagnostic only; it must remain visible when a
-    // transition (such as Palace) correctly rejects the Mode-0 classifier.
+int golden_sun_wide_conditional_branch(std::uint32_t instruction_pc,
+                                       std::uint32_t original_decision,
+                                       std::uint32_t* out_decision) {
     record_golden_sun_cull_trace(instruction_pc);
-    // The config contract is Mode-0 expanded-view only.  Keep the immediate
-    // widening fail-closed until the same live scene authentication used by
-    // the field tile/object providers is present; otherwise a menu, battle,
-    // or transition can write coordinates that the faithful scene rejects.
-    const bool x_authorized =
-        gsr::widescreen::golden_sun_field_obj_cull_authorized(
-            g_golden_sun_expanded_obj_scene, instruction_pc, original_value,
-            g_golden_sun_wide_extra_right);
-    const bool y_authorized =
-        gsr::widescreen::golden_sun_field_obj_y_cull_authorized(
-            g_golden_sun_expanded_obj_scene, instruction_pc, original_value,
-            g_golden_sun_wide_extra_bottom);
-    if (!g_ws_active || !out_value || (!x_authorized && !y_authorized)) {
-        record_golden_sun_cull_gate_reject(instruction_pc);
+    const std::uint32_t width = gsr::widescreen::kNativeWidth +
+        g_golden_sun_wide_extra_left + g_golden_sun_wide_extra_right;
+    const std::uint32_t height = gsr::widescreen::kNativeHeight +
+        g_golden_sun_wide_extra_top + g_golden_sun_wide_extra_bottom;
+    std::int32_t compared_operand = 0;
+    if (instruction_pc == 0x0800B324u) {
+        // Generated disassembly: B322 is `cmp r4,#239`; B324 consumes r4.
+        compared_operand = static_cast<std::int32_t>(g_cpu.R[4]);
+    } else if (instruction_pc == 0x0800B27Eu ||
+               instruction_pc == 0x0800B328u) {
+        // Generated disassembly: B27C/B326 are `cmp r6,#159`; both consume r6.
+        compared_operand = static_cast<std::int32_t>(g_cpu.R[6]);
+    } else if (instruction_pc == 0x0800B3D2u ||
+               instruction_pc == 0x0800B3DCu ||
+               instruction_pc == 0x0800B3E6u ||
+               instruction_pc == 0x0800B3ECu ||
+               instruction_pc == 0x0800C6FAu) {
+        // Func_b388 and C6FA consume signed r3 at their reviewed branches.
+        // C6FA's policy converts the preserved bit pattern back to unsigned.
+        compared_operand = static_cast<std::int32_t>(g_cpu.R[3]);
+    } else if (instruction_pc == 0x0800C702u ||
+               instruction_pc == 0x0800C708u) {
+        // Func_c62c's lower/upper Y routes consume signed r2.
+        compared_operand = static_cast<std::int32_t>(g_cpu.R[2]);
+    }
+    record_golden_sun_signed_y_cull(instruction_pc, compared_operand);
+    GoldenSunObjB328ParentClassification b328_classification =
+        GoldenSunObjB328ParentClassification::NoParent;
+    unsigned b328_mismatch_flags = 0u;
+    if (instruction_pc == 0x0800B328u &&
+        golden_sun_expanded_obj_view_active() && compared_operand >= 160 &&
+        compared_operand <= 199) {
+        const std::uint64_t frame = runtime_current_frame();
+        const std::uint32_t call_depth = runtime_call_stack_depth();
+        const std::uint32_t call_return_pc =
+            golden_sun_obj_call_return_pc(call_depth);
+        const auto classification = classify_golden_sun_b328_parent(
+            g_cpu.R[7], frame, call_depth, call_return_pc);
+        b328_classification = classification.classification;
+        b328_mismatch_flags = classification.mismatch_flags;
+        record_golden_sun_b328_classification(
+            compared_operand, classification, g_cpu.R[7], frame, call_depth,
+            call_return_pc);
+        if (b328_classification == GoldenSunObjB328ParentClassification::NoParent) {
+            record_golden_sun_b328_parentless_token(
+                frame, g_cpu.R[7], compared_operand, call_depth,
+                call_return_pc);
+        }
+    }
+    bool overridden = g_ws_active &&
+        gsr::widescreen::golden_sun_expanded_viewport_branch_override(
+            instruction_pc, original_decision, width, height,
+            g_golden_sun_wide_extra_left, g_golden_sun_wide_extra_right,
+            g_golden_sun_wide_extra_top, g_golden_sun_wide_extra_bottom,
+            compared_operand, out_decision);
+    if (!overridden && instruction_pc == 0x0800B328u) {
+        const std::uint64_t frame = runtime_current_frame();
+        const std::uint32_t call_depth = runtime_call_stack_depth();
+        const std::uint32_t call_return_pc =
+            golden_sun_obj_call_return_pc(call_depth);
+        const GoldenSunObjB27EParentRoute* parent =
+            find_golden_sun_current_b27e_parent(
+                g_cpu.R[7], frame, call_depth, call_return_pc);
+        if (parent) {
+            gsr::widescreen::GoldenSunObjB328ParentMatch match{};
+            match.valid = parent->valid;
+            match.staging_address = parent->staging_address;
+            match.frame = parent->frame;
+            match.call_depth = parent->call_depth;
+            match.call_return_pc = parent->call_return_pc;
+            match.original_decision = parent->original_decision;
+            match.final_decision = parent->final_decision;
+            match.overridden = parent->overridden;
+            overridden =
+                gsr::widescreen::golden_sun_b328_parent_override(
+                    golden_sun_expanded_obj_view_active(), original_decision,
+                    compared_operand, g_cpu.R[7], frame, call_depth,
+                    call_return_pc, match, out_decision);
+        }
+    }
+    if (instruction_pc == 0x0800B328u) {
+        const std::uint32_t final_decision =
+            overridden ? *out_decision : original_decision;
+        trace_golden_sun_obj_y_cull_decision(
+            original_decision, final_decision, overridden, compared_operand);
+        if (gsr::widescreen::golden_sun_obj_y_branch_writes_oam(
+                instruction_pc, original_decision, overridden,
+                final_decision)) {
+            record_golden_sun_b328_accepted_candidate(
+                compared_operand, b328_classification, g_cpu.R[7],
+                runtime_current_frame(), runtime_call_stack_depth(),
+                golden_sun_obj_call_return_pc(runtime_call_stack_depth()));
+        } else {
+            record_golden_sun_b328_rejected_candidate(
+                compared_operand, b328_classification, b328_mismatch_flags,
+                g_cpu.R[7], runtime_current_frame(),
+                runtime_call_stack_depth(),
+                golden_sun_obj_call_return_pc(runtime_call_stack_depth()));
+        }
+    }
+    if (golden_sun_expanded_obj_view_active() &&
+        instruction_pc == 0x0800B27Eu) {
+        const std::uint32_t final_decision =
+            overridden ? *out_decision : original_decision;
+        record_golden_sun_b27e_parent_route(
+            original_decision, overridden, final_decision, compared_operand);
+    }
+    // B324/B328 are the final staging-record route. B27E is an earlier
+    // decision point and does not itself write the record, so provenance must
+    // not be attached there.
+    const bool expanded_obj_view = golden_sun_expanded_obj_view_active();
+    if (expanded_obj_view && instruction_pc == 0x0800B324u &&
+        ((!overridden && !original_decision) ||
+         (overridden && *out_decision == 0u))) {
+        record_golden_sun_obj_staging(
+            instruction_pc, true, compared_operand);
+    }
+    if (expanded_obj_view && instruction_pc == 0x0800B328u &&
+        gsr::widescreen::golden_sun_obj_y_branch_writes_oam(
+            instruction_pc, original_decision, overridden,
+            overridden ? *out_decision : original_decision)) {
+        record_golden_sun_obj_staging(
+            instruction_pc, false, compared_operand);
+    }
+    // A rejected final Y branch means no staging record is written. Retire
+    // the X candidate captured at B324 so a later OAM slot cannot inherit it.
+    if (expanded_obj_view && instruction_pc == 0x0800B328u &&
+        !gsr::widescreen::golden_sun_obj_y_branch_writes_oam(
+            instruction_pc, original_decision, overridden,
+            overridden ? *out_decision : original_decision)) {
+        clear_golden_sun_obj_staging(g_cpu.R[7]);
+    }
+    if (!overridden) {
+        if (instruction_pc == 0x0800B27Eu || instruction_pc == 0x0800B328u) {
+            trace_golden_sun_obj_y_attempt(
+                instruction_pc, g_ws_active ? "branch-rejected" : "scene-disabled",
+                compared_operand < 0 ? 0u : static_cast<std::uint32_t>(compared_operand),
+                0u, false, -1);
+        }
+        record_golden_sun_cull_inactive_reject(instruction_pc);
         return 0;
     }
-    if (x_authorized && instruction_pc == kFieldObjXCullPc &&
-        original_value == 239u) {
-        *out_value = static_cast<std::uint32_t>(
-            gsr::widescreen::golden_sun_field_obj_right_cull_limit(
-                g_golden_sun_wide_extra_right));
-        record_golden_sun_cull_override(instruction_pc);
-        return 1;
-    }
-    if (y_authorized) {
-        *out_value = static_cast<std::uint32_t>(
-            gsr::widescreen::golden_sun_field_obj_bottom_cull_limit(
-                g_golden_sun_wide_extra_bottom));
-        // The compare sees the full screen Y before the accepted store
-        // truncates it to the low OAM byte. Record only this authenticated,
-        // address-validated producer so raw 160..255 can later be resolved
-        // without reinterpreting unrelated off-top sprites.
-        record_golden_sun_obj_y_provenance(instruction_pc, g_cpu.R[6]);
-        record_golden_sun_cull_override(instruction_pc);
-        return 1;
-    }
-    // 0x0800B27C/0x0800B326 are the only widened Y compares. B388 remains
-    // unchanged because its latest measured capture executed it zero times.
-    // The three Func_b388 routes remain installed for attribution, but the
-    // acceptance session executed none of them; do not infer a missing visual
-    // override from an unexecuted route.
-    return 0;
-}
-
-int golden_sun_wide_literal_override(std::uint32_t instruction_pc,
-                                     std::uint32_t original_value,
-                                     std::uint32_t* out_value) {
-    GoldenSunLiteralTrace* trace = nullptr;
-    const int trace_index = gsr::widescreen::golden_sun_literal_trace_index(
-        instruction_pc);
-    if (trace_index >= 0) {
-        trace = &g_golden_sun_literal_trace[static_cast<std::size_t>(
-            trace_index)];
-    }
-    const bool diagnostics = golden_sun_wide_diagnostics_enabled();
-    if (trace != nullptr && diagnostics) {
-        gsr::widescreen::golden_sun_literal_trace_call(*trace, original_value);
-    }
-    const auto gate_reject = [&] {
-        if (trace != nullptr && diagnostics) {
-            gsr::widescreen::golden_sun_literal_trace_gate_reject(*trace);
-        }
-        return 0;
-    };
-    const auto compare_reject = [&] {
-        if (trace != nullptr && diagnostics) {
-            gsr::widescreen::golden_sun_literal_trace_compare_reject(*trace);
-        }
-        return 0;
-    };
-    const auto accepted = [&] {
-        if (trace != nullptr && diagnostics) {
-            gsr::widescreen::golden_sun_literal_trace_override(*trace);
-        }
-        return 1;
-    };
-    if (!g_ws_active || !g_golden_sun_expanded_obj_scene || !out_value)
-        return gate_reject();
-    if (instruction_pc == gsr::widescreen::kFieldListXUpperLiteralPc) {
-        if (original_value != 0x012FFFFEu) return compare_reject();
-        if (g_golden_sun_wide_extra_right == 0u) return gate_reject();
-        *out_value = gsr::widescreen::golden_sun_field_list_x_upper_literal(
-            g_golden_sun_wide_extra_right);
-        return accepted();
-    }
-    if (instruction_pc == gsr::widescreen::kFieldListYLowerLiteralPc) {
-        if (original_value != 0xFFE00000u) return compare_reject();
-        if (g_golden_sun_wide_extra_top == 0u) return gate_reject();
-        *out_value = gsr::widescreen::golden_sun_field_list_y_lower_literal(
-            g_golden_sun_wide_extra_top);
-        return accepted();
-    }
-    return gate_reject();
+    record_golden_sun_cull_bypass(instruction_pc);
+    return 1;
 }
 
 void golden_sun_wide_ewram_write_observer(std::uint32_t address,
@@ -1687,11 +5744,29 @@ void golden_sun_wide_ewram_write_observer(std::uint32_t address,
     // DMA has descriptor-level provenance and must not be misreported as a
     // CPU store or establish authored-cell identity one copied unit at a time.
     if (gba::vram_trace::dma_active()) return;
-    // Keep this bitmap diagnostic-only. In particular, a loaded savestate can
-    // contain a populated table before any post-load CPU store repopulates
-    // the bitmap; the provider therefore remains explicitly unwired below.
+    invalidate_golden_sun_palace_table_if_overlapping(address, size);
+    // A loaded savestate can contain a populated table before any post-load
+    // CPU store repopulates the bitmap; the provider stays fail-closed until
+    // current-epoch CPU ownership is observed.
     g_golden_sun_field_authored.mark_write(address, size);
     record_golden_sun_field_table_write(address, size);
+}
+
+void golden_sun_fast_iwram_write_observer(std::uint32_t address,
+                                          std::uint32_t size,
+                                          std::uint32_t phase) {
+    if (phase == RUNTIME_FAST_IWRAM_WRITE_START) {
+        gba::vram_trace::trace_oam_shadow_write(g_cpu.R[15], address, size);
+        return;
+    }
+    gba::vram_trace::trace_oam_shadow_write_committed(
+        g_cpu.R[15], address, size);
+    // Fast generated IWRAM stores are already committed at this seam. Feed
+    // the CRASH-03 observer as a post-write bus-equivalent event so partial
+    // stores can be reconstructed from the live word.
+    note_golden_sun_obj_record_write(g_cpu.R[15], address, size);
+    note_golden_sun_obj_record_value(g_cpu.R[15], address, size);
+    runtime_note_pool_ldm_bus_write(address, size);
 }
 
 void install_golden_sun_widescreen(std::uint32_t extra_left,
@@ -1709,19 +5784,31 @@ void install_golden_sun_widescreen(std::uint32_t extra_left,
     g_golden_sun_mode0_split_scroll_frame.reset();
     g_golden_sun_expanded_obj_scene = false;
     clear_golden_sun_obj_y_provenance();
+    reset_golden_sun_func1dc8_writer_diagnostics();
+    g_golden_sun_obj_y_provenance_logs_in_epoch = 0;
+    reset_golden_sun_obj_y_alias_diagnostics();
     g_golden_sun_wide_line_io_valid = false;
     g_golden_sun_wide_line_dispcnt = 0;
     g_golden_sun_field_authored.reset();
-    g_golden_sun_field_authored_reset_done = true;
+    g_golden_sun_field_auth_scene = GoldenSunFieldAuthScene::None;
     g_golden_sun_wide_field_map_census.clear();
     g_golden_sun_wide_field_map_trace_frame = UINT64_MAX;
     g_golden_sun_field_auth_epoch = 0;
+    g_golden_sun_palace_table_authorized = false;
+    g_golden_sun_palace_table_invalidated = false;
+    g_golden_sun_palace_table_auth_attempted = false;
+    reset_golden_sun_palace_active_region();
     g_golden_sun_field_map_writes = {};
     g_golden_sun_field_raw_writes = {};
     g_golden_sun_field_map_dma_writes = {};
     g_golden_sun_field_raw_dma_writes = {};
     g_golden_sun_field_provider_trace = {};
+    g_golden_sun_field_map_id_attribution = {};
+    g_golden_sun_field_map_id_attribution_overflow = {};
     reset_golden_sun_field_producers();
+    reset_golden_sun_obj_record_census();
+    reset_golden_sun_obj_record_value_events();
+    reset_golden_sun_obj_commit_order();
     g_golden_sun_field_epoch_map_writes = 0;
     g_golden_sun_field_epoch_raw_writes = 0;
     g_golden_sun_field_epoch_map_dma_writes = 0;
@@ -1745,11 +5832,6 @@ void install_golden_sun_widescreen(std::uint32_t extra_left,
     g_golden_sun_margin_diagnostic_last_log_frame = UINT64_MAX;
     g_golden_sun_margin_diagnostic_total = {};
     g_golden_sun_margin_diagnostic_last = {};
-    for (auto& stat : g_golden_sun_literal_trace) {
-        const std::uint32_t pc = stat.pc;
-        stat = {};
-        stat.pc = pc;
-    }
     static bool cull_report_armed = false;
     if (!cull_report_armed) {
         cull_report_armed = true;
@@ -1766,28 +5848,30 @@ void install_golden_sun_widescreen(std::uint32_t extra_left,
         ? golden_sun_wide_margin_diagnostics_callback : nullptr;
     gba::g_ws_tilemap_provider = golden_sun_wide_tilemap_provider;
     gba::g_ws_bg_x_provider = golden_sun_wide_bg_x_provider;
-    gba::g_ws_obj_x_provider = golden_sun_wide_obj_x_provider;
-    // Do not install the old raw-Y provider: 160..255 is dual-use. The rich
-    // hook below only reinterprets a slot with fresh writer provenance.
+    // The rich hooks consume signed logical coordinates captured before the
+    // guest truncates them into OAM. Missing or stale visible provenance
+    // always leaves canonical GBA wrapping in control.
+    gba::g_ws_obj_attr_x_provider = golden_sun_wide_obj_attr_x_provider;
+    gba::g_ws_obj_x_provider = nullptr;
     gba::g_ws_obj_y_provider = nullptr;
     gba::g_ws_obj_attr_y_provider = golden_sun_wide_obj_attr_y_provider;
-    // The EWRAM authored-cell probe is opt-in. Keep both the generic fast
-    // path seam and the GbaBus slow-path observer null for ordinary runs;
-    // either path reports the same CPU store exactly once when diagnostics are
-    // enabled.
-    if (golden_sun_wide_diagnostics_enabled()) {
-        gba::g_ws_ewram_write_observer = golden_sun_wide_ewram_write_observer;
-        g_runtime_fast_ewram_write_observer =
-            golden_sun_wide_ewram_write_observer;
-    } else {
-        gba::g_ws_ewram_write_observer = nullptr;
-        g_runtime_fast_ewram_write_observer = nullptr;
-    }
+    // Authored ownership is required by the provider in every expanded run;
+    // diagnostics only controls logging, not the ownership contract.
+    gba::g_ws_ewram_write_observer = golden_sun_wide_ewram_write_observer;
+    g_runtime_fast_ewram_write_observer = golden_sun_wide_ewram_write_observer;
+    g_runtime_fast_iwram_write_observer = golden_sun_wide_diagnostics_enabled()
+        ? golden_sun_fast_iwram_write_observer : nullptr;
     gba::vram_trace::set_dma_descriptor_observer(
         golden_sun_wide_dma_descriptor_observer);
+    gba::vram_trace::set_oam_shadow_write_observer(
+        (golden_sun_wide_diagnostics_enabled() ||
+         golden_sun_experimental_fixes_enabled())
+            ? golden_sun_oam_shadow_write_observer : nullptr);
     gba::g_ws_bg_x_provider_layers = 0xFu; // BG0 + Mode0 field layers.
-    g_runtime_thumb_alu_imm_override = golden_sun_wide_obj_cull_immediate;
-    g_runtime_thumb_literal_override = golden_sun_wide_literal_override;
+    g_runtime_thumb_alu_imm_override = nullptr;
+    g_runtime_thumb_literal_override = nullptr;
+    g_runtime_conditional_branch_override =
+        golden_sun_wide_conditional_branch;
 }
 
 // Golden Sun-specific policy lives in the project runner. The reusable
@@ -2055,6 +6139,31 @@ const auto kTransientCodeImages = std::to_array<TransientCodeImage>({
      "Func_dc8_synth_template_03000904",
      gsr_synth_dc8_03000904_kDispatchTable,
      &gsr_synth_dc8_03000904_kDispatchTableLen},
+    // main.toml's [[code_copy]] runtime_start=0x03000000 source_start=
+    // 0x08000770 size=0x1400 DMA-installs a fixed ROM image that kDispatchTable
+    // already has AOT entries for (gf_irq_handler_03000000 and friends). Page 0
+    // of IWRAM (0x03000000..0x03000FFF) is registered for dirty-tracking by the
+    // synth-template rows above, so that DMA copy itself sets the page-0 dirty
+    // bit before any dispatch ever reaches it, discarding the AOT fn on first
+    // touch. Split around the 0x03000828..0x030008CC synth-template slot,
+    // whose content is not part of this fixed identity (three registered
+    // variants above own it). SHA-1s are computed from the pinned ROM at
+    // source_start (+offset for the second half); the image is dispatched in
+    // both modes per goldensun.elf mapping symbols (e.g. gf_tfunc_03000658 is
+    // THUMB, gf_afunc_03000088 is ARM), so each half is registered once per
+    // mode over identical bytes.
+    {0x03000000u, 0x03000828u, 0x08000770u, 0,
+     "0fddefbcec607b67676b8f0de9bcad8322c6e061",
+     "main_copy_03000000_pre_dc8_arm", nullptr, nullptr},
+    {0x03000000u, 0x03000828u, 0x08000770u, 1,
+     "0fddefbcec607b67676b8f0de9bcad8322c6e061",
+     "main_copy_03000000_pre_dc8_thumb", nullptr, nullptr},
+    {0x030008CCu, 0x03001400u, 0x0800103Cu, 0,
+     "41e0eb7fdbbfdd4622513cb838239db8410e641a",
+     "main_copy_03000000_post_dc8_arm", nullptr, nullptr},
+    {0x030008CCu, 0x03001400u, 0x0800103Cu, 1,
+     "41e0eb7fdbbfdd4622513cb838239db8410e641a",
+     "main_copy_03000000_post_dc8_thumb", nullptr, nullptr},
 #if 0  // Superseded by the generated, complete overlay registry below.
     // TCP capture at frame 293, PC 0x0808c5ba matched the installed bytes
     // uniquely to the pinned rom_779188 overlay build. Its compressed ROM
@@ -2492,6 +6601,124 @@ const std::array<RelocatableCodeImage, 17> kRelocatableCodeImages{{
      gsr_funca418_pic_kDispatchTable,
      &gsr_funca418_pic_kDispatchTableLen},
 }};
+
+struct GoldenSunFunc1dc8WriterCache {
+    bool valid = false;
+    bool image_verified = false;
+    std::uint32_t base = 0;
+    std::uint64_t generation = 0;
+    std::array<unsigned int, 64> page_epochs{};
+};
+std::array<GoldenSunFunc1dc8WriterCache, 4>
+    g_golden_sun_func1dc8_writer_cache{};
+
+void reset_golden_sun_func1dc8_writer_diagnostics() {
+    g_golden_sun_func1dc8_writer_cache.fill({});
+    g_golden_sun_func1dc8_writer_recognized = 0;
+    g_golden_sun_func1dc8_writer_identity_mismatch = 0;
+    g_golden_sun_func1dc8_writer_unknown_variant = 0;
+    g_golden_sun_func1dc8_writer_logs = 0;
+    g_golden_sun_func1dc8_last_base = 0;
+    g_golden_sun_func1dc8_last_generation = 0;
+}
+
+const char* golden_sun_func1dc8_writer_route_name(
+    gsr::Func1dc8WriterRoute route) {
+    switch (route) {
+        case gsr::Func1dc8WriterRoute::D4: return "D4";
+        case gsr::Func1dc8WriterRoute::EC: return "EC";
+        case gsr::Func1dc8WriterRoute::F0: return "F0";
+        case gsr::Func1dc8WriterRoute::Count: break;
+    }
+    return "unknown";
+}
+
+bool golden_sun_func1dc8_writer_pc(std::uint32_t pc,
+                                   gsr::Func1dc8WriterRoute route) {
+    const bool diagnostics = golden_sun_wide_diagnostics_enabled();
+    // Preserve the previously proven fixed route when diagnostics are off;
+    // identity work is strictly observational and must not affect gameplay.
+    if (!diagnostics) {
+        const std::uint32_t fixed =
+            gsr::kFunc1dc8KnownFixedBase + gsr::writer_offset(route);
+        return pc == fixed;
+    }
+
+    const std::uint32_t offset = gsr::writer_offset(route);
+    if (offset == 0u || pc < offset) {
+        ++g_golden_sun_func1dc8_writer_unknown_variant;
+        return false;
+    }
+    const std::uint32_t base = pc - offset;
+    if (base < 0x02000000u ||
+        base + gsr::kFunc1dc8ImageSize > 0x04000000u ||
+        (base & 3u) != 0u) {
+        ++g_golden_sun_func1dc8_writer_unknown_variant;
+        return false;
+    }
+
+    const RelocatableCodeImage* image = nullptr;
+    for (const auto& candidate : kRelocatableCodeImages) {
+        if (std::strcmp(candidate.name, "Func_1dc8_relocatable") == 0) {
+            image = &candidate;
+            break;
+        }
+    }
+    if (!image) {
+        ++g_golden_sun_func1dc8_writer_unknown_variant;
+        return false;
+    }
+
+    auto& cache = g_golden_sun_func1dc8_writer_cache[
+        static_cast<std::size_t>(route)];
+    const bool current = cache.valid && cache.base == base &&
+        gsr::ram_range_pages_current(
+            base, base + *image->size, cache.page_epochs,
+            ram_code_page_epoch);
+    bool verified = false;
+    if (current) {
+        verified = cache.image_verified;
+    } else {
+        bool prefix_passed = false;
+        verified = relocatable_resident_at(*image, base, &prefix_passed);
+        cache = {};
+        cache.valid = true;
+        cache.image_verified = verified;
+        cache.base = base;
+        cache.generation = g_ram_write_epoch;
+        gsr::ram_range_register_mask(
+            base, base + *image->size, &g_ram_code_page_mask_iwram,
+            &g_ram_code_page_mask_ewram_lo, &g_ram_code_page_mask_ewram_hi);
+        gsr::save_ram_range_page_epochs(
+            base, base + *image->size, cache.page_epochs,
+            ram_code_page_epoch);
+    }
+    const gsr::Func1dc8WriterIdentity identity{
+        verified, gsr::kFunc1dc8ImageKey, base, cache.generation};
+    const auto resolved = gsr::resolve_func1dc8_writer(
+        pc, route, gsr::kFunc1dc8ImageKey, cache.generation, identity);
+    if (!resolved.recognized) {
+        if (resolved.identity_mismatch)
+            ++g_golden_sun_func1dc8_writer_identity_mismatch;
+        else
+            ++g_golden_sun_func1dc8_writer_unknown_variant;
+        return false;
+    }
+    ++g_golden_sun_func1dc8_writer_recognized;
+    g_golden_sun_func1dc8_last_base = resolved.base;
+    g_golden_sun_func1dc8_last_generation = cache.generation;
+    if (g_golden_sun_func1dc8_writer_logs < 64u) {
+        ++g_golden_sun_func1dc8_writer_logs;
+        std::fprintf(stderr,
+            "[wide-obj-writer] frame=%llu route=%s pc=0x%08x base=0x%08x "
+            "image_key=0x%08x generation=%llu verified=1\n",
+            static_cast<unsigned long long>(runtime_current_frame()),
+            golden_sun_func1dc8_writer_route_name(route), pc, resolved.base,
+            gsr::kFunc1dc8ImageKey,
+            static_cast<unsigned long long>(cache.generation));
+    }
+    return true;
+}
 
 // Last base each relocatable image was verified at. A pooled routine is
 // entered many times in a row at the same base, so trying it first keeps the
@@ -3110,6 +7337,8 @@ void blitter_function_entry(std::uint32_t entry_pc) {
 }
 
 void golden_sun_function_entry_observer(std::uint32_t entry_pc) {
+    golden_sun_obj_f0_entry_capture(entry_pc);
+    golden_sun_obj_staging_handoff(entry_pc);
     blitter_function_entry(entry_pc);
 }
 
@@ -4193,6 +8422,22 @@ RuntimeGuestFn verified_ram_dispatch(std::uint32_t pc, int thumb) {
     std::abort();
 }
 
+// The static kDispatchTable already has a fixed AOT entry for this
+// transient-RAM pc, but runtime_ram_code_range_dirty() found a write
+// recorded somewhere in its containing 4 KiB page since boot/load — the
+// dirty bit is page-granular, not per-pc. verified_ram_dispatch() above
+// already ran for this exact pc/thumb earlier in the same runtime_dispatch
+// call, so its cache entry (if any) is guaranteed fresh here. A `Static`
+// entry means it independently confirmed, via the registered identity's own
+// SHA-1, that the reviewed ROM-sourced bytes at this pc still match live
+// memory — the write that dirtied the page landed elsewhere in the page, not
+// in this pc's own bytes — so the AOT entry is safe to use as-is.
+int verified_ram_identity_confirmed(std::uint32_t pc, int thumb) {
+    const auto cached = g_verified_ram_cache.find(verified_ram_key(pc, thumb));
+    return cached != g_verified_ram_cache.end() &&
+           cached->second.action == VerifiedRamAction::Static;
+}
+
 void print_usage() {
     std::printf(
         "GoldenSunRecomp [--bios <path>] [--rom <path>] [game.toml]\n"
@@ -4249,12 +8494,24 @@ int main(int argc, char** argv) {
     options.launcher_aspect_view_heights = kGoldenSunAspectHeights;
     options.launcher_num_aspects = 3;
     g_runtime_ram_dispatch_hook = verified_ram_dispatch;
+    g_runtime_ram_identity_confirmed_hook = verified_ram_identity_confirmed;
     g_runtime_call_return_hook = verified_ram_dispatch_return_hook;
     g_runtime_guest_step_boundary_hook = verified_ram_dispatch_outer_boundary;
     g_runtime_mem_write_override = player_speed_write_override;
     init_ram_code_page_masks();
     g_verified_ram_cache.clear();
     g_verified_identity_cache = {};
+    {
+        std::size_t static_aot_ranges = 0;
+        for (const auto& image : kTransientCodeImages) {
+            if (image.dispatch_table == nullptr) ++static_aot_ranges;
+        }
+        std::fprintf(stderr,
+            "GoldenSunRecomp: %zu transient-RAM range(s) registered to defer "
+            "to the static AOT dispatch table once their identity matches "
+            "(no heal/JIT needed).\n",
+            static_aot_ranges);
+    }
     g_relocatable_identity_cache = {};
     const int result = gbarecomp::run_game(argc, argv, options);
     if (g_player_speed_diagnostic) {

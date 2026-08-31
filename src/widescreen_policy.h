@@ -1,6 +1,7 @@
 // Golden Sun's narrow, evidence-backed expanded-view policy.
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -32,74 +33,278 @@ inline constexpr std::int32_t kExpandedWidth =
 inline constexpr std::int32_t kExpandedHeight =
     static_cast<std::int32_t>(kNativeHeight) + 2 * kExpandedExtraY;
 
-// Exact THUMB immediate-override routes reviewed for the field-object cull
-// diagnostics. Keep this table independent of the runner so synthetic tests
-// can prove that only the six configured PCs are accounted for; unknown PCs
-// remain outside the diagnostic route.
-enum class GoldenSunCullSite : std::uint8_t {
-    B27C = 0,
-    B322,
-    B326,
-    B3CA,
-    B3D6,
-    B3EA,
+// The exact conditional branches below are the measured guest viewport
+// reject decisions. Every route is operand-aware: a guest decision is changed
+// only when its measured operand is in the newly visible viewport band.
+enum class GoldenSunViewportBranchSite : std::uint8_t {
+    B27E = 0,  // BGT to the normal Func_b168 writer path.
+    B324,       // BGT to the normal Func_b168 writer path.
+    B328,       // BGT to the normal Func_b168 writer path.
+    B3D2,       // BGE, Func_b388 lower-X bound.
+    B3DC,       // BLE, Func_b388 upper-X bound.
+    B3E6,       // BGE, Func_b388 lower-Y bound.
+    B3EC,       // BLE, Func_b388 upper-Y bound.
+    C6FA,       // BLS, Func_c62c upper-X reject route.
+    C702,       // BLE, Func_c62c lower-Y reject route.
+    C708,       // BGT, Func_c62c upper-Y reject route.
     Count,
 };
 
-inline constexpr int golden_sun_cull_site_index(std::uint32_t pc) {
-    switch (pc) {
-        case 0x0800B27Cu: return 0;
-        case 0x0800B322u: return 1;
-        case 0x0800B326u: return 2;
-        case 0x0800B3CAu: return 3;
-        case 0x0800B3D6u: return 4;
-        case 0x0800B3EAu: return 5;
-        default: return -1;
+struct GoldenSunViewportBranchReview {
+    std::uint32_t pc;
+    bool forced_decision;
+};
+
+inline constexpr std::array<GoldenSunViewportBranchReview,
+                             static_cast<std::size_t>(
+                                 GoldenSunViewportBranchSite::Count)>
+    kGoldenSunViewportBranchReviews{{
+        {0x0800B27Eu, false},
+        {0x0800B324u, false},
+        {0x0800B328u, false},
+        {0x0800B3D2u, true},
+        {0x0800B3DCu, true},
+        {0x0800B3E6u, true},
+        {0x0800B3ECu, true},
+        {0x0800C6FAu, true},
+        {0x0800C702u, false},
+        {0x0800C708u, false},
+    }};
+
+inline constexpr int golden_sun_viewport_branch_site_index(
+    std::uint32_t pc) {
+    for (std::size_t i = 0; i < kGoldenSunViewportBranchReviews.size();
+         ++i) {
+        if (kGoldenSunViewportBranchReviews[i].pc == pc) {
+            return static_cast<int>(i);
+        }
     }
+    return -1;
 }
 
-inline constexpr std::uint32_t golden_sun_cull_site_pc(
-    std::size_t index) {
-    switch (index) {
-        case 0: return 0x0800B27Cu;
-        case 1: return 0x0800B322u;
-        case 2: return 0x0800B326u;
-        case 3: return 0x0800B3CAu;
-        case 4: return 0x0800B3D6u;
-        case 5: return 0x0800B3EAu;
-        default: return 0u;
+inline constexpr bool golden_sun_expanded_view_active(
+    std::uint32_t width, std::uint32_t height, std::uint32_t extra_left,
+    std::uint32_t extra_right, std::uint32_t extra_top,
+    std::uint32_t extra_bottom) {
+    return width == static_cast<std::uint32_t>(kExpandedWidth) &&
+           height == static_cast<std::uint32_t>(kExpandedHeight) &&
+           extra_left == static_cast<std::uint32_t>(kExpandedExtraX) &&
+           extra_right == static_cast<std::uint32_t>(kExpandedExtraX) &&
+           extra_top == static_cast<std::uint32_t>(kExpandedExtraY) &&
+           extra_bottom == static_cast<std::uint32_t>(kExpandedExtraY);
+}
+
+// Func_b388's stock padded actor bounds are X [-32, 272] and Y [-32, 208].
+// Keep the lower bounds axis-specific: the guest's X and Y comparisons do not
+// share padding, so horizontal expansion must not enlarge the vertical band.
+inline constexpr std::uint32_t golden_sun_actor_precull_negative_x_padding(
+    std::uint32_t extra_left) {
+    return 32u + extra_left;
+}
+
+inline constexpr std::uint32_t golden_sun_actor_precull_negative_y_padding(
+    std::uint32_t extra_top) {
+    return 32u + extra_top;
+}
+
+inline constexpr std::uint32_t golden_sun_actor_precull_right_half_limit(
+    std::uint32_t extra_right) {
+    return 136u + ((extra_right + 1u) / 2u);
+}
+
+inline constexpr std::uint32_t golden_sun_actor_precull_bottom_limit(
+    std::uint32_t extra_bottom) {
+    return 208u + extra_bottom;
+}
+
+// Func_c62c's fixed-point bounds. The X operand is already x + 32 in
+// unsigned 16.16 form; the Y lower bound is signed -32px in 16.16 form.
+inline constexpr std::uint32_t golden_sun_field_list_x_upper_literal(
+    std::uint32_t extra_right) {
+    return 0x012FFFFEu + (extra_right << 16);
+}
+
+inline constexpr std::uint32_t golden_sun_field_list_y_lower_literal(
+    std::uint32_t extra_top) {
+    return 0xFFE00000u - (extra_top << 16);
+}
+
+// Returns nonzero only when this exact reviewed branch is enabled for the
+// strict expanded geometry and an output slot is available. `compared_value`
+// is the measured operand at the branch: r4 for B324 and r6 for B27E/B328;
+// the other routes consume the operands documented at their exact PCs.
+inline constexpr bool golden_sun_expanded_viewport_branch_override(
+    std::uint32_t pc, std::uint32_t original_decision,
+    std::uint32_t width, std::uint32_t height, std::uint32_t extra_left,
+    std::uint32_t extra_right, std::uint32_t extra_top,
+    std::uint32_t extra_bottom, std::int32_t compared_value,
+    std::uint32_t* out_decision) {
+    if (!out_decision || !golden_sun_expanded_view_active(
+            width, height, extra_left, extra_right, extra_top,
+            extra_bottom)) {
+        return false;
     }
-}
-
-inline constexpr std::uint32_t golden_sun_cull_site_original(
-    std::size_t index) {
-    switch (index) {
-        case 0: return 159u;
-        case 1: return 239u;
-        case 2: return 159u;
-        case 3: return 32u;
-        case 4: return 136u;
-        case 5: return 208u;
-        default: return 0u;
+    const int index = golden_sun_viewport_branch_site_index(pc);
+    if (index < 0) return false;
+    const bool object_x_route = pc == 0x0800B324u;
+    // B328 is an alternate writer route. Its widened fall-through can create
+    // an unauthenticated positive-Y OAM entry, so preserve the guest decision
+    // here. A narrower parent-correlated helper below handles the one proven
+    // route without making this generic policy depend on runtime state.
+    const bool object_y_route = pc == 0x0800B27Eu;
+    if (object_x_route) {
+        // B322 compares r4 against 239; admit only x=240..299.
+        if (compared_value < static_cast<std::int32_t>(kNativeWidth) ||
+            compared_value >= static_cast<std::int32_t>(
+                kNativeWidth + extra_right) || !original_decision) {
+            return false;
+        }
+        *out_decision = 0u;
+        return true;
     }
+    if (object_y_route) {
+        // B27C compares r6 against 159; admit only y=160..199.
+        if (compared_value < static_cast<std::int32_t>(kNativeHeight) ||
+            compared_value >= static_cast<std::int32_t>(
+                kNativeHeight + extra_bottom) || !original_decision) {
+            return false;
+        }
+        *out_decision = 0u;
+        return true;
+    }
+    // Func_b388 lower-X/lower-Y: admit only the new lower band. A stock
+    // accepted decision is never rewritten.
+    if (pc == 0x0800B3D2u) {
+        const std::int64_t lower = -static_cast<std::int64_t>(
+            golden_sun_actor_precull_negative_x_padding(extra_left));
+        const std::int64_t stock_lower = -32;
+        if (!original_decision &&
+            static_cast<std::int64_t>(compared_value) >= lower &&
+            static_cast<std::int64_t>(compared_value) < stock_lower) {
+            *out_decision = 1u;
+            return true;
+        }
+        return false;
+    }
+    if (pc == 0x0800B3E6u) {
+        const std::int64_t lower = -static_cast<std::int64_t>(
+            golden_sun_actor_precull_negative_y_padding(extra_top));
+        const std::int64_t stock_lower = -32;
+        if (!original_decision &&
+            static_cast<std::int64_t>(compared_value) >= lower &&
+            static_cast<std::int64_t>(compared_value) < stock_lower) {
+            *out_decision = 1u;
+            return true;
+        }
+        return false;
+    }
+    // Func_b388 upper-X/upper-Y: admit only the new upper band. A stock
+    // accepted decision is never rewritten.
+    if (pc == 0x0800B3DCu) {
+        const std::int64_t upper = 2 * static_cast<std::int64_t>(
+            golden_sun_actor_precull_right_half_limit(extra_right));
+        if (!original_decision && compared_value > 272 &&
+            static_cast<std::int64_t>(compared_value) <= upper) {
+            *out_decision = 1u;
+            return true;
+        }
+        return false;
+    }
+    if (pc == 0x0800B3ECu) {
+        const std::int64_t upper = static_cast<std::int64_t>(
+            golden_sun_actor_precull_bottom_limit(extra_bottom));
+        if (!original_decision && compared_value > 208 &&
+            static_cast<std::int64_t>(compared_value) <= upper) {
+            *out_decision = 1u;
+            return true;
+        }
+        return false;
+    }
+    // Func_c62c upper-X: retain the unsigned lower behavior and widen only
+    // the interval above the stock literal.
+    if (pc == 0x0800C6FAu) {
+        const std::uint32_t operand = static_cast<std::uint32_t>(
+            compared_value);
+        constexpr std::uint32_t stock_upper = 0x012FFFFEu;
+        const std::uint32_t widened_upper =
+            golden_sun_field_list_x_upper_literal(extra_right);
+        // The lower side of this fixed-point X operand is signed.  Preserve
+        // the guest's existing decision, but admit the newly visible
+        // negative band as well as the established unsigned upper band.
+        const std::int64_t lower =
+            -(static_cast<std::int64_t>(extra_left) << 16);
+        const bool lower_band =
+            static_cast<std::int64_t>(compared_value) >= lower &&
+            compared_value < 0;
+        const bool upper_band = operand > stock_upper &&
+            operand <= widened_upper;
+        if (!original_decision && (lower_band || upper_band)) {
+            *out_decision = 1u;
+            return true;
+        }
+        return false;
+    }
+    // Func_c62c lower-Y: this is a direct reject branch, so bypass only a
+    // taken reject whose signed operand is above the expanded lower bound.
+    if (pc == 0x0800C702u) {
+        const std::int64_t lower = static_cast<std::int64_t>(
+            static_cast<std::int32_t>(
+                golden_sun_field_list_y_lower_literal(extra_top)));
+        if (original_decision &&
+            static_cast<std::int64_t>(compared_value) > lower) {
+            *out_decision = 0u;
+            return true;
+        }
+        return false;
+    }
+    // Func_c62c upper-Y: bypass a taken reject through the expanded upper
+    // boundary; values above it remain rejected.
+    if (pc == 0x0800C708u) {
+        const std::int64_t upper = (208ll + extra_bottom) << 16;
+        if (original_decision &&
+            static_cast<std::int64_t>(compared_value) <= upper) {
+            *out_decision = 0u;
+            return true;
+        }
+        return false;
+    }
+    return false;
 }
 
-inline constexpr bool golden_sun_cull_site_matches(
-    std::uint32_t pc, std::uint32_t original_value) {
-    const int index = golden_sun_cull_site_index(pc);
-    return index >= 0 && original_value == golden_sun_cull_site_original(
-        static_cast<std::size_t>(index));
-}
+// B328's alternate writer may be widened only when the same current staging
+// record was admitted by B27E's widened route. Keep this predicate pure: the
+// runner supplies the current execution identity and the exact parent record,
+// while diagnostics remain observational and are not required for behavior.
+struct GoldenSunObjB328ParentMatch {
+    bool valid = false;
+    std::uint32_t staging_address = 0;
+    std::uint64_t frame = UINT64_MAX;
+    std::uint32_t call_depth = 0;
+    std::uint32_t call_return_pc = 0;
+    std::uint32_t original_decision = 0;
+    std::uint32_t final_decision = 0;
+    bool overridden = false;
+};
 
-// Only Func_b168's final X compare is proven on the executed field route.
-// Keep the route, original literal, and authenticated field scene separate so
-// an unrelated cull site or an unequal-scroll scene cannot opt in by accident.
-inline constexpr bool golden_sun_field_obj_cull_authorized(
-    bool authenticated_field, std::uint32_t instruction_pc,
-    std::uint32_t original_value, std::uint32_t extra_right) {
-    return authenticated_field && extra_right != 0u &&
-        instruction_pc == golden_sun_cull_site_pc(1u) &&
-        original_value == golden_sun_cull_site_original(1u);
+inline constexpr bool golden_sun_b328_parent_override(
+    bool expanded_view_active, std::uint32_t original_decision,
+    std::int32_t operand, std::uint32_t staging_address,
+    std::uint64_t frame, std::uint32_t call_depth,
+    std::uint32_t call_return_pc,
+    const GoldenSunObjB328ParentMatch& parent,
+    std::uint32_t* out_decision) {
+    if (!out_decision || !expanded_view_active || original_decision != 1u ||
+        operand < static_cast<std::int32_t>(kNativeHeight) ||
+        operand >= static_cast<std::int32_t>(kNativeHeight + kExpandedExtraY) ||
+        !parent.valid || parent.staging_address != staging_address ||
+        parent.frame != frame || parent.call_depth != call_depth ||
+        parent.call_return_pc != call_return_pc ||
+        parent.original_decision != 1u || parent.final_decision != 0u ||
+        !parent.overridden) {
+        return false;
+    }
+    *out_decision = 0u;
+    return true;
 }
 
 // The expanded renderer may reinterpret only the raw OBJ-X values that the
@@ -113,24 +318,6 @@ inline constexpr bool golden_sun_field_obj_x_authorized(
     return raw_x < static_cast<int>(kNativeWidth + extra_right);
 }
 
-// Func_b168's measured field-object writer rejects screen X > 239 at
-// ROM 0x0800B322.  A widened 288px field needs the same inclusive right edge
-// as the renderer (239 + 24 = 263); keep this pure so the runner's exact-PC
-// immediate hook and its tests share one evidence-backed limit.
-inline constexpr int golden_sun_field_obj_right_cull_limit(
-    std::uint32_t extra_right) {
-    return static_cast<int>(kNativeWidth + extra_right - 1u);
-}
-
-inline constexpr bool golden_sun_field_obj_y_cull_authorized(
-    bool authenticated_field, std::uint32_t instruction_pc,
-    std::uint32_t original_value, std::uint32_t extra_bottom) {
-    return authenticated_field && extra_bottom != 0u &&
-        original_value == 159u &&
-        (instruction_pc == golden_sun_cull_site_pc(0u) ||
-         instruction_pc == golden_sun_cull_site_pc(2u));
-}
-
 // Measured OAM shadow range: 128 slots, 8 bytes each, with end exclusive.
 inline constexpr std::uint32_t kGoldenSunOamShadowStart = 0x0300347Cu;
 inline constexpr std::uint32_t kGoldenSunOamShadowEnd = 0x0300387Cu;
@@ -138,6 +325,19 @@ inline constexpr std::uint32_t kGoldenSunOamShadowSlotBytes = 8u;
 inline constexpr std::size_t kGoldenSunOamShadowSlotCount =
     (kGoldenSunOamShadowEnd - kGoldenSunOamShadowStart) /
     kGoldenSunOamShadowSlotBytes;
+inline constexpr std::uint32_t kGoldenSunOamStart = 0x07000000u;
+inline constexpr std::uint32_t kGoldenSunOamBytes = 1024u;
+
+// This is the only transfer that makes the shadow provenance visible to the
+// renderer. Keep the descriptor contract exact so another DMA cannot publish
+// a partially updated or unrelated OAM image.
+inline constexpr bool golden_sun_obj_provenance_dma_handoff(
+    std::uint32_t source, std::uint32_t destination, std::uint32_t bytes,
+    std::uint16_t control) {
+    return source == kGoldenSunOamShadowStart &&
+           destination == kGoldenSunOamStart && bytes == kGoldenSunOamBytes &&
+           (control & 0x0060u) == 0u;
+}
 
 inline constexpr int golden_sun_oam_shadow_slot(std::uint32_t attr0_address) {
     if (attr0_address < kGoldenSunOamShadowStart ||
@@ -150,63 +350,237 @@ inline constexpr int golden_sun_oam_shadow_slot(std::uint32_t attr0_address) {
                             kGoldenSunOamShadowSlotBytes);
 }
 
-// The adjacent `cmp r6,#159` at ROM 0x0800B326 is the final screen-Y reject.
-inline constexpr int golden_sun_field_obj_bottom_cull_limit(
-    std::uint32_t extra_bottom) {
-    return static_cast<int>(kNativeHeight + extra_bottom - 1u);
+// The branch PCs are the instructions after the two measured `cmp r6,#159`
+// instructions.  The branch body owns the corresponding OAM ATTR0 store:
+// B27E writes the second word and B328 writes the first word of the slot.
+inline constexpr std::uint32_t golden_sun_obj_y_provenance_offset(
+    std::uint32_t branch_pc) {
+    return branch_pc == 0x0800B27Eu ? 16u
+         : branch_pc == 0x0800B328u ? 4u
+                                    : UINT32_MAX;
 }
 
-// Func_b388 performs an earlier padded actor-box reject: X -32..272 and
-// Y -32..208. Preserve its padding while extending every live viewport edge.
-inline constexpr std::uint32_t golden_sun_actor_precull_negative_padding(
-    std::uint32_t extra_left, std::uint32_t extra_top) {
-    return 32u + (extra_left > extra_top ? extra_left : extra_top);
+// B27E and B328 are BGT rejects. The fall-through path writes ATTR0, whether
+// the guest condition was originally false or the expanded policy forced it
+// false. Keep both paths on the same logical-Y provenance route.
+inline constexpr bool golden_sun_obj_y_branch_writes_oam(
+    std::uint32_t branch_pc, std::uint32_t original_decision,
+    bool overridden, std::uint32_t resulting_decision) {
+    if (branch_pc != 0x0800B27Eu && branch_pc != 0x0800B328u) return false;
+    return (overridden ? resulting_decision : original_decision) == 0u;
 }
 
-// The guest forms 272 as `movs r1,#136; lsl r1,#1`.
-inline constexpr std::uint32_t golden_sun_actor_precull_right_half_limit(
-    std::uint32_t extra_right) {
-    return 136u + ((extra_right + 1u) / 2u);
+inline constexpr bool golden_sun_obj_y_provenance_address(
+    std::uint32_t branch_pc, std::uint32_t r7,
+    std::uint32_t* out_address) {
+    const std::uint32_t offset =
+        golden_sun_obj_y_provenance_offset(branch_pc);
+    if (!out_address || offset == UINT32_MAX || r7 > UINT32_MAX - offset)
+        return false;
+    *out_address = r7 + offset;
+    return true;
 }
 
-inline constexpr std::uint32_t golden_sun_actor_precull_bottom_limit(
-    std::uint32_t extra_bottom) {
-    return 208u + extra_bottom;
+// Func_b168's widened writer stores ATTR1 at R7+6 on the B324/B328 route,
+// immediately after ATTR0 at R7+4. Resolve the owning ATTR0 base so the
+// address can be mapped to an aligned OAM slot while retaining X from r4.
+inline constexpr bool golden_sun_obj_x_provenance_address(
+    std::uint32_t branch_pc, std::uint32_t r7,
+    std::uint32_t* out_attr0_address) {
+    if (!out_attr0_address || branch_pc != 0x0800B324u ||
+        r7 > UINT32_MAX - 4u) {
+        return false;
+    }
+    *out_attr0_address = r7 + 4u;
+    return true;
 }
 
-// Func_c62c's earlier field-list culls use these 16.16 fixed-point literal
-// bounds before calling Func_b168. The X comparison adds 32px before testing
-// against 304px, so its literal grows by the active right margin. The Y lower
-// comparison is a signed -32px reject and grows downward by the top margin.
-inline constexpr std::uint32_t golden_sun_field_list_x_upper_literal(
-    std::uint32_t extra_right) {
-    return 0x012FFFFEu + (extra_right << 16);
+enum class GoldenSunObjYResolution : std::uint8_t {
+    Canonical = 0,
+    SignedProvenance,
+};
+
+// Signed writer provenance is the only expanded-Y override. Without a fresh
+// matching record, preserve canonical GBA 8-bit Y wrapping: e.g. logical
+// Y=-65 truncates to raw 191 and must stay above the canvas, not become +191.
+inline constexpr GoldenSunObjYResolution golden_sun_obj_y_resolution(
+    bool signed_provenance_matches) {
+    if (signed_provenance_matches) {
+        return GoldenSunObjYResolution::SignedProvenance;
+    }
+    return GoldenSunObjYResolution::Canonical;
 }
 
-inline constexpr std::uint32_t golden_sun_field_list_y_lower_literal(
-    std::uint32_t extra_top) {
-    return 0xFFE00000u - (extra_top << 16);
+// Raw OBJ Y values are ambiguous whenever their signed logical counterpart
+// crosses the 8-bit hardware boundary: values >=160 can be widened positive
+// rows, while negative logical rows can truncate below 160 and wrap positive
+// in an unprovenanced fallback. Keep this predicate diagnostic-only; it does
+// not select a rendering path.
+inline constexpr bool golden_sun_obj_y_alias_candidate(int raw_y,
+                                                        int logical_y) {
+    return (raw_y >= 160 && logical_y >= 160) ||
+           (raw_y < 160 && logical_y < 0);
 }
 
-// The expanded field writer can emit the bottom-margin OBJ Y range as raw
-// 160..(native_height+extra_bottom-1). Reinterpret that range positively only
-// while the bottom margin is actually present; otherwise preserve hardware's
-// normal signed 8-bit decode.
-inline constexpr bool golden_sun_field_obj_y_expanded(
-    int raw_y, std::uint32_t extra_top, std::uint32_t extra_bottom) {
-    (void)extra_top;
-    if (extra_bottom == 0u) return false;
-    return raw_y >= static_cast<int>(kNativeHeight) &&
-           raw_y <= golden_sun_field_obj_bottom_cull_limit(extra_bottom);
+// One measured NPC crossed the 8-bit OBJ-Y boundary as 162/-94, 161/-95,
+// 160/-96, then 159/+159.  Keep that evidence as a pure, fail-closed state
+// machine.  It is intentionally independent of the guest/OAM state and is
+// applied only by the final Expanded renderer seam. The final-Y provider may
+// call this once per scanline, so the state records the last raw/canonical
+// result to distinguish an identical same-frame sample from a mutation.
+struct GoldenSunObjYEdgeAliasState {
+    bool valid = false;
+    std::uint8_t count = 0;
+    int slot = -1;
+    std::uint32_t target_address = 0;
+    std::uint64_t auth_epoch = 0;
+    std::uint64_t last_frame = UINT64_MAX;
+    std::uint16_t attr0_non_y = 0;
+    std::uint16_t attr1 = 0;
+    std::uint16_t attr2 = 0;
+    int last_raw_y = 0;
+    int last_canonical_y = 0;
+};
+
+struct GoldenSunObjYEdgeAliasSample {
+    bool expanded_active = false;
+    bool sprite_active = false;
+    bool exact_provenance = false;
+    int slot = -1;
+    std::uint32_t target_address = 0;
+    std::uint64_t auth_epoch = 0;
+    std::uint64_t frame = UINT64_MAX;
+    int raw_y = 0;
+    int canonical_y = 0;
+    std::uint16_t attr0 = 0;
+    std::uint16_t attr1 = 0;
+    std::uint16_t attr2 = 0;
+};
+
+struct GoldenSunObjYEdgeAliasStep {
+    GoldenSunObjYEdgeAliasState state{};
+    bool activated = false;
+};
+
+inline constexpr std::uint16_t golden_sun_obj_y_edge_alias_attr0_non_y(
+    std::uint16_t attr0) {
+    return static_cast<std::uint16_t>(attr0 & 0xFF00u);
 }
 
-// Golden Sun builds the IWRAM OAM shadow before VBlank and copies it for the
-// following visible frame. Accept only that one-frame handoff (plus direct
-// same-frame use) so a recycled slot cannot retain stale positive-Y meaning.
+inline constexpr bool golden_sun_obj_y_edge_alias_identity_matches(
+    const GoldenSunObjYEdgeAliasState& state,
+    const GoldenSunObjYEdgeAliasSample& sample) {
+    return state.valid && state.slot == sample.slot &&
+           state.target_address == sample.target_address &&
+           state.auth_epoch == sample.auth_epoch &&
+           state.attr0_non_y == golden_sun_obj_y_edge_alias_attr0_non_y(
+               sample.attr0) &&
+           state.attr1 == sample.attr1 && state.attr2 == sample.attr2;
+}
+
+inline constexpr bool golden_sun_obj_y_edge_alias_frame_contiguous(
+    std::uint64_t previous, std::uint64_t current) {
+    // The captured transition advances by 1, 2, 1 guest frames.  A larger
+    // gap is a different observation and must not complete the latch.
+    return current > previous && current - previous <= 2u;
+}
+
+inline constexpr GoldenSunObjYEdgeAliasStep golden_sun_obj_y_edge_alias_step(
+    const GoldenSunObjYEdgeAliasState& previous,
+    const GoldenSunObjYEdgeAliasSample& sample) {
+    GoldenSunObjYEdgeAliasStep result{};
+    result.state = previous;
+    const auto reset = [&]() {
+        result.state = {};
+    };
+    if (!sample.expanded_active || !sample.sprite_active ||
+        sample.exact_provenance || sample.slot < 0 ||
+        sample.target_address == 0u || sample.frame == UINT64_MAX) {
+        reset();
+        return result;
+    }
+
+    constexpr int kFirstRaw = 162;
+    constexpr int kFirstCanonical = -94;
+    if (!previous.valid) {
+        if (sample.raw_y != kFirstRaw || sample.canonical_y != kFirstCanonical)
+            return result;
+        result.state.valid = true;
+        result.state.count = 1u;
+        result.state.slot = sample.slot;
+        result.state.target_address = sample.target_address;
+        result.state.auth_epoch = sample.auth_epoch;
+        result.state.last_frame = sample.frame;
+        result.state.last_raw_y = sample.raw_y;
+        result.state.last_canonical_y = sample.canonical_y;
+        result.state.attr0_non_y =
+            golden_sun_obj_y_edge_alias_attr0_non_y(sample.attr0);
+        result.state.attr1 = sample.attr1;
+        result.state.attr2 = sample.attr2;
+        return result;
+    }
+
+    if (!golden_sun_obj_y_edge_alias_identity_matches(previous, sample) ||
+        (sample.frame == previous.last_frame &&
+         (sample.raw_y != previous.last_raw_y ||
+          sample.canonical_y != previous.last_canonical_y)) ||
+        (sample.frame != previous.last_frame &&
+         !golden_sun_obj_y_edge_alias_frame_contiguous(
+             previous.last_frame, sample.frame))) {
+        reset();
+        return result;
+    }
+
+    // The final-Y provider runs once per scanline. Repeated observations of
+    // one frame are the same sample, not a frame-gap violation.
+    if (sample.frame == previous.last_frame) {
+        return result;
+    }
+
+    const int expected_raw = previous.count == 1u ? 161
+        : previous.count == 2u ? 160
+        : previous.count == 3u ? 159 : -1;
+    const int expected_canonical = previous.count == 1u ? -95
+        : previous.count == 2u ? -96
+        : previous.count == 3u ? 159 : 0;
+    if (sample.raw_y != expected_raw ||
+        sample.canonical_y != expected_canonical) {
+        reset();
+        return result;
+    }
+    if (previous.count == 3u) {
+        result.state = {};
+        result.activated = true;
+        return result;
+    }
+    result.state.last_frame = sample.frame;
+    result.state.last_raw_y = sample.raw_y;
+    result.state.last_canonical_y = sample.canonical_y;
+    ++result.state.count;
+    return result;
+}
+
+// Historical cadence predicate retained for focused diagnostics/tests. The
+// runtime's visible provenance validity is now bounded by exact OAM identity,
+// not by this short frame-age window.
 inline constexpr bool golden_sun_obj_provenance_frame_fresh(
     std::uint64_t writer_frame, std::uint64_t render_frame) {
-    return writer_frame == render_frame ||
-           (writer_frame != UINT64_MAX && writer_frame + 1u == render_frame);
+    if (writer_frame == UINT64_MAX || render_frame < writer_frame) {
+        return false;
+    }
+    return render_frame - writer_frame <= 2u;
+}
+
+// A signed placement may outlive the producer-frame cadence, but it must
+// never outlive the exact OAM image it describes.  The three attributes are
+// the complete identity consumed by the OBJ renderer (ATTR0/1/2); a changed
+// or reused slot therefore fails closed and keeps canonical GBA wrapping.
+inline constexpr bool golden_sun_obj_provenance_attrs_match(
+    bool expected_valid, std::uint16_t expected_attr0,
+    std::uint16_t expected_attr1, std::uint16_t expected_attr2,
+    std::uint16_t attr0, std::uint16_t attr1, std::uint16_t attr2) {
+    return expected_valid && expected_attr0 == attr0 &&
+           expected_attr1 == attr1 && expected_attr2 == attr2;
 }
 
 inline constexpr std::uint16_t kDispcntModeMask = 0x0007u;
@@ -376,6 +750,36 @@ inline constexpr std::uint16_t kGoldenSunPalaceBg1Cnt = 0x0709u;
 inline constexpr std::uint16_t kGoldenSunPalaceBg2Cnt = 0x060Au;
 inline constexpr std::uint16_t kGoldenSunPalaceBg3Cnt = 0x0503u;
 
+// Exact payload-free fingerprints measured for McCoy Palace's restored
+// split-scroll tables.  A fingerprint is necessary but not sufficient: the
+// runner also requires a complete clean split-scroll frame and invalidates the
+// authorization on any subsequent table write.
+inline constexpr std::uint32_t kGoldenSunPalaceMapCrc = 0x0aef4a71u;
+inline constexpr std::uint32_t kGoldenSunPalaceRawCrc = 0x11020c66u;
+// Bilibin's measured pair (0x7ac260c4/0x060ecd2c) has no independently
+// measured raw 0xffff/filler ownership profile. Keep it fail-closed until an
+// exact profile can be established; it must not inherit Palace authorization.
+// The measured Palace fingerprint is dominated by metatile 0x026 outside
+// the active room (14,068/16,384 cells). Treat that fill as out-of-room in
+// the split-scroll provider; all other IDs remain subject to the raw-entry
+// sentinel and finite atlas checks below.
+inline constexpr std::uint16_t kGoldenSunPalaceNoMapId = 0x026u;
+
+inline constexpr bool golden_sun_palace_table_fingerprint_matches(
+    std::uint32_t map_crc, std::uint32_t raw_crc) {
+    return map_crc == kGoldenSunPalaceMapCrc &&
+           raw_crc == kGoldenSunPalaceRawCrc;
+}
+
+inline constexpr bool golden_sun_palace_table_authorization_allowed(
+    bool complete_clean_split_scroll, bool table_written,
+    GoldenSunWidePolicyReason reason, std::uint32_t map_crc,
+    std::uint32_t raw_crc) {
+    return complete_clean_split_scroll && !table_written &&
+           reason == GoldenSunWidePolicyReason::AuthorizedMode0SplitScroll &&
+           golden_sun_palace_table_fingerprint_matches(map_crc, raw_crc);
+}
+
 inline constexpr GoldenSunWidePolicyReason
 golden_sun_mode0_split_scroll_policy_reason(
     std::uint16_t dispcnt, const std::uint8_t* io) {
@@ -498,6 +902,12 @@ struct GoldenSunFieldTilemapMetadata {
     std::uint32_t map_y = 0;
     bool has_raw_entry = false;
 };
+
+inline constexpr bool golden_sun_palace_out_of_room(
+    const GoldenSunFieldTilemapMetadata& metadata) {
+    return metadata.has_raw_entry &&
+           metadata.map_id == kGoldenSunPalaceNoMapId;
+}
 // State1's complete 128x128 field table proves metatile 0x017/raw 0xF200 is
 // the un-authored fill: it occupies 13,531/16,384 cells and forms the solid
 // rows/columns outside the active 32x32 room. Metatile 0x003 is authored room
@@ -863,10 +1273,14 @@ inline bool golden_sun_field_tilemap_entry(
     };
     const std::int32_t tile_x = floor_div8(abs_x);
     const std::int32_t tile_y = floor_div8(abs_y);
-    const std::uint32_t map_x =
-        static_cast<std::uint32_t>(tile_x >> 1) & 127u;
-    const std::uint32_t map_y =
-        static_cast<std::uint32_t>(tile_y >> 1) & 127u;
+    // The provider's map is a finite 128x128 authored table. Do not apply
+    // GBA's 9-bit/wrap behavior to this logical atlas lookup: negative or
+    // beyond-table tile coordinates are out-of-room and must fail closed.
+    if (tile_x < 0 || tile_y < 0 || tile_x >= 256 || tile_y >= 256) {
+        return false;
+    }
+    const std::uint32_t map_x = static_cast<std::uint32_t>(tile_x / 2);
+    const std::uint32_t map_y = static_cast<std::uint32_t>(tile_y / 2);
     if (out_metadata) {
         out_metadata->tile_x = tile_x;
         out_metadata->tile_y = tile_y;
@@ -909,9 +1323,341 @@ inline bool golden_sun_field_tilemap_entry(
         out_metadata->raw_entry = raw_entry;
         out_metadata->has_raw_entry = true;
     }
-    if (raw_entry == kGoldenSunFieldUnavailableTile) return false;
+    if (raw_entry == kGoldenSunFieldUnavailableTile ||
+        (allow_split_scroll && id == kGoldenSunPalaceNoMapId)) {
+        return false;
+    }
     *out_entry = raw_entry;
     return true;
+}
+
+// Palace's restored table contains a large 0x026 residual region.  A raw
+// entry can be finite and non-sentinel while still belonging to a disconnected
+// island of that residual image.  Keep the presentation boundary conservative:
+// seed each layer from independently valid samples in the authentic canvas,
+// then flood bounded per-seed windows through non-0x026 map cells. This is
+// pure table metadata; it does not use authored-write ownership or a bitmap.
+class GoldenSunPalaceActiveRegion {
+public:
+    static constexpr std::size_t kWidth = 128u;
+    static constexpr std::size_t kHeight = 128u;
+    static constexpr std::size_t kCellCount = kWidth * kHeight;
+    // A 16px metatile bounds the atlas graph. These are the exact conservative
+    // ceil margins for Expanded's 60px horizontal and 40px vertical view.
+    static constexpr std::size_t kMaxHorizontalCells = 4u;
+    static constexpr std::size_t kMaxVerticalCells = 3u;
+
+    GoldenSunPalaceActiveRegion() { reset(); }
+
+    void reset() {
+        for (auto& layer : reachable_) layer.fill(0u);
+        for (auto& layer : seeded_) layer.fill(0u);
+        built_.fill(false);
+        seed_counts_.fill(0u);
+    }
+
+    bool build(std::uint16_t dispcnt, const std::uint8_t* io,
+               std::size_t io_size, const std::uint8_t* ewram,
+               std::size_t ewram_size, bool exact_table_authorized) {
+        reset();
+        if (!exact_table_authorized ||
+            golden_sun_mode0_split_scroll_policy_reason(dispcnt, io) !=
+                GoldenSunWidePolicyReason::AuthorizedMode0SplitScroll ||
+            !io || io_size < 0x20u || !ewram ||
+            ewram_size < 0x20000u + 4096u * 8u) {
+            return false;
+        }
+
+        // The 8px sampling interval is half a metatile, so every visible
+        // 16px map cell gets an opportunity to seed each independently
+        // scrolled layer. Include the authentic right/bottom edge explicitly;
+        // otherwise the last 7px would make the expanded edge need an extra
+        // graph cell beyond the ceil(60/16) and ceil(40/16) bounds.
+        for (int bg = 1; bg <= 3; ++bg) {
+            std::array<std::uint8_t, kCellCount> seeds{};
+            for (int screen_y = 0;;) {
+                for (int hw_x = 0;;) {
+                    std::uint16_t entry = 0;
+                    GoldenSunFieldTilemapMetadata metadata;
+                    const bool resolved = golden_sun_field_tilemap_entry(
+                        dispcnt, io, io_size, ewram, ewram_size, bg, hw_x,
+                        screen_y, &entry, &metadata, nullptr,
+                        true, true);
+                    if (resolved && metadata.has_raw_entry &&
+                        metadata.map_id != kGoldenSunPalaceNoMapId &&
+                        metadata.raw_entry != kGoldenSunFieldUnavailableTile &&
+                        metadata.map_x < kWidth && metadata.map_y < kHeight) {
+                        const std::size_t cell =
+                            static_cast<std::size_t>(metadata.map_y) * kWidth +
+                            metadata.map_x;
+                        seeds[cell] = 1u;
+                        seeded_[static_cast<std::size_t>(bg - 1)][cell] = 1u;
+                        reachable_[static_cast<std::size_t>(bg - 1)][cell] = 1u;
+                        ++seed_counts_[static_cast<std::size_t>(bg - 1)];
+                    }
+                    if (hw_x == static_cast<int>(kNativeWidth) - 1) break;
+                    hw_x = std::min(hw_x + 8,
+                                    static_cast<int>(kNativeWidth) - 1);
+                }
+                if (screen_y == static_cast<int>(kNativeHeight) - 1) break;
+                screen_y = std::min(screen_y + 8,
+                                    static_cast<int>(kNativeHeight) - 1);
+            }
+            if (seed_counts_[static_cast<std::size_t>(bg - 1)] == 0u)
+                continue;
+
+            auto& layer = reachable_[static_cast<std::size_t>(bg - 1)];
+            for (std::size_t cell = 0; cell < kCellCount; ++cell) {
+                if (seeds[cell] == 0u) continue;
+                struct QueueNode {
+                    std::uint16_t cell;
+                    std::int8_t dx;
+                    std::int8_t dy;
+                };
+                constexpr std::size_t kWindowWidth =
+                    2u * kMaxHorizontalCells + 1u;
+                constexpr std::size_t kWindowHeight =
+                    2u * kMaxVerticalCells + 1u;
+                std::array<QueueNode, kWindowWidth * kWindowHeight> queue{};
+                std::array<std::uint8_t, kWindowWidth * kWindowHeight> seen{};
+                std::size_t head = 0;
+                std::size_t tail = 0;
+                queue[tail++] = {static_cast<std::uint16_t>(cell), 0, 0};
+                seen[kMaxVerticalCells * kWindowWidth +
+                     kMaxHorizontalCells] = 1u;
+                while (head < tail) {
+                    const QueueNode node = queue[head++];
+                    const std::size_t current = node.cell;
+                    const std::size_t x = current % kWidth;
+                    const std::size_t y = current / kWidth;
+                    const auto visit = [&](std::size_t nx, std::size_t ny,
+                                           std::int8_t dx,
+                                           std::int8_t dy) {
+                        if (dx < -static_cast<std::int8_t>(kMaxHorizontalCells) ||
+                            dx > static_cast<std::int8_t>(kMaxHorizontalCells) ||
+                            dy < -static_cast<std::int8_t>(kMaxVerticalCells) ||
+                            dy > static_cast<std::int8_t>(kMaxVerticalCells))
+                            return;
+                        const std::size_t local =
+                            static_cast<std::size_t>(dy +
+                                static_cast<std::int8_t>(kMaxVerticalCells)) *
+                                kWindowWidth + static_cast<std::size_t>(dx +
+                                static_cast<std::int8_t>(kMaxHorizontalCells));
+                        if (seen[local] != 0u || palace_map_id(
+                                ewram, ewram_size, nx, ny) ==
+                                kGoldenSunPalaceNoMapId) return;
+                        seen[local] = 1u;
+                        const std::size_t next = ny * kWidth + nx;
+                        layer[next] = 1u;
+                        queue[tail++] = {static_cast<std::uint16_t>(next),
+                                         dx, dy};
+                    };
+                    if (x != 0u) visit(x - 1u, y, node.dx - 1, node.dy);
+                    if (x + 1u < kWidth)
+                        visit(x + 1u, y, node.dx + 1, node.dy);
+                    if (y != 0u) visit(x, y - 1u, node.dx, node.dy - 1);
+                    if (y + 1u < kHeight)
+                        visit(x, y + 1u, node.dx, node.dy + 1);
+                }
+            }
+            built_[static_cast<std::size_t>(bg - 1)] = true;
+        }
+        return built_[0] && built_[1] && built_[2];
+    }
+
+    bool reachable(int bg, std::uint32_t map_x, std::uint32_t map_y) const {
+        if (bg < 1 || bg > 3 || map_x >= kWidth || map_y >= kHeight)
+            return false;
+        const std::size_t layer = static_cast<std::size_t>(bg - 1);
+        return built_[layer] &&
+               reachable_[layer][static_cast<std::size_t>(map_y) * kWidth +
+                                  map_x] != 0u;
+    }
+
+    // A seed is a cell observed directly in the authentic 240x160 canvas.
+    // Reachable-but-unseeded cells are only admitted because the bounded
+    // Palace margin envelope connected them to a native seed.
+    bool seeded(int bg, std::uint32_t map_x, std::uint32_t map_y) const {
+        if (bg < 1 || bg > 3 || map_x >= kWidth || map_y >= kHeight)
+            return false;
+        const std::size_t layer = static_cast<std::size_t>(bg - 1);
+        return built_[layer] &&
+               seeded_[layer][static_cast<std::size_t>(map_y) * kWidth +
+                              map_x] != 0u;
+    }
+
+    bool layer_built(int bg) const {
+        return bg >= 1 && bg <= 3 && built_[static_cast<std::size_t>(bg - 1)];
+    }
+
+private:
+    static std::uint16_t palace_map_id(const std::uint8_t* ewram,
+                                       std::size_t ewram_size,
+                                       std::size_t map_x,
+                                       std::size_t map_y) {
+        const std::size_t off = 0x10000u + (map_y * kWidth + map_x) * 4u;
+        if (!ewram || off + 4u > ewram_size) return kGoldenSunPalaceNoMapId;
+        return static_cast<std::uint16_t>(
+            (static_cast<std::uint32_t>(ewram[off]) |
+             (static_cast<std::uint32_t>(ewram[off + 1u]) << 8) |
+             (static_cast<std::uint32_t>(ewram[off + 2u]) << 16) |
+             (static_cast<std::uint32_t>(ewram[off + 3u]) << 24)) & 0x0FFFu);
+    }
+
+    std::array<std::array<std::uint8_t, kCellCount>, 3> reachable_{};
+    std::array<std::array<std::uint8_t, kCellCount>, 3> seeded_{};
+    std::array<bool, 3> built_{};
+    std::array<std::uint32_t, 3> seed_counts_{};
+};
+
+// WIDE-01 experimental off-screen cull safety net. Gated entirely by the
+// launcher's "Experimental Fixes" toggle (see kNativeMp2kButton-style wiring
+// in src/launcher_main.cpp and golden_sun_experimental_fixes_enabled() in
+// src/runner_main.cpp) -- normal play never calls any of this. Pure
+// functions, no I/O, no game state. See docs/issues/WIDE-01_NPC_IDENTITY.md,
+// "Update 2026-08-30 (numeric transform verification)" and the body-ground-
+// truth follow-up, for the evidence this is built from: the committed OAM
+// ATTR0/ATTR1 already are the on-screen coordinate (no scroll subtraction),
+// so this operates directly on the just-committed hardware bytes.
+
+// Resign a hardware 9-bit OAM X coordinate (0..511) to the signed value
+// WIDE-01_ENTITY_PRODUCER_FINDINGS.md's 77/77-exact X correlation uses:
+// standard two's-complement resign (>=256 -> subtract 512), except exactly
+// 256, which that correlation proved stays positive (its one documented
+// exception). Values above the already-shipped admitted edge
+// (kNativeWidth+extra_right, e.g. 299) resign negative same as any other
+// value >=257; this function does not special-case that whole band, only
+// the one proven point, matching the evidence on record.
+inline constexpr int golden_sun_experimental_resign_oam_x(std::uint32_t raw9) {
+    const std::uint32_t v = raw9 & 0x1FFu;
+    if (v == 256u) return 256;
+    return v >= 256u ? static_cast<int>(v) - 512 : static_cast<int>(v);
+}
+
+// Resign a hardware 8-bit OAM Y coordinate (0..255) to signed: standard
+// two's complement (>=128 -> subtract 256). WIDE-01_ENTITY_PRODUCER_FINDINGS.md
+// reports no observed exception for Y, unlike X.
+inline constexpr int golden_sun_experimental_resign_oam_y(std::uint32_t raw8) {
+    const std::uint32_t v = raw8 & 0xFFu;
+    return v >= 128u ? static_cast<int>(v) - 256 : static_cast<int>(v);
+}
+
+// Resolve only coordinates that are either exact pre-truncation provenance or
+// outside the hardware sign ambiguity.  A false result means the caller must
+// keep the sprite; no signed value is guessed.
+inline constexpr bool golden_sun_experimental_resolve_oam_x(
+    std::uint32_t raw9, bool exact, int exact_x, int* out_x) {
+    if (!out_x) return false;
+    const std::uint32_t raw = raw9 & 0x1FFu;
+    if (exact) {
+        if ((static_cast<std::uint32_t>(exact_x) & 0x1FFu) != raw)
+            return false;
+        *out_x = exact_x;
+        return true;
+    }
+    if (raw >= 256u) return false;
+    *out_x = static_cast<int>(raw);
+    return true;
+}
+
+inline constexpr bool golden_sun_experimental_resolve_oam_y(
+    std::uint32_t raw8, bool exact, int exact_y, int* out_y) {
+    if (!out_y) return false;
+    const std::uint32_t raw = raw8 & 0xFFu;
+    if (exact) {
+        if ((static_cast<std::uint32_t>(exact_y) & 0xFFu) != raw)
+            return false;
+        *out_y = exact_y;
+        return true;
+    }
+    if (raw >= 128u) return false;
+    *out_y = static_cast<int>(raw);
+    return true;
+}
+
+// Standard GBA OBJ shape (ATTR0 bits 14-15) x size (ATTR1 bits 14-15) pixel
+// table. WIDE-01_NPC_IDENTITY.md's "Sprite extent" section observed exactly
+// four combinations across every session mined for that document
+// (shape=0,size=1 -> 16x16; shape=0,size=2 -> 32x32; shape=1,size=0 -> 16x8;
+// shape=2,size=3 -> 32x64); the full standard table is included so any
+// shape/size decode stays well-defined, not just the observed four.
+inline constexpr void golden_sun_obj_half_extent(unsigned shape,
+                                                  unsigned size,
+                                                  int* out_half_w,
+                                                  int* out_half_h) {
+    constexpr int kWidths[3][4] = {
+        {8, 16, 32, 64},   // shape 0: square
+        {16, 32, 32, 64},  // shape 1: wide
+        {8, 8, 16, 32},    // shape 2: tall
+    };
+    constexpr int kHeights[3][4] = {
+        {8, 16, 32, 64},
+        {8, 8, 16, 32},
+        {16, 32, 32, 64},
+    };
+    const unsigned s = shape > 2u ? 0u : shape;
+    const unsigned z = size > 3u ? 0u : size;
+    if (out_half_w) *out_half_w = kWidths[s][z] / 2;
+    if (out_half_h) *out_half_h = kHeights[s][z] / 2;
+}
+
+// Decode the standard, non-affine OBJ size.  The culler uses the real
+// top-left origin and full dimensions; returning false keeps unusual/invalid
+// shapes visible rather than guessing.
+inline constexpr bool golden_sun_obj_dimensions(unsigned shape,
+                                                unsigned size,
+                                                int* out_width,
+                                                int* out_height) {
+    constexpr int kWidths[3][4] = {
+        {8, 16, 32, 64},
+        {16, 32, 32, 64},
+        {8, 8, 16, 32},
+    };
+    constexpr int kHeights[3][4] = {
+        {8, 16, 32, 64},
+        {8, 8, 16, 32},
+        {16, 32, 32, 64},
+    };
+    if (!out_width || !out_height || shape >= 3u || size >= 4u)
+        return false;
+    *out_width = kWidths[shape][size];
+    *out_height = kHeights[shape][size];
+    return true;
+}
+
+// Extra generosity is added only on the negative (left/top) side, where the
+// resign floor (-256 for X, -128 for Y) leaves unambiguous headroom past the
+// admitted viewport edge. The safety clamps below enforce this regardless of
+// the runtime margins passed in.
+inline constexpr int kGoldenSunExperimentalCullBuffer = 40;
+
+// Hard floors keep the negative edge away from the hardware wrap floors.
+// These are deliberately conservative fixed clamps, independent of whatever
+// extra_left/extra_top the caller passes, so a misconfigured or unusually
+// large margin can never produce a wrap-around reappearance.
+inline constexpr int kGoldenSunExperimentalMinSafeLeft = -220;
+inline constexpr int kGoldenSunExperimentalMinSafeTop = -80;
+
+// The GBA OBJ coordinate is the sprite's top-left pixel.
+inline constexpr bool golden_sun_experimental_sprite_fully_offscreen_top_left(
+    int screen_x, int screen_y, int width, int height,
+    std::uint32_t extra_left, std::uint32_t extra_right,
+    std::uint32_t extra_top, std::uint32_t extra_bottom) {
+    if (width <= 0 || height <= 0) return false;
+    const int right_edge =
+        static_cast<int>(kNativeWidth + extra_right);
+    const int bottom_edge =
+        static_cast<int>(kNativeHeight + extra_bottom);
+    int left_edge = -static_cast<int>(extra_left) -
+                    kGoldenSunExperimentalCullBuffer;
+    if (left_edge < kGoldenSunExperimentalMinSafeLeft)
+        left_edge = kGoldenSunExperimentalMinSafeLeft;
+    int top_edge = -static_cast<int>(extra_top) -
+                   kGoldenSunExperimentalCullBuffer;
+    if (top_edge < kGoldenSunExperimentalMinSafeTop)
+        top_edge = kGoldenSunExperimentalMinSafeTop;
+    return screen_x >= right_edge || screen_x + width <= left_edge ||
+           screen_y >= bottom_edge || screen_y + height <= top_edge;
 }
 
 }  // namespace gsr::widescreen

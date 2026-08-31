@@ -19,11 +19,19 @@ unidentified. Full evidence chain, ranked hypotheses, safety boundaries, and
 the approved bounded provenance diagnostic live in the durable companion
 [`CRASH-03_HANDOFF.md`](CRASH-03_HANDOFF.md).
 
+Session `20260828_102032` rebuilt the diagnostic-only first clean-to-poison
+latch. It records generated/bus/mirrored writer context and emits it with an
+invalid-dispatch dump; no crash behavior fix or completed poison-writer
+identity is claimed.
+
 ## Next action
 
 The handoff's bounded diagnostic is implemented: depth-8 slot write rings,
 `state_epoch` tags, restore/arm-time + auth-epoch CRC over
-`0x03007E00..0x03007E40`, and a synthetic `pool_ldm_probe_tests` ctest pass.
+`0x03007E00..0x03007E40`, plus a non-evicting first clean-to-
+`0xDCEF0210` transition latch covering generated, bus, and mirrored writes.
+The latch records writer context and is emitted in the invalid-dispatch dump;
+synthetic `pool_ldm_probe_tests` passes. This remains diagnostic-only.
 Take one root-launcher capture per NEXT_TASK.md. Do not patch guest state
 before a non-carrier poisoning writer is proven.
 

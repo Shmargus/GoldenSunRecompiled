@@ -52,6 +52,12 @@ bool g_test_ram_churn_probe = k_launcher_test_defaults.ram_churn_probe;
 bool g_test_oam_shadow_trace = k_launcher_test_defaults.oam_shadow_trace;
 bool g_widescreen_diagnostics =
     gsr::launcher_widescreen_diagnostics_default();
+// WIDE-01 experimental off-screen cull safety net (see
+// src/widescreen_policy.h, golden_sun_experimental_sprite_fully_offscreen).
+// Session-only, always starts unchecked -- same rule as the diagnostics
+// toggle above: normal play must never inherit a developer shell's leftover
+// setting.
+bool g_experimental_fixes = false;
 
 struct LauncherAudioSettings {
     bool native_mp2k = false;
@@ -467,13 +473,31 @@ void prune_old_logs(const fs::path& logs_dir) {
         const fs::path misses = events.wstring() + L".misses.csv";
         const fs::path recursion = events.wstring() + L".recursion.csv";
         const fs::path ram_churn = events.wstring() + L".ram-churn.csv";
+        const fs::path input = logs[i].wstring().substr(
+            0, logs[i].wstring().size() - 4) + L".input";
         fs::remove(logs[i], ec);
         fs::remove(events, ec);
         fs::remove(misses, ec);
         fs::remove(recursion, ec);
         fs::remove(ram_churn, ec);
         fs::remove(phase, ec);
+        fs::remove(input, ec);
+        for (unsigned suffix = 1; suffix < 1000; ++suffix) {
+            const fs::path suffixed = logs[i].wstring().substr(
+                0, logs[i].wstring().size() - 4) + L"_" +
+                std::to_wstring(suffix) + L".input";
+            fs::remove(suffixed, ec);
+        }
     }
+}
+
+bool create_empty_file_exclusive(const fs::path& path) {
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ,
+                              nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL,
+                              nullptr);
+    if (file == INVALID_HANDLE_VALUE) return false;
+    CloseHandle(file);
+    return true;
 }
 
 // Thread-safe sink for the two pipe-reader threads below. One HANDLE, one
@@ -752,6 +776,78 @@ int run_game(const fs::path& root, const std::wstring& rom,
     child_environment.set(L"GBARECOMP_VRAM_MAP_TRACE",
                           widescreen_diagnostics_policy.environment_value);
 
+    // WIDE-01 experimental off-screen cull safety net: launcher-owned and
+    // always explicit, same discipline as the diagnostics toggle above --
+    // unchecked always sends 0, even if a developer shell has this set.
+    child_environment.set(L"GBARECOMP_EXPERIMENTAL_FIXES",
+                          g_experimental_fixes ? L"1" : L"0");
+
+    // A WIDE-01 diagnostics launch must carry its exact user input sequence so
+    // the resulting RAM trace can be replayed. Replay and recording are
+    // mutually exclusive in the runner; reject an explicit conflict before
+    // spawning rather than allowing a partial, misleading session.
+    const std::wstring explicit_input_record =
+        inherited_environment_value(L"GBARECOMP_INPUT_RECORD");
+    const std::wstring input_replay =
+        inherited_environment_value(L"GBARECOMP_INPUT_REPLAY");
+    std::wstring automatic_input_path;
+    if (logging && input_replay.empty() && explicit_input_record.empty() &&
+        widescreen_diagnostics_policy.enabled) {
+        automatic_input_path = gsr::choose_unique_input_record_path(
+            log_path, [](const std::wstring& candidate) {
+                return fs::exists(fs::path(candidate));
+            });
+    }
+    const auto input_record_policy =
+        gsr::resolve_launcher_input_record_policy(
+            widescreen_diagnostics_policy.enabled, explicit_input_record,
+            !input_replay.empty(), automatic_input_path);
+    if (input_record_policy.replay_conflict) {
+        if (log_file != INVALID_HANDLE_VALUE) CloseHandle(log_file);
+        MessageBoxW(window,
+                    L"GBARECOMP_INPUT_RECORD cannot be used together with "
+                    L"GBARECOMP_INPUT_REPLAY.",
+                    L"Golden Sun Recompiled", MB_OK | MB_ICONERROR);
+        return 1;
+    }
+    if (widescreen_diagnostics_policy.enabled && input_replay.empty() &&
+        explicit_input_record.empty() && !input_record_policy.enabled) {
+        if (log_file != INVALID_HANDLE_VALUE) CloseHandle(log_file);
+        MessageBoxW(window,
+                    L"Widescreen diagnostics could not create its input "
+                    L"recording path.",
+                    L"Golden Sun Recompiled", MB_OK | MB_ICONERROR);
+        return 1;
+    }
+    if (input_record_policy.enabled) {
+        const fs::path input_path(input_record_policy.path);
+        std::error_code input_ec;
+        if (!input_path.parent_path().empty())
+            fs::create_directories(input_path.parent_path(), input_ec);
+        if (input_ec || fs::exists(input_path) ||
+            !create_empty_file_exclusive(input_path)) {
+            if (log_file != INVALID_HANDLE_VALUE) CloseHandle(log_file);
+            MessageBoxW(window,
+                        L"The input recording path could not be created "
+                        L"without overwriting an existing file.",
+                        L"Golden Sun Recompiled", MB_OK | MB_ICONERROR);
+            return 1;
+        }
+        child_environment.set(L"GBARECOMP_INPUT_RECORD",
+                              input_record_policy.path);
+    }
+    if (logging) {
+        const std::string state =
+            std::string("[launcher] input_record=") +
+            (input_record_policy.enabled ? "ENABLED path=\"" +
+                 wide_to_utf8(input_record_policy.path) + "\"\n"
+                                         : "DISABLED\n");
+        DWORD written = 0;
+        WriteFile(log_file, state.data(), static_cast<DWORD>(state.size()),
+                  &written, nullptr);
+        FlushFileBuffers(log_file);
+    }
+
     // These are diagnostics, never part of the faithful default. Explicitly
     // remove inherited values when the master checkbox is off so a
     // shell-launched value cannot silently turn this into a crutch run;
@@ -905,6 +1001,7 @@ constexpr int kAudioHelpText = 1012;
 constexpr int kCopySessionIdButton = 1013;
 constexpr int kOamShadowTraceButton = 1014;
 constexpr int kWideDiagnosticsButton = 1015;
+constexpr int kExperimentalFixesButton = 1016;
 
 fs::path g_launcher_root;
 std::wstring g_launcher_bios;
@@ -924,6 +1021,7 @@ void layout_buttons(HWND window) {
     HWND quit = GetDlgItem(window, kQuitButton);
     HWND test_variables = GetDlgItem(window, kTestVariablesButton);
     HWND wide_diagnostics = GetDlgItem(window, kWideDiagnosticsButton);
+    HWND experimental_fixes = GetDlgItem(window, kExperimentalFixesButton);
     if (pick) MoveWindow(pick, x, y, button_width, button_height, TRUE);
     if (quit) MoveWindow(quit, x + button_width + gap, y,
                          button_width, button_height, TRUE);
@@ -935,6 +1033,12 @@ void layout_buttons(HWND window) {
     const int wide_toggle_y = std::max<int>(0, y - toggle_height - 8);
     if (wide_diagnostics) {
         MoveWindow(wide_diagnostics, toggle_x, wide_toggle_y,
+                   wide_toggle_width, toggle_height, TRUE);
+    }
+    const int experimental_toggle_y =
+        std::max<int>(0, wide_toggle_y - toggle_height - 4);
+    if (experimental_fixes) {
+        MoveWindow(experimental_fixes, toggle_x, experimental_toggle_y,
                    wide_toggle_width, toggle_height, TRUE);
     }
 
@@ -1059,6 +1163,7 @@ LRESULT CALLBACK launcher_window_proc(HWND window, UINT message,
         // noisy on the next launcher invocation.
         g_widescreen_diagnostics =
             gsr::launcher_widescreen_diagnostics_default();
+        g_experimental_fixes = false;
         g_test_variables = k_launcher_test_defaults.master;
         g_test_selfheal_ram = k_launcher_test_defaults.self_heal_ram;
         g_test_cost_probe = k_launcher_test_defaults.cost_probe;
@@ -1088,6 +1193,20 @@ LRESULT CALLBACK launcher_window_proc(HWND window, UINT message,
                          reinterpret_cast<WPARAM>(g_button_font), TRUE);
             SendMessageW(wide_diagnostics, BM_SETCHECK,
                          g_widescreen_diagnostics
+                             ? BST_CHECKED : BST_UNCHECKED,
+                         TRUE);
+        }
+        HWND experimental_fixes = CreateWindowExW(
+            0, L"BUTTON", L"Experimental Fixes",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+            0, 0, 0, 0, window,
+            reinterpret_cast<HMENU>(kExperimentalFixesButton),
+            GetModuleHandleW(nullptr), nullptr);
+        if (experimental_fixes) {
+            SendMessageW(experimental_fixes, WM_SETFONT,
+                         reinterpret_cast<WPARAM>(g_button_font), TRUE);
+            SendMessageW(experimental_fixes, BM_SETCHECK,
+                         g_experimental_fixes
                              ? BST_CHECKED : BST_UNCHECKED,
                          TRUE);
         }
@@ -1233,6 +1352,12 @@ LRESULT CALLBACK launcher_window_proc(HWND window, UINT message,
         if (LOWORD(w_param) == kWideDiagnosticsButton) {
             g_widescreen_diagnostics = SendMessageW(
                 GetDlgItem(window, kWideDiagnosticsButton), BM_GETCHECK, 0, 0) ==
+                BST_CHECKED;
+            return 0;
+        }
+        if (LOWORD(w_param) == kExperimentalFixesButton) {
+            g_experimental_fixes = SendMessageW(
+                GetDlgItem(window, kExperimentalFixesButton), BM_GETCHECK, 0, 0) ==
                 BST_CHECKED;
             return 0;
         }
@@ -1435,6 +1560,13 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         // This path is deliberately opt-in and uses the same cached ROM plus
         // exact SHA-1 validation as the normal Pick ROM button. It exists so
         // scripted replay can still enter through GoldenSunLauncher.exe.
+        // Developer replay captures may opt into the existing WIDE-01 trace
+        // without requiring the interactive checkbox. Normal launches still
+        // reset this choice to the explicit UI default below.
+        g_widescreen_diagnostics = inherited_environment_truthy(
+            L"GBARECOMP_VRAM_MAP_TRACE");
+        g_experimental_fixes = inherited_environment_truthy(
+            L"GBARECOMP_EXPERIMENTAL_FIXES");
         const fs::path cached_path = root / L"local" / L"launcher-rom.txt";
         const std::wstring cached_rom = read_cached_path(cached_path);
         std::wstring error;

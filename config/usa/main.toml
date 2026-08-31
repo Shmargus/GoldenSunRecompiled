@@ -9,8 +9,7 @@
 # reviewed section seeds: 2539
 # reviewed interworking resumes: 216
 # derived veneer resumes: 705
-# reviewed THUMB ALU immediate overrides: 6
-# reviewed THUMB literal overrides: 2
+# reviewed conditional branch overrides: 10
 # reviewed resume ranges: 442 from 185 function(s)
 
 [program]
@@ -25,37 +24,45 @@ codegen_shards = 32
 [identity]
 sha1 = "5c4695205413df7db52b9a184815a07783999971"
 
-[[thumb_alu_immediate_override]]
-addr = 0x0800b27c
-note = "Mode-0 equal-scroll field only: Func_b168 alternate screen-Y cmp r6,#159; runner widens the measured bottom edge with per-slot OAM provenance"
+[[conditional_branch_override]]
+addr = 0x0800b27e
+note = "Func_b168 screen-Y BGT: force the reviewed writer path in strict Expanded Widescreen 360x240 only"
 
-[[thumb_alu_immediate_override]]
-addr = 0x0800b322
-note = "Mode-0 widescreen only: Func_b168 screen-X cull is cmp r4,#239 at this exact ROM PC; runner widens to the authenticated right margin"
+[[conditional_branch_override]]
+addr = 0x0800b324
+note = "Func_b168 screen-X BGT: force the reviewed writer path in strict Expanded Widescreen 360x240 only"
 
-[[thumb_alu_immediate_override]]
-addr = 0x0800b326
-note = "Mode-0 equal-scroll field only: Func_b168 screen-Y cmp r6,#159; runner widens the measured bottom edge with per-slot OAM provenance"
+[[conditional_branch_override]]
+addr = 0x0800b328
+note = "Func_b168 screen-Y BGT: force the reviewed writer path in strict Expanded Widescreen 360x240 only"
 
-[[thumb_alu_immediate_override]]
-addr = 0x0800b3ca
-note = "WIDE-01 diagnostic route: Func_b388 shared negative X/Y actor pre-cull; no override until an executed authenticated path proves semantics"
+[[conditional_branch_override]]
+addr = 0x0800b3d2
+note = "Func_b388 lower-X BGE: bypass the padded reject in strict Expanded Widescreen 360x240 only"
 
-[[thumb_alu_immediate_override]]
-addr = 0x0800b3d6
-note = "WIDE-01 diagnostic route: Func_b388 actor X upper pre-cull half-limit; no override until an executed authenticated path proves semantics"
+[[conditional_branch_override]]
+addr = 0x0800b3dc
+note = "Func_b388 upper-X BLE: bypass the padded reject in strict Expanded Widescreen 360x240 only"
 
-[[thumb_alu_immediate_override]]
-addr = 0x0800b3ea
-note = "WIDE-01 diagnostic route: Func_b388 actor Y upper pre-cull; vertical widening remains disabled"
+[[conditional_branch_override]]
+addr = 0x0800b3e6
+note = "Func_b388 lower-Y BGE: bypass the padded reject in strict Expanded Widescreen 360x240 only"
 
-[[thumb_literal_override]]
-addr = 0x0800c6f2
-note = "Mode-0 expanded-view only: Func_c62c field-list X upper bound LDR literal 0x012ffffe at the source PC; runner adds the active right margin in 16.16 fixed-point"
+[[conditional_branch_override]]
+addr = 0x0800b3ec
+note = "Func_b388 upper-Y BLE: bypass the padded reject in strict Expanded Widescreen 360x240 only"
 
-[[thumb_literal_override]]
-addr = 0x0800c6fe
-note = "Mode-0 expanded-view only: Func_c62c field-list Y lower bound LDR literal -32px at the source PC; runner extends the authenticated top margin while preserving the native padding"
+[[conditional_branch_override]]
+addr = 0x0800c6fa
+note = "Func_c62c upper-X BLS: bypass the direct reject route in strict Expanded Widescreen 360x240 only"
+
+[[conditional_branch_override]]
+addr = 0x0800c702
+note = "Func_c62c lower-Y BLE: bypass the direct reject route in strict Expanded Widescreen 360x240 only"
+
+[[conditional_branch_override]]
+addr = 0x0800c708
+note = "Func_c62c upper-Y BGT: bypass the direct reject route in strict Expanded Widescreen 360x240 only"
 
 [[code_copy]]
 runtime_start = 0x03000000
