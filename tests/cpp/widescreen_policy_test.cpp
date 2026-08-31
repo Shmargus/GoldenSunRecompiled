@@ -1529,5 +1529,98 @@ int main() {
             return 1;
         }
     }
+
+    // Terrain-only Mode0ScrollMismatch field (non-Palace split scroll),
+    // WIDE-01/margin follow-up. golden_sun_field_terrain_bg must pick the
+    // lowest-indexed enabled regular BG among BG1..BG3 from live DISPCNT
+    // state, not a fixed literal, and return 0 (never a valid field bg) when
+    // none is enabled.
+    if (golden_sun_field_terrain_bg(
+            kDispcntMode0 | kDispcntBg1 | kDispcntBg2 | kDispcntBg3) != 1 ||
+        golden_sun_field_terrain_bg(kDispcntMode0 | kDispcntBg2 |
+                                    kDispcntBg3) != 2 ||
+        golden_sun_field_terrain_bg(kDispcntMode0 | kDispcntBg3) != 3 ||
+        golden_sun_field_terrain_bg(kDispcntMode0) != 0) {
+        std::puts("widescreen_policy_test: field terrain bg selection wrong");
+        return 1;
+    }
+
+    // golden_sun_field_tilemap_entry must reject a Mode0ScrollMismatch
+    // lookup unless the caller opts in with allow_mismatch_terrain, and even
+    // then must use the requested layer's own raw scroll register directly
+    // -- no cross-layer reconstruction or guessed delta, exactly like the
+    // AuthorizedMode0 (equal-scroll) path above.
+    {
+        std::array<std::uint8_t, 0x400> split_io{};
+        constexpr std::uint16_t split_dispcnt =
+            kDispcntMode0 | kDispcntBg1 | kDispcntBg2 | kDispcntBg3;
+        constexpr std::uint16_t split_bgcnt = 0x0180u;  // 256-colour, 256x256.
+        store16(split_io, 0x0A, split_bgcnt);
+        store16(split_io, 0x0C, split_bgcnt);
+        store16(split_io, 0x0E, split_bgcnt);
+        store16(split_io, 0x14, 100u);  // BG1 HOFS.
+        store16(split_io, 0x16, 50u);   // BG1 VOFS.
+        store16(split_io, 0x18, 932u);  // BG2 HOFS (distant/backdrop layer).
+        store16(split_io, 0x1A, 346u);  // BG2 VOFS.
+        store16(split_io, 0x1C, 300u);  // BG3 HOFS.
+        store16(split_io, 0x1E, 200u);  // BG3 VOFS.
+        if (golden_sun_wide_margin_policy_reason(split_dispcnt,
+                                                 split_io.data()) !=
+            GoldenSunWidePolicyReason::Mode0ScrollMismatch) {
+            std::puts("widescreen_policy_test: split fixture is not a "
+                      "Mode0ScrollMismatch scene");
+            return 1;
+        }
+
+        std::vector<std::uint8_t> split_ewram(0x28000u, 0);
+        // BG1's own raw (100, 50) at hw_x=0/screen_y=0 addresses tile
+        // (tile_x=12, tile_y=6), i.e. map cell (map_x=6, map_y=3). Author
+        // that cell with metatile id 7 and its (tile_x even, tile_y even)
+        // raw slot with a recognizable payload.
+        store32(split_ewram, 0x10000u + (3u * 128u + 6u) * 4u, 7u);
+        store16(split_ewram, 0x20000u + 7u * 8u + 0u * 4u + 0u * 2u, 0x1234u);
+
+        // hw_x/screen_y are inside the authentic 240x160 canvas here (0,0)
+        // purely to keep the map-cell arithmetic above simple; every real
+        // caller of this path only ever queries margin (off-canvas)
+        // coordinates, so allow_native_x=true stands in for that here.
+        std::uint16_t entry_gated = 0;
+        if (golden_sun_field_tilemap_entry(
+                split_dispcnt, split_io.data(), split_io.size(),
+                split_ewram.data(), split_ewram.size(), 1, 0, 0,
+                &entry_gated, nullptr, nullptr, true)) {
+            std::puts("widescreen_policy_test: Mode0ScrollMismatch lookup "
+                      "accepted without allow_mismatch_terrain");
+            return 1;
+        }
+
+        GoldenSunFieldTilemapMetadata meta_terrain;
+        std::uint16_t entry_terrain = 0;
+        if (!golden_sun_field_tilemap_entry(
+                split_dispcnt, split_io.data(), split_io.size(),
+                split_ewram.data(), split_ewram.size(), 1, 0, 0,
+                &entry_terrain, &meta_terrain, nullptr, true, false, true) ||
+            entry_terrain != 0x1234u || meta_terrain.map_x != 6u ||
+            meta_terrain.map_y != 3u) {
+            std::puts("widescreen_policy_test: terrain layer did not use its "
+                      "own raw scroll register");
+            return 1;
+        }
+
+        // The non-terrain BG2/BG3 layers must not be reachable through this
+        // gate at all, even with allow_mismatch_terrain set -- margins for
+        // them come from nowhere; the caller must reject those bg indices
+        // outright rather than call into this lookup for them.
+        std::uint16_t entry_backdrop = 0;
+        if (golden_sun_field_tilemap_entry(
+                split_dispcnt, split_io.data(), split_io.size(),
+                split_ewram.data(), split_ewram.size(), 2, 0, 0,
+                &entry_backdrop, nullptr, nullptr, true, false, true) &&
+            entry_backdrop == 0x1234u) {
+            std::puts("widescreen_policy_test: BG2 unexpectedly resolved the "
+                      "terrain layer's map cell");
+            return 1;
+        }
+    }
     return 0;
 }

@@ -872,6 +872,30 @@ struct GoldenSunMode0SplitScrollFrame {
     bool authorized = false;
 };
 
+// Field maps whose BG1/BG2/BG3 scroll registers disagree (see
+// Mode0ScrollMismatch above) are not McCoy Palace's exact fingerprint, and no
+// per-room offset between the layers is proven stable (a prior attempt to
+// live-measure and reconstruct one produced visibly misaligned margins and
+// was removed). Rather than guess a cross-layer relationship, only the
+// field's own terrain/gameplay layer is widened, using its own raw scroll
+// directly -- exactly the technique the already-correct equal-scroll path
+// uses for every layer when they all agree. The other two layers contribute
+// nothing outside the native 240x160 canvas.
+//
+// The terrain layer is the lowest-indexed regular BG among BG1..BG3 that
+// DISPCNT currently reports enabled, so the choice is derived from live
+// layer-enable state each frame rather than a fixed literal. Every measured
+// field scene requires BG1/BG2/BG3 all enabled to reach this classification
+// (see the Mode0Layers gate above), so this resolves to BG1 in every case
+// proven so far; a future room where that is not true would need its own
+// measurement before this helper could return anything else.
+inline constexpr int golden_sun_field_terrain_bg(std::uint16_t dispcnt) {
+    if ((dispcnt & kDispcntBg1) != 0) return 1;
+    if ((dispcnt & kDispcntBg2) != 0) return 2;
+    if ((dispcnt & kDispcntBg3) != 0) return 3;
+    return 0;
+}
+
 inline constexpr unsigned golden_sun_wide_margin_policy(
     std::uint16_t dispcnt, const std::uint8_t* io) {
     return golden_sun_wide_policy_authorized(
@@ -1227,9 +1251,16 @@ inline bool golden_sun_field_tilemap_entry(
     int screen_y, std::uint16_t* out_entry,
     GoldenSunFieldTilemapMetadata* out_metadata = nullptr,
     const GoldenSunFieldAuthoredMap* authored = nullptr,
-    bool allow_native_x = false, bool allow_split_scroll = false) {
+    bool allow_native_x = false, bool allow_split_scroll = false,
+    bool allow_mismatch_terrain = false) {
     // `allow_split_scroll` is reserved for the separately authenticated Palace
     // class. It does not relax any coordinate, source-bound, or sentinel check.
+    // `allow_mismatch_terrain` permits the Mode0ScrollMismatch policy reason
+    // to reach this lookup for the field's terrain layer only (see
+    // golden_sun_field_terrain_bg); every layer, including the terrain layer,
+    // always reads its own raw scroll register directly. There is no
+    // cross-layer reconstruction: a prior attempt at one guessed an unproven
+    // delta and produced visibly wrong margins.
     constexpr std::size_t kMapBase = 0x10000u;
     constexpr std::size_t kRawBase = 0x20000u;
     constexpr std::size_t kMapBytes = 128u * 128u * 4u;
@@ -1252,7 +1283,9 @@ inline bool golden_sun_field_tilemap_entry(
     if (policy_reason != GoldenSunWidePolicyReason::AuthorizedMode0 &&
         !(allow_split_scroll &&
           golden_sun_mode0_split_scroll_policy_reason(dispcnt, io) ==
-              GoldenSunWidePolicyReason::AuthorizedMode0SplitScroll)) {
+              GoldenSunWidePolicyReason::AuthorizedMode0SplitScroll) &&
+        !(allow_mismatch_terrain &&
+          policy_reason == GoldenSunWidePolicyReason::Mode0ScrollMismatch)) {
         return false;
     }
 

@@ -198,6 +198,14 @@ GoldenSunFieldAuthScene g_golden_sun_field_auth_scene =
 bool g_golden_sun_expanded_obj_scene = false;
 gsr::widescreen::GoldenSunMode0SplitScrollFrame
     g_golden_sun_mode0_split_scroll_frame;
+// Terrain-only Mode0ScrollMismatch field (non-Palace split scroll): see
+// gsr::widescreen::golden_sun_field_terrain_bg. Deliberately separate from
+// g_golden_sun_mode0_field/g_golden_sun_mode0_split_scroll above so it
+// cannot change BG0 suppression or the OBJ scene gate (g_golden_sun_
+// expanded_obj_scene) that those two already-authenticated flags drive; it
+// only widens the BG margin tilemap provider below, and only for the one
+// field layer whose own raw scroll is trusted directly.
+bool g_golden_sun_mode0_terrain_field = false;
 
 // Declared here because the diagnostics-only B328 candidate table is defined
 // before the staging-record helpers below.
@@ -4673,7 +4681,17 @@ unsigned golden_sun_wide_margin_policy_callback(
     const bool split_frame_authorized =
         g_golden_sun_mode0_split_scroll_frame.observe(
             runtime_current_frame(), split_row, expected_rows);
-    const unsigned flags = split_frame_authorized ? 0u : generic_flags;
+    // Terrain-only Mode0ScrollMismatch field (non-Palace split scroll): this
+    // is a direct, immediate per-row classification like AuthorizedMode0
+    // above, not a multi-frame stability gate -- there is no cross-layer
+    // offset being trusted, only the terrain layer's own live register (see
+    // golden_sun_field_terrain_bg / golden_sun_wide_tilemap_provider below).
+    const bool terrain_field_row =
+        !split_frame_authorized &&
+        reason == GoldenSunWidePolicyReason::Mode0ScrollMismatch;
+    g_golden_sun_mode0_terrain_field = terrain_field_row;
+    const unsigned flags =
+        (split_frame_authorized || terrain_field_row) ? 0u : generic_flags;
     trace_golden_sun_wide_scene(dispcnt, io, flags);
     if (io) {
         std::memcpy(g_golden_sun_wide_line_io.data(), io,
@@ -4734,6 +4752,16 @@ int golden_sun_wide_tilemap_provider(int bg, int hw_x, int screen_y,
     const bool equal_scroll_field = g_golden_sun_mode0_field;
     const bool split_scroll_palace = g_golden_sun_mode0_split_scroll &&
         g_golden_sun_palace_table_authorized;
+    // Terrain-only non-Palace split-scroll field; see
+    // golden_sun_field_terrain_bg. Mutually exclusive with the Palace path
+    // by construction (g_golden_sun_mode0_terrain_field is only ever set
+    // when split_frame_authorized is false), kept explicit here too.
+    const bool terrain_field =
+        g_golden_sun_mode0_terrain_field && !split_scroll_palace;
+    const int terrain_bg = terrain_field
+        ? gsr::widescreen::golden_sun_field_terrain_bg(
+              g_golden_sun_wide_line_dispcnt)
+        : 0;
 
     GoldenSunFieldProviderTrace* trace = nullptr;
     if (golden_sun_wide_diagnostics_enabled() && bg >= 0 && bg < 4) {
@@ -4766,9 +4794,16 @@ int golden_sun_wide_tilemap_provider(int bg, int hw_x, int screen_y,
         if (trace) ++trace->replacements;
         return gba::kWsTilemapReplace;
     };
-    if (!g_ws_active || (!equal_scroll_field && !split_scroll_palace) ||
+    if (!g_ws_active ||
+        (!equal_scroll_field && !split_scroll_palace && !terrain_field) ||
         !g_golden_sun_wide_line_io_valid) {
         return reject(true, false, false, false);
+    }
+    // The terrain-only field draws margins solely from its own gameplay
+    // layer; every other BG index contributes nothing outside the native
+    // canvas rather than guessing a cross-layer position for it.
+    if (terrain_field && bg != terrain_bg) {
+        return reject(false, true, false, false);
     }
     // This is a presentation-time read of the already-active EWRAM image.
     // It does not use bus_read_* and therefore cannot mutate guest timing or
@@ -4813,13 +4848,16 @@ int golden_sun_wide_tilemap_provider(int bg, int hw_x, int screen_y,
         }
     }
 
+    // The terrain layer (when active) and every equal-scroll/Palace layer
+    // all read their own live raw scroll register directly -- no cross-layer
+    // reconstruction.
     gsr::widescreen::GoldenSunFieldTilemapMetadata metadata;
     const bool resolved = gsr::widescreen::golden_sun_field_tilemap_entry(
                 g_golden_sun_wide_line_dispcnt,
                 g_golden_sun_wide_line_io.data(),
                 g_golden_sun_wide_line_io.size(), bus->ewram_ptr(),
                 256u * 1024u, bg, hw_x, screen_y, out_entry, &metadata,
-                nullptr, false, split_scroll_palace);
+                nullptr, false, split_scroll_palace, terrain_field);
     const auto record_palace = [&](GoldenSunPalaceMarginOutcome outcome) {
         if (split_scroll_palace)
             g_golden_sun_palace_margin_diagnostics.record(
