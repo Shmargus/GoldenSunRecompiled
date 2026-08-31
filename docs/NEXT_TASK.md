@@ -1,5 +1,10 @@
 # Next task — WIDE-01 NPC vertical-culling acceptance
 
+> **2026-08-31 session:** start from
+> [`issues/SESSION_HANDOFF_2026-08-31.md`](issues/SESSION_HANDOFF_2026-08-31.md).
+> Widescreen margins were reworked and need visual retest first.
+> The NPC culling task below is still open and untouched.
+
 Date: 2026-08-30. Keep dynamic RAM **NOT_STATIC**.
 
 The opt-in Expanded culler now requires exact same-frame source/placement
