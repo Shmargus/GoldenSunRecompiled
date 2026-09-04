@@ -1,5 +1,8 @@
 # Enhanced Timing Plan
 
+> **Shelved 2026-09-04.** Not on the current roadmap. Kept because part of
+> it is built. Do not resume without saying so first.
+
 ## Goal
 
 Provide a smoother PC experience than original GBA hardware:
@@ -49,7 +52,7 @@ Steps 1-4 are **done and shipped**: Enhanced Timing exists as a default-off
 setting with exact 60/120 pacing and resampled audio, and the user's choice
 persists. Step 5 (the one-hour A/V drift test) has **not** been run and is the
 gate blocking Enhanced Timing from ever becoming a default — see PRES-01 in
-`docs/ACTIVE_ISSUES.md`. Steps 6-7, dynamic CPU headroom, are **not built**.
+`ROADMAP.md`. Steps 6-7, dynamic CPU headroom, are **not built**.
 
 Note that the manual guest CPU overclock that did ship is a *different* thing
 from step 6: it is a blunt user-chosen multiplier, not a measured per-frame

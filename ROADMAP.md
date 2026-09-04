@@ -139,6 +139,15 @@ Detail is preserved in `docs/features/MP2K.md`, with the issue records in
 
 Do not pick this up without saying so first.
 
+## Shelved — enhanced timing
+
+Also **shelved, not abandoned.** A plan for smoother-than-hardware
+presentation: stable 60 Hz guest updates and exact 120 Hz presentation with 2x
+interpolation. Part of it is built; the dynamic CPU headroom steps are not.
+
+Detail in `docs/features/ENHANCED_TIMING.md`. Do not resume without saying so
+first.
+
 ## Out of scope
 
 - **Full decompilation.** ~6,000 real functions, ~1.3 MB of code; comparable
