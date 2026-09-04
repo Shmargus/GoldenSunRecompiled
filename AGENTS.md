@@ -12,6 +12,42 @@ kept in `docs/OLD/`).
 Run Golden Sun on native C++ with the ROM used only for assets, and be able to
 change how it works. Readable generated code is explicitly **not** a goal.
 
+## Start of session — read these three, nothing more
+
+1. `AGENTS.md` — this file. How to work.
+2. `ROADMAP.md` — the goal and the current milestone.
+3. `FACTS.md` — what has already been measured.
+
+That is the whole default reading list. **Do not read the docs folder to "get
+oriented".** Load a further file only when the task actually calls for it, using
+the routing below, and load the specific file rather than its whole directory.
+
+### Load only when the task needs it
+
+| Working on | Read |
+|---|---|
+| Map data, room layout, reconstructing a room (milestone 1) | `ROADMAP.md` milestone 1 and the map section of `FACTS.md`; the tables live at `0x02010000` and `0x02020000` |
+| Rendering, presentation, the room buffer | `ARCHITECTURE.md` — repository boundary and native presentation sections |
+| The function tracer | `src/function_tracer.h` first, then `.cpp` only if changing it |
+| Overlays, RAM-resident code, dispatch identity | `docs/OVERLAYS.md`, `docs/GS011_TRANSIENT_IMAGES.md` |
+| Symbols, importing names or addresses | `docs/SYMBOL_IMPORT.md` |
+| Build failures, profiling, headless runs | the Builds section below, then `docs/DEBUGGING.md` |
+| Why something was decided the way it was | `DECISIONS.md` |
+| Repository layout, where things live | `docs/WORKSPACE_LAYOUT.md` |
+| Audio — shelved, do not start unprompted | `docs/features/MP2K.md` |
+
+### Never load these into context
+
+- `docs/OLD/` — superseded. Open a single named file from it only when
+  explicitly auditing history, never to orient yourself.
+- `local/gs011/` — the generated corpus, ~187 MB across 34 files. Grep it if you
+  must; never read a file from it whole.
+- `build/` — generated output.
+- Subagent transcript files under the scratchpad — they will overflow context.
+
+If you find yourself reading a fourth or fifth file before doing any work, stop
+and ask instead.
+
 ## Two hard rules
 
 **1. Never pick a number without measuring it.**
@@ -145,9 +181,12 @@ Three files, kept current:
 - `FACTS.md` — verified findings with their evidence. Add to it whenever
   something is measured; never record a guess here.
 
-`docs/OLD/` is superseded material. It is kept because several files hold real
-measurements and dead ends worth not repeating, but nothing in it is current
-guidance and none of it should be treated as a task plan.
+When you measure something, add it to `FACTS.md`. When direction changes, update
+`ROADMAP.md`. Neither is a chat log — record the finding, not the session.
+
+`docs/OLD/` is superseded material, kept because several files hold real
+measurements and dead ends worth not repeating. Nothing in it is current
+guidance and none of it is a task plan.
 
 `CLAUDE.md` is a pointer to this file so both Claude Code and Codex load the
 same rules.
