@@ -13,6 +13,7 @@
 #include "crc32.h"
 #include "blitter_shadow_observer.h"
 #include "crash_handler.h"
+#include "function_tracer.h"
 #include "gba_bus.h"
 #include "gba_ppu.h"
 #include "gba_vram_trace.h"
@@ -7378,6 +7379,8 @@ void golden_sun_function_entry_observer(std::uint32_t entry_pc) {
     golden_sun_obj_f0_entry_capture(entry_pc);
     golden_sun_obj_staging_handoff(entry_pc);
     blitter_function_entry(entry_pc);
+    // Costs one predictable branch when the tracer is disabled.
+    gsr::function_tracer_on_entry(entry_pc);
 }
 
 void blitter_shadow_dispatch(std::uint32_t pc, int thumb) {
@@ -8490,6 +8493,56 @@ void print_usage() {
 
 }  // namespace
 
+// Cross-TU accessors for gsr::function_tracer (src/function_tracer.cpp).
+// Deliberately outside the anonymous namespace above so they get ordinary
+// external linkage; the preceding block's state is still reachable here via
+// the unnamed-namespace using-directive. Only called from the tracer's
+// per-frame sample boundary, never the hot path.
+//
+// kTransientCodeImages holds two different kinds of row: small IWRAM
+// identity-gate stubs and the large EWRAM overlay banks named
+// "overlay_rom_*". Only the latter are meaningful here -- reporting a stub
+// in their place is worse than reporting nothing. Several banks can be
+// matched at once, so this is an index-based iterator: call with
+// i = 0, 1, 2, ... until it returns nullptr.
+extern "C" const char* gsr_overlay_name_at(std::size_t i) {
+    std::size_t seen = 0;
+    for (std::size_t idx = 0; idx < kTransientCodeImages.size(); ++idx) {
+        const char* name = kTransientCodeImages[idx].name;
+        if (std::strncmp(name, "overlay_rom_", 12) != 0) continue;
+        if (!g_verified_identity_cache[idx].valid ||
+            !g_verified_identity_cache[idx].matched) {
+            continue;
+        }
+        if (seen == i) return name;
+        ++seen;
+    }
+    return nullptr;
+}
+
+// TODO-EVIDENCE: room identity is not currently readable.
+//
+// The GSR_MAP_RECORD diagnostic that provided it was lost on 2026-09-04 when
+// uncommitted work was destroyed by a git checkout during recovery from a
+// half-finished widescreen removal. What was measured survives in FACTS.md:
+// the pointer at 0x03001E70 is always 0x02030CCC and is useless as an
+// identity, while the four bounds values beside it took 23 distinct
+// combinations that tracked real room changes.
+//
+// What did NOT survive is the exact layout -- the offsets and widths of those
+// four bounds fields relative to the room struct. Guessing them would violate
+// the evidence rule in AGENTS.md, so this returns false until the layout is
+// re-established by watching the writes. The tracer already treats an
+// unavailable identity as a normal case; room tagging is simply absent.
+extern "C" bool gsr_map_record_identity(std::uint32_t* room_ptr,
+                                        std::uint32_t* min_x,
+                                        std::uint32_t* min_y,
+                                        std::uint32_t* ext_x,
+                                        std::uint32_t* ext_y) {
+    (void)room_ptr; (void)min_x; (void)min_y; (void)ext_x; (void)ext_y;
+    return false;
+}
+
 int main(int argc, char** argv) {
     // Must be the FIRST thing in main, before SDL init or any other
     // subsystem, so as much of the run as possible is covered. nullptr =
@@ -8513,6 +8566,7 @@ int main(int argc, char** argv) {
     options.builtin_game_name = "Golden Sun";
     options.builtin_rom_sha1 = kRomSha1;
     options.function_entry_observer = golden_sun_function_entry_observer;
+    gsr::function_tracer_init();
     options.max_view_width = 360;
     options.max_view_height = 240;
     options.frame_interpolation_available = true;

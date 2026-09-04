@@ -1319,15 +1319,21 @@ LRESULT CALLBACK launcher_window_proc(HWND window, UINT message,
         };
         const TestChildControl children[] = {
             {kSelfHealRamButton, L"Self-heal RAM"},
-            {kCostProbeButton, L"Cost probe"},
-            {kPresentCadenceButton, L"Present cadence"},
-            {kBlitterShadowButton, L"Blitter shadow"},
-            {kRecursionProbeButton, L"Recursion probe"},
-            {kRamChurnProbeButton, L"RAM churn probe"},
-            {kOamShadowTraceButton, L"OAM shadow writer trace"},
-            {kObjParkCensusButton, L"Log off-screen sprite positions"},
-            {kMapRecordButton, L"Record map data per room"},
             {kFunctionTracerButton, L"Function tracer"},
+            // Hidden 2026-09-04 to keep the launcher focused on the two
+            // toggles current work needs. The flags, ids and environment
+            // plumbing all remain, so restoring one is a matter of
+            // uncommenting its line here. "Record map data per room" is
+            // additionally dead: the GSR_MAP_RECORD diagnostic it drove no
+            // longer exists (see gsr_map_record_identity in runner_main.cpp).
+            // {kCostProbeButton, L"Cost probe"},
+            // {kPresentCadenceButton, L"Present cadence"},
+            // {kBlitterShadowButton, L"Blitter shadow"},
+            // {kRecursionProbeButton, L"Recursion probe"},
+            // {kRamChurnProbeButton, L"RAM churn probe"},
+            // {kOamShadowTraceButton, L"OAM shadow writer trace"},
+            // {kObjParkCensusButton, L"Log off-screen sprite positions"},
+            // {kMapRecordButton, L"Record map data per room"},
         };
         for (const TestChildControl& child : children) {
             CreateWindowExW(0, L"BUTTON", child.label,
