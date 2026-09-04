@@ -116,3 +116,6 @@ RUN BATTLE PROBE.ps1
 # Local trace launcher (see WIDE-05); regenerable, not committed
 TRACE MAP.ps1
 logs/mmio_map_*.csv
+
+# Local Claude Code settings carry absolute paths; never commit them.
+.claude/settings.local.json

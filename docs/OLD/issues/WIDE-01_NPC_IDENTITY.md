@@ -203,8 +203,8 @@ reproduced. Nothing here overrides or edits any prior finding in
 Replay run via `scripts/gs-replay.ps1` (root launcher only, secondary monitor,
 `-Mute`, no focus steal) using `logs/session_20260829_234316.input`
 (1183 frames) on the savestate that session's own log names
-(`savestate_loaded slot=2 path="C:\Users\Jimmy\Documents\rom\Golden
-Sun.state2"`), with `build/gs011_opt/config.ini` `[Enhancements]
+(`savestate_loaded slot=2`, the Golden Sun savestate in the user's own
+ROM directory), with `build/gs011_opt/config.ini` `[Enhancements]
 Widescreen=true` / `ViewMode=2` set beforehand and restored afterward
 (verified no `GoldenSunRecomp`/`GoldenSunLauncher` process was running
 before restoring, and re-read the file after - back to

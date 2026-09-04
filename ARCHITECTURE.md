@@ -32,7 +32,7 @@ This repository owns only Golden Sun-specific integration:
 - Main binary and overlay metadata.
 - Symbol importers.
 - Game runner configuration.
-- Narrow presentation policy, later.
+- Native presentation drawn from the game's own data — see below.
 - Game-specific regression scenarios.
 
 The `gbarecomp` platform core owns:
@@ -111,6 +111,27 @@ The baseline path must use original hardware semantics:
 - Timing through the runtime scheduler.
 
 Optional enhanced presentation may observe or shadow baseline output later, but it must never become the verification oracle.
+
+## Native presentation
+
+The intended direction (see `ROADMAP.md`) is to draw the field natively from
+the game's own map data — reconstructing a room into a buffer when it is
+entered, rather than resolving each pixel while rendering. This lives in this
+repository, not upstream, because it depends on Golden Sun's map layout.
+
+Two constraints follow from the accuracy boundary above:
+
+- The emulated hardware path remains the oracle. Native drawing is a layer over
+  it, never the reference it is checked against.
+- The game's own code still runs and still writes hardware registers. Whatever
+  it asks for mid-frame must be honoured or the picture is wrong, regardless of
+  how the pixels are produced.
+
+An earlier attempt inverted this: it hooked the per-pixel tile lookup and
+invented margin content, then culled whatever came out wrong. That approach was
+removed on 2026-09-04. It caused both the cost and the visual defects, since a
+margin pixel meant a branching host callback and an answer that had to be
+guessed.
 
 ## Build boundary
 

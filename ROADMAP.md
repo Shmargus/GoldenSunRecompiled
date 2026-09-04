@@ -1,118 +1,155 @@
-# Roadmap Status
+# Roadmap
 
-Update this file only when an acceptance gate has evidence. Current state in
-prose is `docs/STATUS.md`; the immediate task is `docs/NEXT_TASK.md`; open work
-is indexed in `docs/ACTIVE_ISSUES.md` and detailed under `docs/issues/`.
-Feature tracks are under `docs/features/`; wishlist and deferred work live in
-`docs/BACKLOG.md` and `docs/PARKED.md`.
+Written 2026-09-04. Replaces the previous roadmap, status, next-task and
+backlog files, all kept in `docs/OLD/`.
 
-Two kinds of evidence appear below and they are not interchangeable:
+## The goal
 
-- **oracle/measured** — a recorded comparison, trace or benchmark;
-- **play-proven** — the user reached it and it behaved correctly in real play.
+Run Golden Sun on native C++, with the ROM used only for assets, and be able to
+change how it works — PC-native widescreen, turbo, walk speeds, potentially
+replacement item and Psynergy tables.
 
-Play-proven is real evidence, but it is not a recorded oracle diff. Boxes
-resting on it are marked.
+The test for "done", in the user's words: widescreen becomes **"render more of
+the world at once"** by changing a camera or render-resolution value, instead of
+a per-pixel reconstruction problem.
 
-## Baseline
+Readable generated code is explicitly not a goal. A faithful but ugly native
+implementation counts as success.
 
-- [x] Starter governance and planning pack created.
-- [x] Upstream commits pinned.
-- [ ] Non-ROM CI green — `heal_gate_tests` is the one known non-pass left.
-  `public_repository_audit` was failing permanently because it audited the
-  gitignored `private/` tree; it now audits repository membership instead and
-  passes.
-- [x] Exact ROM verified locally.
-- [x] Exact BIOS verified locally.
+## Where the project actually is
 
-## Disassembly and metadata
+**The code half of the goal is already substantially met.** The recompiler
+translated 26,935 functions plus 95 overlay banks into C++ ahead of time, and
+that generated C++ is what executes. The interpreter is only a fallback for
+dispatch misses — one distinct miss against 186,079 native calls in a
+2026-09-03 snapshot. The ROM is already just a data source.
 
-- [x] `gsret/goldensun` builds reproducibly.
-- [x] Main ELF/map inventory captured.
-- [x] All overlay ELF/map outputs inventoried.
-- [x] Symbol import schema and synthetic validation fixtures completed.
-- [x] Main symbols imported deterministically.
-- [x] Overlay symbols imported deterministically.
-- [x] ARM/THUMB modes validated.
-- [x] Data/code ambiguities reported.
+What is still emulation is the **hardware** layer: PPU, DMA, timers, IRQ,
+sound. That is hand-written native C++ modelling a GBA, never derived from the
+ROM.
 
-## Recompiler integration
+So the remaining distance is in the hardware layer, and in the ability to
+modify behaviour — not in translating game code.
 
-- [x] Exact-ROM unseeded discovery baseline classified deterministically.
-- [ ] Main ROM TOML reviewed.
-- [x] ELF-backed IWRAM code-copy source/destination/size reviewed.
-- [ ] Overlay manifest reviewed.
-- [ ] Main generated corpus compiles x86-64 against the public upstream pin.
-- [x] Local patched-upstream main corpus compiles x86-64 (pin update pending).
-- [x] All 96 overlay corpora compile x86-64 (95 unique code identities).
-- [x] Local generic same-PC overlay activation/eviction proof passes (pin
-  update pending).
-- [x] Golden Sun overlay load/identity adapter works in play. Not re-verified
-  against the oracle as a recorded diff.
+## Milestone 1 — understand the map data (current)
 
-## Execution milestones
+**Work out exactly how Golden Sun's map data is laid out, so a room can be
+reconstructed ahead of time instead of resolved per pixel while rendering.**
 
-- [x] Recompiled BIOS runs.
-- [x] First cartridge instruction runs.
-- [x] First Golden Sun function identified and runs.
-- [x] BIOS handoff CPU and writable-memory state synchronized with mGBA.
-- [x] First architectural divergence localized to an exact instruction/read.
-- [x] VBlank/IRQ, VRAM/OAM/PAL writes drive a correct picture — play-proven
-  across hours of real play, not a recorded per-event oracle diff.
-- [x] Title screen renders.
-- [x] Menu input works.
-- [x] New game starts.
-- [x] Vale vertical slice completes (play-proven).
-- [x] Early battle completes (play-proven).
-- [ ] Save compatibility round-trips — saving and loading work in play; a
-  round-trip against original-hardware/emulator save data is unproven.
-- [ ] Full playthrough completes.
-- [ ] Strict-static full playthrough completes with zero misses. Bounded
-  strict-static tracks pass; see `docs/STATUS.md`.
+This is the foundation for everything else. Nothing else starts until it is
+understood.
 
-## Enhancements
+Known starting points, from the widescreen work:
 
-All are opt-in and default-off. The faithful path stays the default.
+- Metatile table at `0x02010000`
+- Tile-entry table at `0x02020000`
+- Room bounds struct — the pointer at `0x03001E70` is always `0x02030CCC` and
+  is useless as an identity, but the four bounds values beside it do change per
+  room (23 distinct combinations measured in one session)
+- Camera clamp function `Func_10230`
 
-- [x] Raster-aware 2x scene interpolation (battle midpoints; world map falls
-  back safely).
-- [x] Enhanced Timing: exact 60/120 Hz host pacing.
-- [x] Enhanced Timing: audio resampling
-  ([plan](docs/features/ENHANCED_TIMING.md)).
-- [ ] Enhanced Timing: measured dynamic CPU headroom
-  ([plan](docs/features/ENHANCED_TIMING.md)). Distinct from the manual overclock
-  below; not built.
-- [x] Guest CPU overclock (manual 1x/2x/4x/8x, live-toggleable): scales only
-  per-instruction execution cost, never halt/idle time or DMA/IRQ-added
-  cycles. 1x verified bit-exact across 8.4M fingerprint records. Smooth at
-  2x/4x in play; throughput gain is not instrumented.
-- [x] Display scaling and live color profiles (faithful raw default;
-  verified integer layout).
-- [x] Native scene supersampling with faithful per-frame fallback. Battle is
-  mostly supported; world-map raster effects fall back.
-- [x] Temporal blend / "LCD ghosting", and soft-filter shimmer reduction.
-- [x] Hotkeys bindable to keyboard or controller; Turbo in Held and Toggle
-  forms.
-- [ ] Widescreen. Three optional fixed modes are implemented: Native 240x160
-  (default), Widescreen 288x160, and Expanded Widescreen 360x240 with true
-  ±60 horizontal/±40 vertical signed margins. Strict-static and framebuffer
-  capture force Native. State1 root-launcher capture is 1080x720 at 3x; native
-  center and the 288x160 slice are byte-identical
-  (`channel_diffs=0`, `max_delta=0`). Focused tests and the full serial
-  playable build pass. Manual multi-scene acceptance remains pending, and
-  vertical guest OBJ cull coverage is not proven beyond resident OAM; see
-  WIDE-01 in `docs/ACTIVE_ISSUES.md`.
-- [ ] Enhanced audio shadow path. An opt-in verified MP2K wall mixer exists;
-  manual acceptance is still open.
-- [ ] Turbo-decoupled native audio. Current experimental scope is launcher-
-  gated MP2K music only, bounded to 2x-4x; PSG/FIFO and normal-speed SFX are
-  future work. Canonical guest audio remains the oracle, and unsupported,
-  reverb, queue/ring failure, or uncapped mode falls back to canonical coupled
-  audio; explicit MuteDuringTurbo still mutes.
-- [ ] Mod hook policy.
-- [ ] Custom items / weapons (recolour, new unleash, new entries). Not yet
-  investigated: need the item and unleash tables, and the width of the item
-  ID field (a 1-byte ID caps the roster at 256 regardless of added space).
-- [ ] Custom Psynergy. Same shape of problem: locate the Psynergy table and
-  its ID width before promising new entries.
-- [ ] Additional ROM regions.
+What needs answering:
+
+1. The exact layout of both tables — entry size, meaning of each field, how a
+   tile coordinate maps to an entry.
+2. How the tables relate to each other and to the room bounds.
+3. Which BG layers are sourced from them. (BG3 ground, BG2 tiles, BG1 props,
+   BG0 lighting, per earlier observation — needs confirming against the data.)
+4. How often the tables are written during play. Statues are entities, not
+   tile edits, so churn is expected to be rare and event-driven — but this is
+   unmeasured.
+5. How often scroll changes mid-frame, and in which scenes. At least one
+   split-scroll scene is on record. If it is one or two scenes they can be
+   special-cased; if it is pervasive the design must accommodate it.
+
+Points 4 and 5 are measurements, not opinions. See rule 1 in `AGENTS.md`.
+
+## Milestone 2 — the room buffer
+
+Build the room's tilemap once into a plain buffer and render from it, instead of
+calling back into game-specific host code per pixel.
+
+Why: the old widescreen implementation called
+`golden_sun_wide_tilemap_provider` per pixel from the PPU's inner texel loop.
+Each margin pixel meant a host callback that read emulated memory, branched on
+mutable globals and consulted a stateful bitmap. That caused both problems at
+once — the cost (a branching callback per pixel, not the pixel count) and the
+garbage (answers invented per pixel, then culled). Three culls failed that way
+on 2026-09-03.
+
+With a prebuilt buffer, a margin pixel is an array lookup like any other, and
+nothing is invented so there is nothing to cull.
+
+**This does not require a GPU renderer.** Earlier scoping framed it as an
+OpenGL project against mgba's `gl.c`. That is more than is needed.
+
+The widescreen implementation was removed entirely on 2026-09-04 to give this a
+clean slate; the game renders 240x160 as a GBA does.
+
+## Milestone 3 — locate the data worth changing
+
+Camera, entity list, spell and item tables, walk speed. Each is a targeted find
+using the tracer plus memory-watching — the technique that located the room
+bounds first time.
+
+Data changes need no new architecture: find a table, edit values. That covers
+item and Psynergy tables and probably walk speed.
+
+## Milestone 4 — function replacement
+
+**Nothing can currently substitute a native function for a guest one.** The
+function-entry hook is observe-only
+(`gbarecomp/src/armv4t/runtime_arm.h:815-816`).
+
+This is the one missing primitive for changing behaviour rather than data. The
+project is unusually well-shaped for it: every guest function is already a
+separate generated C++ function reached through a dispatch table, so a redirect
+sits at a natural seam.
+
+Build it when a concrete need appears, not before.
+
+## Tooling — the tracer
+
+Built 2026-09-04 and working. Records per-function call counts with the most
+recent argument registers at entry, splits captures on room-bounds change,
+overlay bank change and window-register change, tags captures by room, and logs
+raw hardware signals per frame. Launcher toggle "Function tracer", off by
+default.
+
+Verified deterministic: two independent headless runs produced identical
+function sets and call counts.
+
+Coverage from one 55-minute session: 1,289 of 2,981 main-ROM functions (43.2%),
+plus 767 addresses in overlay code and 719 in IWRAM.
+
+Use it in service of a milestone, not for its own sake.
+
+## Shelved — audio
+
+The native MP2K work is **shelved, not abandoned.** It is a real goal to return
+to once the map and renderer work is done.
+
+State when shelved: the native path was experimental and fail-closed, with the
+canonical PSG/FIFO path as the oracle. Latest probation evidence failed at
+correlation 0.68, ratio 0.19. Producer ownership, fidelity and independent
+clock completion were all still open.
+
+Detail is preserved in `docs/features/MP2K.md`, with the issue records in
+`docs/OLD/issues/AUD-01.md` and `AUD-03.md`.
+
+Do not pick this up without saying so first.
+
+## Out of scope
+
+- **Full decompilation.** ~6,000 real functions, ~1.3 MB of code; comparable
+  projects took communities years. Not the goal, and readability is explicitly
+  not wanted.
+- **Readable or idiomatic generated code.**
+- **A GPU/OpenGL renderer**, unless the room buffer proves insufficient.
+- **BG0 margin work** — was built on 2026-09-04, never viewed, and removed with
+  the rest of the widescreen implementation.
+
+## Open questions for the user
+
+- Priority between milestone 1's two measurements once they can be taken.
+- Whether the launcher's other test toggles stay commented out or come back.

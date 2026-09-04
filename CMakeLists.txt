@@ -5,6 +5,38 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# Link-time (interprocedural) optimization for GoldenSunRecomp + the
+# gbarecomp static libraries it links. Off for gsr_bootstrap and every
+# third_party/* target (imgui, toml++, gba_suite, mgba) — those keep whatever
+# flags they already had. Degrades gracefully: if the toolchain can't do IPO
+# (checked below, not assumed), the build proceeds without it instead of
+# failing. Override with -DGSR_ENABLE_LTO=OFF.
+option(GSR_ENABLE_LTO
+    "Enable link-time optimization for GoldenSunRecomp and gbarecomp targets"
+    ON)
+set(GSR_IPO_SUPPORTED FALSE)
+if(GSR_ENABLE_LTO)
+    include(CheckIPOSupported)
+    check_ipo_supported(RESULT GSR_IPO_SUPPORTED OUTPUT GSR_IPO_SUPPORT_ERROR)
+    if(NOT GSR_IPO_SUPPORTED)
+        message(STATUS
+            "GSR_ENABLE_LTO is ON but this toolchain reports IPO/LTO "
+            "unsupported (${GSR_IPO_SUPPORT_ERROR}); building without it.")
+    endif()
+endif()
+# Parallel LTRANS (post-analysis codegen) job count for GCC's -flto=N on the
+# final GoldenSunRecomp link. This does NOT bound the whole-program-analysis
+# (WPA) pass that precedes it — WPA is single-threaded in GCC and is the
+# actual peak-memory phase for a binary this size (~168 MB, ~400k alias
+# thunks), so raising this number buys wall-clock time on the codegen phase
+# only, not memory headroom. Left at a conservative fraction of logical
+# cores rather than the full core count so LTRANS workers don't compound
+# against that WPA peak on a 16 GB box. Set to "" to omit the explicit -flto=N
+# override, or to 1 for a fully serial (lowest-memory) LTRANS. See the LTO
+# section in the delivery report for the reasoning and how to size this up.
+set(GSR_LTO_JOBS "8" CACHE STRING
+    "Parallel LTRANS job count (-flto=N) for the GoldenSunRecomp link when LTO is enabled; empty = compiler default")
+
 # This starter target proves the public repository builds without a ROM/BIOS.
 # The real runner is intentionally not wired until GS-009, after upstream APIs,
 # symbols, overlays, and hashes are pinned and reviewed.
@@ -511,6 +543,7 @@ if(GSR_BUILD_LOCAL_RUNNER)
 
     add_executable(GoldenSunRecomp
         src/runner_main.cpp
+        src/function_tracer.cpp
         ${GSR_GENERATED_SOURCES}
         ${GSR_TRANSIENT_FUNC2D5C_SOURCES}
         ${GSR_TRANSIENT_FUNCA37C_SOURCES}
@@ -539,6 +572,9 @@ if(GSR_BUILD_LOCAL_RUNNER)
         ${GSR_SYNTH_DC8_03000904_SOURCES}
         ${GSR_SYNTH_DC8_030008EC_SOURCES}
         ${GSR_PROACTIVE_OVERLAY_SOURCES})
+    if(GSR_IPO_SUPPORTED)
+        set_property(TARGET GoldenSunRecomp PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
+    endif()
     target_include_directories(GoldenSunRecomp PRIVATE
         "${GSR_GENERATED_DIR}"
         "${GBARECOMP_ROOT}/src/armv4t"
@@ -556,13 +592,24 @@ if(GSR_BUILD_LOCAL_RUNNER)
             gbarecomp_armv4t)
         target_link_options(GoldenSunRecomp PRIVATE /STACK:16777216)
     else()
+        target_compile_options(GoldenSunRecomp PRIVATE
+            -ffunction-sections -fdata-sections)
         target_link_libraries(GoldenSunRecomp PRIVATE
             "-Wl,--start-group"
             gbarecomp_runtime gbarecomp_debug gbarecomp_gba
             gbarecomp_armv4t
             "-Wl,--end-group")
+        target_link_options(GoldenSunRecomp PRIVATE -Wl,--gc-sections)
         if(MINGW OR WIN32)
             target_link_options(GoldenSunRecomp PRIVATE -Wl,--stack,16777216)
+        endif()
+        if(GSR_IPO_SUPPORTED AND GSR_LTO_JOBS)
+            # -flto=N here overrides the plain -flto that
+            # INTERPROCEDURAL_OPTIMIZATION already put on this link line,
+            # asking GCC to run LTRANS across N parallel processes. See the
+            # GSR_LTO_JOBS comment near the top of this file for why this
+            # isn't set to the full core count.
+            target_link_options(GoldenSunRecomp PRIVATE -flto=${GSR_LTO_JOBS})
         endif()
     endif()
 
@@ -576,7 +623,7 @@ if(GSR_BUILD_LOCAL_RUNNER)
         if(CMAKE_OBJCOPY)
             add_custom_command(TARGET GoldenSunRecomp POST_BUILD
                 COMMAND "${CMAKE_OBJCOPY}" --only-keep-debug "$<TARGET_FILE:GoldenSunRecomp>" "$<TARGET_FILE:GoldenSunRecomp>.debug"
-                COMMAND "${CMAKE_OBJCOPY}" --strip-debug "$<TARGET_FILE:GoldenSunRecomp>"
+                COMMAND "${CMAKE_OBJCOPY}" --strip-all "$<TARGET_FILE:GoldenSunRecomp>"
                 COMMAND "${CMAKE_OBJCOPY}" --add-gnu-debuglink="$<TARGET_FILE_NAME:GoldenSunRecomp>.debug" "$<TARGET_FILE:GoldenSunRecomp>"
                 WORKING_DIRECTORY "$<TARGET_FILE_DIR:GoldenSunRecomp>"
                 COMMENT "Splitting debug symbols for GoldenSunRecomp")

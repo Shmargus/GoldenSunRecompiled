@@ -16,6 +16,10 @@ struct LauncherTestDefaults {
     bool recursion_probe = false;
     bool ram_churn_probe = false;
     bool oam_shadow_trace = false;
+    bool obj_park_census = false;
+    bool margin_tile_log = false;
+    bool map_record = false;
+    bool function_tracer = false;
 };
 
 constexpr LauncherTestDefaults launcher_test_defaults() {

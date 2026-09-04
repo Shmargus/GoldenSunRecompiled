@@ -50,14 +50,9 @@ bool g_test_blitter_shadow = k_launcher_test_defaults.blitter_shadow;
 bool g_test_recursion_probe = k_launcher_test_defaults.recursion_probe;
 bool g_test_ram_churn_probe = k_launcher_test_defaults.ram_churn_probe;
 bool g_test_oam_shadow_trace = k_launcher_test_defaults.oam_shadow_trace;
-bool g_widescreen_diagnostics =
-    gsr::launcher_widescreen_diagnostics_default();
-// WIDE-01 experimental off-screen cull safety net (see
-// src/widescreen_policy.h, golden_sun_experimental_sprite_fully_offscreen).
-// Session-only, always starts unchecked -- same rule as the diagnostics
-// toggle above: normal play must never inherit a developer shell's leftover
-// setting.
-bool g_experimental_fixes = false;
+bool g_test_obj_park_census = k_launcher_test_defaults.obj_park_census;
+bool g_test_map_record = k_launcher_test_defaults.map_record;
+bool g_test_function_tracer = k_launcher_test_defaults.function_tracer;
 
 struct LauncherAudioSettings {
     bool native_mp2k = false;
@@ -767,32 +762,17 @@ int run_game(const fs::path& root, const std::wstring& rom,
     child_environment.set(L"GBARECOMP_HEAL_CACHE",
                           (root / L"recomp_cache").wstring());
 
-    // WIDE-01 diagnostics are launcher-owned and always explicit: unchecked
-    // means the child receives 0, even if the launcher inherited 1 from a
-    // developer shell. This keeps normal gameplay free of optional traces.
-    const auto widescreen_diagnostics_policy =
-        gsr::resolve_launcher_widescreen_diagnostics_policy(
-            g_widescreen_diagnostics);
-    child_environment.set(L"GBARECOMP_VRAM_MAP_TRACE",
-                          widescreen_diagnostics_policy.environment_value);
-
-    // WIDE-01 experimental off-screen cull safety net: launcher-owned and
-    // always explicit, same discipline as the diagnostics toggle above --
-    // unchecked always sends 0, even if a developer shell has this set.
-    child_environment.set(L"GBARECOMP_EXPERIMENTAL_FIXES",
-                          g_experimental_fixes ? L"1" : L"0");
-
-    // A WIDE-01 diagnostics launch must carry its exact user input sequence so
-    // the resulting RAM trace can be replayed. Replay and recording are
-    // mutually exclusive in the runner; reject an explicit conflict before
-    // spawning rather than allowing a partial, misleading session.
+    // A function-tracer launch must carry its exact user input sequence so
+    // the resulting trace can be replayed. Replay and recording are mutually
+    // exclusive in the runner; reject an explicit conflict before spawning
+    // rather than allowing a partial, misleading session.
     const std::wstring explicit_input_record =
         inherited_environment_value(L"GBARECOMP_INPUT_RECORD");
     const std::wstring input_replay =
         inherited_environment_value(L"GBARECOMP_INPUT_REPLAY");
     std::wstring automatic_input_path;
     if (logging && input_replay.empty() && explicit_input_record.empty() &&
-        widescreen_diagnostics_policy.enabled) {
+        g_test_function_tracer) {
         automatic_input_path = gsr::choose_unique_input_record_path(
             log_path, [](const std::wstring& candidate) {
                 return fs::exists(fs::path(candidate));
@@ -800,7 +780,7 @@ int run_game(const fs::path& root, const std::wstring& rom,
     }
     const auto input_record_policy =
         gsr::resolve_launcher_input_record_policy(
-            widescreen_diagnostics_policy.enabled, explicit_input_record,
+            g_test_function_tracer, explicit_input_record,
             !input_replay.empty(), automatic_input_path);
     if (input_record_policy.replay_conflict) {
         if (log_file != INVALID_HANDLE_VALUE) CloseHandle(log_file);
@@ -810,12 +790,12 @@ int run_game(const fs::path& root, const std::wstring& rom,
                     L"Golden Sun Recompiled", MB_OK | MB_ICONERROR);
         return 1;
     }
-    if (widescreen_diagnostics_policy.enabled && input_replay.empty() &&
+    if (g_test_function_tracer && input_replay.empty() &&
         explicit_input_record.empty() && !input_record_policy.enabled) {
         if (log_file != INVALID_HANDLE_VALUE) CloseHandle(log_file);
         MessageBoxW(window,
-                    L"Widescreen diagnostics could not create its input "
-                    L"recording path.",
+                    L"Function tracer could not create its input recording "
+                    L"path.",
                     L"Golden Sun Recompiled", MB_OK | MB_ICONERROR);
         return 1;
     }
@@ -864,6 +844,9 @@ int run_game(const fs::path& root, const std::wstring& rom,
         {L"GSR_RECURSION_PROBE", g_test_recursion_probe},
         {L"GSR_RAM_CHURN_PROBE", g_test_ram_churn_probe},
         {L"GSR_OAM_SHADOW_TRACE", g_test_oam_shadow_trace},
+        {L"GBARECOMP_OBJ_PARK_CENSUS", g_test_obj_park_census},
+        {L"GSR_MAP_RECORD", g_test_map_record},
+        {L"GBARECOMP_FN_TRACER", g_test_function_tracer},
     };
     for (const TestEnvironmentVariable& variable : test_environment_variables) {
         const bool self_heal =
@@ -1000,127 +983,176 @@ constexpr int kTurboAudioButton = 1011;
 constexpr int kAudioHelpText = 1012;
 constexpr int kCopySessionIdButton = 1013;
 constexpr int kOamShadowTraceButton = 1014;
-constexpr int kWideDiagnosticsButton = 1015;
-constexpr int kExperimentalFixesButton = 1016;
+constexpr int kObjParkCensusButton = 1017;
+constexpr int kMapRecordButton = 1019;
+constexpr int kFunctionTracerButton = 1020;
 
 fs::path g_launcher_root;
 std::wstring g_launcher_bios;
 std::unique_ptr<Gdiplus::Image> g_splash_image;
 HFONT g_button_font = nullptr;
+HFONT g_body_font = nullptr;
+// Backdrop behind the checkbox groups, recomputed each time layout_buttons
+// runs. Kept as client-relative window coordinates so paint_splash can draw
+// it without recomputing the layout itself.
+RECT g_panel_rect{};
 
+// Every control below is positioned by a single running cursor rather than
+// by hand-tuned offsets between controls, so adding, removing, or hiding a
+// checkbox only ever changes how far the cursor advances -- two controls
+// can no longer end up sharing the same row by accident.
 void layout_buttons(HWND window) {
     RECT client{};
     GetClientRect(window, &client);
-    const int button_width = 190;
-    const int button_height = 48;
-    const int gap = 18;
-    const int total_width = button_width * 2 + gap;
-    const int x = std::max<int>(0, static_cast<int>((client.right - total_width) / 2));
-    const int y = std::max<int>(0, static_cast<int>(client.bottom - button_height - 28));
+
+    // ---- Bottom action buttons (Pick ROM / Quit) --------------------------
+    constexpr int button_width = 190;
+    constexpr int button_height = 48;
+    constexpr int button_gap = 18;
+    constexpr int total_button_width = button_width * 2 + button_gap;
+    const int button_x = std::max<int>(
+        0, (client.right - total_button_width) / 2);
+    const int button_y = std::max<int>(0, client.bottom - button_height - 28);
     HWND pick = GetDlgItem(window, kPickRomButton);
     HWND quit = GetDlgItem(window, kQuitButton);
-    HWND test_variables = GetDlgItem(window, kTestVariablesButton);
-    HWND wide_diagnostics = GetDlgItem(window, kWideDiagnosticsButton);
-    HWND experimental_fixes = GetDlgItem(window, kExperimentalFixesButton);
-    if (pick) MoveWindow(pick, x, y, button_width, button_height, TRUE);
-    if (quit) MoveWindow(quit, x + button_width + gap, y,
+    if (pick) MoveWindow(pick, button_x, button_y, button_width, button_height, TRUE);
+    if (quit) MoveWindow(quit, button_x + button_width + button_gap, button_y,
                          button_width, button_height, TRUE);
 
-    constexpr int toggle_height = 28;
-    constexpr int wide_toggle_width = 360;
-    const int toggle_x = std::max<int>(
-        0, static_cast<int>((client.right - wide_toggle_width) / 2));
-    const int wide_toggle_y = std::max<int>(0, y - toggle_height - 8);
-    if (wide_diagnostics) {
-        MoveWindow(wide_diagnostics, toggle_x, wide_toggle_y,
-                   wide_toggle_width, toggle_height, TRUE);
+    // ---- Checkbox panel -----------------------------------------------
+    constexpr int kPanelPaddingX = 24;
+    constexpr int kPanelPaddingY = 20;
+    constexpr int kRowHeight = 26;
+    constexpr int kRowGap = 6;
+    constexpr int kGroupGap = 18;
+    constexpr int kIndent = 28;
+    constexpr int kContentWidth = 480;
+    constexpr int kPanelBottomMargin = 20;
+
+    const int panel_width = kContentWidth + kPanelPaddingX * 2;
+    const int panel_x = std::max<int>(0, (client.right - panel_width) / 2);
+    const int content_x = panel_x + kPanelPaddingX;
+
+    HWND native_mp2k = GetDlgItem(window, kNativeMp2kButton);
+    HWND turbo_audio = GetDlgItem(window, kTurboAudioButton);
+    HWND audio_help = GetDlgItem(window, kAudioHelpText);
+    HWND copy_session_id = GetDlgItem(window, kCopySessionIdButton);
+    HWND test_variables = GetDlgItem(window, kTestVariablesButton);
+
+    // The help text wraps to as many lines as its content needs at the
+    // panel's content width, instead of a fixed height that can clip it
+    // mid-sentence.
+    int help_height = kRowHeight;
+    if (audio_help && g_body_font) {
+        HDC dc = GetDC(window);
+        HFONT old_font = static_cast<HFONT>(SelectObject(dc, g_body_font));
+        wchar_t text[512] = {};
+        GetWindowTextW(audio_help, text, static_cast<int>(std::size(text)));
+        RECT calc{0, 0, kContentWidth, 0};
+        DrawTextW(dc, text, -1, &calc, DT_LEFT | DT_WORDBREAK | DT_CALCRECT);
+        SelectObject(dc, old_font);
+        ReleaseDC(window, dc);
+        help_height = std::max<int>(kRowHeight, calc.bottom - calc.top);
     }
-    const int experimental_toggle_y =
-        std::max<int>(0, wide_toggle_y - toggle_height - 4);
-    if (experimental_fixes) {
-        MoveWindow(experimental_fixes, toggle_x, experimental_toggle_y,
-                   wide_toggle_width, toggle_height, TRUE);
+
+    int cursor = kPanelPaddingY;  // offset from the panel's top
+
+    // Audio group.
+    const int help_y = cursor;
+    cursor += help_height + kRowGap;
+    const int native_mp2k_y = cursor;
+    cursor += kRowHeight + kRowGap;
+    const int turbo_audio_y = cursor;
+    cursor += kRowHeight + kRowGap;
+    const int copy_session_id_y = cursor;
+    cursor += kRowHeight + kGroupGap;
+
+    // Test variables group. The children stack below the master checkbox,
+    // full content width, so a long label (e.g. "Log off-screen sprite
+    // positions") never gets clipped; adding another entry to `children[]`
+    // just adds another row and the panel grows to match.
+    const int test_variables_y = cursor;
+    cursor += kRowHeight;
+    const int children_top = cursor + kRowGap;
+    constexpr int kChildCount = 10;
+    const int child_width = kContentWidth - kIndent;
+    if (g_test_variables) {
+        cursor = children_top +
+                 kChildCount * kRowHeight + (kChildCount - 1) * kRowGap;
     }
+    cursor += kPanelPaddingY;
 
-    if (test_variables) {
-        constexpr int test_toggle_width = 220;
-        const int test_toggle_x = std::max<int>(
-            0, static_cast<int>((client.right - test_toggle_width) / 2));
-        const int test_toggle_y = std::max<int>(
-            0, wide_toggle_y - toggle_height - 6);
-        MoveWindow(test_variables, test_toggle_x, test_toggle_y,
-                   test_toggle_width, toggle_height, TRUE);
+    const int panel_height = cursor;
+    const int panel_top = std::max<int>(
+        0, button_y - kPanelBottomMargin - panel_height);
+    g_panel_rect = {panel_x, panel_top, panel_x + panel_width,
+                    panel_top + panel_height};
 
-        constexpr int child_width = 240;
-        constexpr int child_height = 24;
-        constexpr int child_gap = 2;
-        const int child_x = std::max<int>(
-            0, static_cast<int>((client.right - child_width) / 2));
-        const int child_bottom = test_toggle_y - 6;
-        const int child_top = child_bottom -
-            (child_height * 7 + child_gap * 6);
-        const int child_y[] = {
-            child_top,
-            child_top + child_height + child_gap,
-            child_top + (child_height + child_gap) * 2,
-            child_top + (child_height + child_gap) * 3,
-            child_top + (child_height + child_gap) * 4,
-            child_top + (child_height + child_gap) * 5,
-            child_top + (child_height + child_gap) * 6,
-        };
-        const int child_ids[] = {
-            kSelfHealRamButton,
-            kCostProbeButton,
-            kPresentCadenceButton,
-            kBlitterShadowButton,
-            kRecursionProbeButton,
-            kRamChurnProbeButton,
-            kOamShadowTraceButton,
-        };
-        for (int i = 0; i < 7; ++i) {
-            HWND child = GetDlgItem(window, child_ids[i]);
-            if (!child) continue;
-            MoveWindow(child, child_x, std::max(0, child_y[i]), child_width,
-                       child_height, TRUE);
-            ShowWindow(child, g_test_variables ? SW_SHOW : SW_HIDE);
-        }
-
-        const int audio_top = std::max(0, child_top - 56);
-        constexpr int audio_width = 500;
-        const int audio_x = std::max<int>(
-            0, static_cast<int>((client.right - audio_width) / 2));
-        HWND native_mp2k = GetDlgItem(window, kNativeMp2kButton);
-        HWND turbo_audio = GetDlgItem(window, kTurboAudioButton);
-        HWND audio_help = GetDlgItem(window, kAudioHelpText);
-        HWND copy_session_id = GetDlgItem(window, kCopySessionIdButton);
-        if (copy_session_id) {
-            MoveWindow(copy_session_id, audio_x, std::max(0, audio_top - 76),
-                       audio_width, 24, TRUE);
-        }
-        if (native_mp2k) {
-            MoveWindow(native_mp2k, audio_x, audio_top, audio_width, 24, TRUE);
-            EnableWindow(native_mp2k, !g_strict_static_route);
-        }
-        if (turbo_audio) {
-            MoveWindow(turbo_audio, audio_x, audio_top + 26,
-                       audio_width, 24, TRUE);
+    if (audio_help) {
+        MoveWindow(audio_help, content_x, panel_top + help_y, kContentWidth,
+                   help_height, TRUE);
+    }
+    if (native_mp2k) {
+        MoveWindow(native_mp2k, content_x, panel_top + native_mp2k_y,
+                   kContentWidth, kRowHeight, TRUE);
+        EnableWindow(native_mp2k, !g_strict_static_route);
+    }
+    if (turbo_audio) {
+        // Sub-toggle of "Native MP2K audio": indented under its master and
+        // greyed out (not hidden) while that master is unchecked, same as
+        // before.
+        MoveWindow(turbo_audio, content_x + kIndent,
+                   panel_top + turbo_audio_y, kContentWidth - kIndent,
+                   kRowHeight, TRUE);
         EnableWindow(turbo_audio, g_audio_settings.native_mp2k &&
-                                      !g_strict_static_route);
-        }
-        if (audio_help) {
-            MoveWindow(audio_help, audio_x, std::max(0, audio_top - 46),
-                       audio_width, 44, TRUE);
-        }
+                                       !g_strict_static_route);
     }
+    if (copy_session_id) {
+        MoveWindow(copy_session_id, content_x, panel_top + copy_session_id_y,
+                   kContentWidth, kRowHeight, TRUE);
+    }
+    if (test_variables) {
+        MoveWindow(test_variables, content_x, panel_top + test_variables_y,
+                   kContentWidth, kRowHeight, TRUE);
+    }
+
+    const int child_ids[kChildCount] = {
+        kSelfHealRamButton,    kCostProbeButton,      kPresentCadenceButton,
+        kBlitterShadowButton,  kRecursionProbeButton, kRamChurnProbeButton,
+        kOamShadowTraceButton, kObjParkCensusButton,
+        kMapRecordButton,      kFunctionTracerButton,
+    };
+    for (int i = 0; i < kChildCount; ++i) {
+        HWND child = GetDlgItem(window, child_ids[i]);
+        if (!child) continue;
+        // Sub-toggles of "Test variables": indented under the master, and
+        // hidden entirely while it is unchecked -- same relationship as
+        // before, just laid out without overlap.
+        const int child_y =
+            panel_top + children_top + i * (kRowHeight + kRowGap);
+        MoveWindow(child, content_x + kIndent, child_y, child_width,
+                   kRowHeight, TRUE);
+        ShowWindow(child, g_test_variables ? SW_SHOW : SW_HIDE);
+    }
+
+    // The panel's extent just changed; repaint the backdrop under it.
+    InvalidateRect(window, nullptr, FALSE);
 }
 
-void paint_splash(HWND window, HDC dc) {
+// origin_x/origin_y let this same routine paint into a child control's DC:
+// (0, 0) in that DC is (origin_x, origin_y) in the launcher window's own
+// client coordinates, so passing the child's client-relative position here
+// draws exactly the artwork/panel slice that sits behind that child --
+// see checkbox_erase_background below.
+void paint_splash(HWND window, HDC dc, int origin_x = 0, int origin_y = 0) {
     RECT client{};
     GetClientRect(window, &client);
     const int width = client.right - client.left;
     const int height = client.bottom - client.top;
     Gdiplus::Graphics graphics(dc);
     graphics.SetSmoothingMode(Gdiplus::SmoothingModeHighQuality);
+    graphics.TranslateTransform(static_cast<Gdiplus::REAL>(-origin_x),
+                                static_cast<Gdiplus::REAL>(-origin_y));
     graphics.Clear(Gdiplus::Color(255, 13, 17, 15));
 
     if (g_splash_image && g_splash_image->GetLastStatus() == Gdiplus::Ok &&
@@ -1149,9 +1181,97 @@ void paint_splash(HWND window, HDC dc) {
                            &attributes);
     }
 
+    // One coherent backdrop behind every checkbox group, instead of a
+    // separate translucent strip per row: same alpha throughout, so the
+    // groups read as one panel over the artwork rather than scattered
+    // patches at inconsistent widths.
+    if (g_panel_rect.right > g_panel_rect.left &&
+        g_panel_rect.bottom > g_panel_rect.top) {
+        const int panel_width = g_panel_rect.right - g_panel_rect.left;
+        const int panel_height = g_panel_rect.bottom - g_panel_rect.top;
+        Gdiplus::SolidBrush panel_fill(Gdiplus::Color(150, 12, 10, 8));
+        graphics.FillRectangle(&panel_fill, g_panel_rect.left, g_panel_rect.top,
+                               panel_width, panel_height);
+        Gdiplus::Pen panel_border(Gdiplus::Color(90, 255, 220, 150), 1.0f);
+        graphics.DrawRectangle(&panel_border, g_panel_rect.left,
+                               g_panel_rect.top, panel_width - 1,
+                               panel_height - 1);
+    }
+
     Gdiplus::SolidBrush bottom_overlay(Gdiplus::Color(145, 0, 0, 0));
     graphics.FillRectangle(&bottom_overlay, 0, std::max(0, height - 132),
                            width, 132);
+}
+
+// Standard (non-owner-drawn) BS_AUTOCHECKBOX controls always erase their own
+// background solid before drawing the checkbox glyph and label, with no
+// message that lets the parent supply a custom (or transparent) fill for
+// them -- that opaque system-colored box behind every checkbox is the
+// per-row "strip" this launcher is being tidied up to avoid. Every checkbox
+// below is therefore BS_OWNERDRAW instead, drawn by draw_checkbox_item, the
+// same way the Pick ROM/Quit buttons already are; this table is how its
+// WM_DRAWITEM handler finds which flag each checkbox's glyph reflects and
+// toggles on click, keyed by control ID so growing the checkbox list is
+// just one more case.
+bool* checkbox_state_for_id(int id) {
+    switch (id) {
+    case kTestVariablesButton: return &g_test_variables;
+    case kSelfHealRamButton: return &g_test_selfheal_ram;
+    case kCostProbeButton: return &g_test_cost_probe;
+    case kPresentCadenceButton: return &g_test_present_cadence;
+    case kBlitterShadowButton: return &g_test_blitter_shadow;
+    case kRecursionProbeButton: return &g_test_recursion_probe;
+    case kRamChurnProbeButton: return &g_test_ram_churn_probe;
+    case kOamShadowTraceButton: return &g_test_oam_shadow_trace;
+    case kObjParkCensusButton: return &g_test_obj_park_census;
+    case kMapRecordButton: return &g_test_map_record;
+    case kFunctionTracerButton: return &g_test_function_tracer;
+    case kNativeMp2kButton: return &g_audio_settings.native_mp2k;
+    case kTurboAudioButton: return &g_audio_settings.turbo_decoupled;
+    case kCopySessionIdButton:
+        return &g_audio_settings.copy_session_id_to_clipboard;
+    default: return nullptr;
+    }
+}
+
+// Draws one owner-drawn checkbox: the exact artwork/panel slice behind it
+// (via paint_splash's origin offset, so it reads as sitting on the panel
+// rather than on its own opaque box), the check glyph, and its label.
+void draw_checkbox_item(const DRAWITEMSTRUCT& item, bool checked) {
+    HWND parent = GetParent(item.hwndItem);
+    POINT origin{0, 0};
+    RECT window_rect{};
+    if (parent && GetWindowRect(item.hwndItem, &window_rect)) {
+        origin = {window_rect.left, window_rect.top};
+        ScreenToClient(parent, &origin);
+    }
+    paint_splash(parent, item.hDC, origin.x, origin.y);
+
+    const bool enabled = !(item.itemState & ODS_DISABLED);
+    constexpr int kBoxSize = 16;
+    RECT box_rect = item.rcItem;
+    box_rect.top += (item.rcItem.bottom - item.rcItem.top - kBoxSize) / 2;
+    box_rect.bottom = box_rect.top + kBoxSize;
+    box_rect.right = box_rect.left + kBoxSize;
+    UINT frame_state = DFCS_BUTTONCHECK;
+    if (checked) frame_state |= DFCS_CHECKED;
+    if (!enabled) frame_state |= DFCS_INACTIVE;
+    if (item.itemState & ODS_SELECTED) frame_state |= DFCS_PUSHED;
+    DrawFrameControl(item.hDC, &box_rect, DFC_BUTTON, frame_state);
+
+    wchar_t label[256] = {};
+    GetWindowTextW(item.hwndItem, label, static_cast<int>(std::size(label)));
+    RECT text_rect = item.rcItem;
+    text_rect.left = box_rect.right + 8;
+    SetBkMode(item.hDC, TRANSPARENT);
+    SetTextColor(item.hDC,
+                enabled ? RGB(240, 232, 210) : RGB(140, 132, 116));
+    HFONT old_font = static_cast<HFONT>(SelectObject(item.hDC, g_button_font));
+    DrawTextW(item.hDC, label, -1, &text_rect,
+             DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    SelectObject(item.hDC, old_font);
+
+    if (item.itemState & ODS_FOCUS) DrawFocusRect(item.hDC, &item.rcItem);
 }
 
 LRESULT CALLBACK launcher_window_proc(HWND window, UINT message,
@@ -1161,9 +1281,6 @@ LRESULT CALLBACK launcher_window_proc(HWND window, UINT message,
         // Optional acceptance diagnostics are session-only and always start
         // unchecked; this prevents a prior trace run from making normal play
         // noisy on the next launcher invocation.
-        g_widescreen_diagnostics =
-            gsr::launcher_widescreen_diagnostics_default();
-        g_experimental_fixes = false;
         g_test_variables = k_launcher_test_defaults.master;
         g_test_selfheal_ram = k_launcher_test_defaults.self_heal_ram;
         g_test_cost_probe = k_launcher_test_defaults.cost_probe;
@@ -1172,6 +1289,9 @@ LRESULT CALLBACK launcher_window_proc(HWND window, UINT message,
         g_test_recursion_probe = k_launcher_test_defaults.recursion_probe;
         g_test_ram_churn_probe = k_launcher_test_defaults.ram_churn_probe;
         g_test_oam_shadow_trace = k_launcher_test_defaults.oam_shadow_trace;
+        g_test_obj_park_census = k_launcher_test_defaults.obj_park_census;
+        g_test_map_record = k_launcher_test_defaults.map_record;
+        g_test_function_tracer = k_launcher_test_defaults.function_tracer;
         CreateWindowExW(0, L"BUTTON", L"Pick ROM",
                         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
                         0, 0, 0, 0, window,
@@ -1182,86 +1302,51 @@ LRESULT CALLBACK launcher_window_proc(HWND window, UINT message,
                         0, 0, 0, 0, window,
                         reinterpret_cast<HMENU>(kQuitButton),
                         GetModuleHandleW(nullptr), nullptr);
-        HWND wide_diagnostics = CreateWindowExW(
-            0, L"BUTTON", L"Widescreen diagnostics (WIDE-01)",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
-            0, 0, 0, 0, window,
-            reinterpret_cast<HMENU>(kWideDiagnosticsButton),
-            GetModuleHandleW(nullptr), nullptr);
-        if (wide_diagnostics) {
-            SendMessageW(wide_diagnostics, WM_SETFONT,
-                         reinterpret_cast<WPARAM>(g_button_font), TRUE);
-            SendMessageW(wide_diagnostics, BM_SETCHECK,
-                         g_widescreen_diagnostics
-                             ? BST_CHECKED : BST_UNCHECKED,
-                         TRUE);
-        }
-        HWND experimental_fixes = CreateWindowExW(
-            0, L"BUTTON", L"Experimental Fixes",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
-            0, 0, 0, 0, window,
-            reinterpret_cast<HMENU>(kExperimentalFixesButton),
-            GetModuleHandleW(nullptr), nullptr);
-        if (experimental_fixes) {
-            SendMessageW(experimental_fixes, WM_SETFONT,
-                         reinterpret_cast<WPARAM>(g_button_font), TRUE);
-            SendMessageW(experimental_fixes, BM_SETCHECK,
-                         g_experimental_fixes
-                             ? BST_CHECKED : BST_UNCHECKED,
-                         TRUE);
-        }
-        HWND test_variables = CreateWindowExW(
-            0, L"BUTTON", L"Test variables",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
-            0, 0, 0, 0, window,
-            reinterpret_cast<HMENU>(kTestVariablesButton),
-            GetModuleHandleW(nullptr), nullptr);
+        // Every checkbox below is BS_OWNERDRAW (drawn by draw_checkbox_item,
+        // state read from checkbox_state_for_id) rather than BS_AUTOCHECKBOX
+        // so it can sit on the panel's real background instead of painting
+        // its own opaque box; their initial checked state is simply whatever
+        // the backing global already holds; no BM_SETCHECK needed.
         // The default is intentionally OFF for every launcher invocation.
-        if (test_variables) {
-            SendMessageW(test_variables, WM_SETFONT,
-                         reinterpret_cast<WPARAM>(g_button_font), TRUE);
-            SendMessageW(test_variables, BM_SETCHECK, BST_UNCHECKED, TRUE);
-        }
+        CreateWindowExW(0, L"BUTTON", L"Test variables",
+                        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                        0, 0, 0, 0, window,
+                        reinterpret_cast<HMENU>(kTestVariablesButton),
+                        GetModuleHandleW(nullptr), nullptr);
         struct TestChildControl {
             int id;
             const wchar_t* label;
-            bool checked;
         };
         const TestChildControl children[] = {
-            {kSelfHealRamButton, L"Self-heal RAM", g_test_selfheal_ram},
-            {kCostProbeButton, L"Cost probe", g_test_cost_probe},
-            {kPresentCadenceButton, L"Present cadence", g_test_present_cadence},
-            {kBlitterShadowButton, L"Blitter shadow", g_test_blitter_shadow},
-            {kRecursionProbeButton, L"Recursion probe", g_test_recursion_probe},
-            {kRamChurnProbeButton, L"RAM churn probe", g_test_ram_churn_probe},
-            {kOamShadowTraceButton, L"OAM shadow writer trace", g_test_oam_shadow_trace},
+            {kSelfHealRamButton, L"Self-heal RAM"},
+            {kCostProbeButton, L"Cost probe"},
+            {kPresentCadenceButton, L"Present cadence"},
+            {kBlitterShadowButton, L"Blitter shadow"},
+            {kRecursionProbeButton, L"Recursion probe"},
+            {kRamChurnProbeButton, L"RAM churn probe"},
+            {kOamShadowTraceButton, L"OAM shadow writer trace"},
+            {kObjParkCensusButton, L"Log off-screen sprite positions"},
+            {kMapRecordButton, L"Record map data per room"},
+            {kFunctionTracerButton, L"Function tracer"},
         };
         for (const TestChildControl& child : children) {
-            HWND control = CreateWindowExW(
-                0, L"BUTTON", child.label,
-                WS_CHILD | WS_TABSTOP | BS_AUTOCHECKBOX,
-                0, 0, 0, 0, window,
-                reinterpret_cast<HMENU>(child.id),
-                GetModuleHandleW(nullptr), nullptr);
-            if (!control) continue;
-            SendMessageW(control, WM_SETFONT,
-                         reinterpret_cast<WPARAM>(g_button_font), TRUE);
-            SendMessageW(control, BM_SETCHECK,
-                         child.checked ? BST_CHECKED : BST_UNCHECKED, TRUE);
+            CreateWindowExW(0, L"BUTTON", child.label,
+                            WS_CHILD | WS_TABSTOP | BS_OWNERDRAW,
+                            0, 0, 0, 0, window,
+                            reinterpret_cast<HMENU>(child.id),
+                            GetModuleHandleW(nullptr), nullptr);
         }
 
-        HWND native_mp2k = CreateWindowExW(
-            0, L"BUTTON", L"Native MP2K audio (Experimental)",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
-            0, 0, 0, 0, window,
-            reinterpret_cast<HMENU>(kNativeMp2kButton),
-            GetModuleHandleW(nullptr), nullptr);
-        HWND turbo_audio = CreateWindowExW(
-            0, L"BUTTON", L"Normal-speed Turbo audio (Experimental)",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
-            0, 0, 0, 0, window,
-            reinterpret_cast<HMENU>(kTurboAudioButton),
-            GetModuleHandleW(nullptr), nullptr);
+        CreateWindowExW(0, L"BUTTON", L"Native MP2K audio (Experimental)",
+                        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                        0, 0, 0, 0, window,
+                        reinterpret_cast<HMENU>(kNativeMp2kButton),
+                        GetModuleHandleW(nullptr), nullptr);
+        CreateWindowExW(0, L"BUTTON", L"Normal-speed Turbo audio (Experimental)",
+                        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                        0, 0, 0, 0, window,
+                        reinterpret_cast<HMENU>(kTurboAudioButton),
+                        GetModuleHandleW(nullptr), nullptr);
         HWND audio_help = CreateWindowExW(
             0, L"STATIC",
             L"Default audio coupled. Launcher toggle: MP2K music-only Turbo; "
@@ -1272,39 +1357,18 @@ LRESULT CALLBACK launcher_window_proc(HWND window, UINT message,
             0, 0, 0, 0, window,
             reinterpret_cast<HMENU>(kAudioHelpText),
             GetModuleHandleW(nullptr), nullptr);
-        for (HWND control : {native_mp2k, turbo_audio, audio_help}) {
-            if (!control) continue;
-            SendMessageW(control, WM_SETFONT,
-                         reinterpret_cast<WPARAM>(g_button_font), TRUE);
+        // A smaller body font for the paragraph-length help text: at the
+        // checkbox font's size the text needs far more lines to stay
+        // readable without clipping.
+        if (audio_help) {
+            SendMessageW(audio_help, WM_SETFONT,
+                         reinterpret_cast<WPARAM>(g_body_font), TRUE);
         }
-        if (native_mp2k) {
-            SendMessageW(native_mp2k, BM_SETCHECK,
-                         g_audio_settings.native_mp2k && !g_strict_static_route
-                             ? BST_CHECKED : BST_UNCHECKED,
-                         TRUE);
-        }
-        if (turbo_audio) {
-            SendMessageW(turbo_audio, BM_SETCHECK,
-                         g_audio_settings.native_mp2k &&
-                                 g_audio_settings.turbo_decoupled &&
-                                 !g_strict_static_route
-                             ? BST_CHECKED : BST_UNCHECKED,
-                         TRUE);
-        }
-        HWND copy_session_id = CreateWindowExW(
-            0, L"BUTTON", L"Copy session ID to clipboard",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
-            0, 0, 0, 0, window,
-            reinterpret_cast<HMENU>(kCopySessionIdButton),
-            GetModuleHandleW(nullptr), nullptr);
-        if (copy_session_id) {
-            SendMessageW(copy_session_id, WM_SETFONT,
-                         reinterpret_cast<WPARAM>(g_button_font), TRUE);
-            SendMessageW(copy_session_id, BM_SETCHECK,
-                         g_audio_settings.copy_session_id_to_clipboard
-                             ? BST_CHECKED : BST_UNCHECKED,
-                         TRUE);
-        }
+        CreateWindowExW(0, L"BUTTON", L"Copy session ID to clipboard",
+                        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                        0, 0, 0, 0, window,
+                        reinterpret_cast<HMENU>(kCopySessionIdButton),
+                        GetModuleHandleW(nullptr), nullptr);
         layout_buttons(window);
         return 0;
     }
@@ -1320,9 +1384,34 @@ LRESULT CALLBACK launcher_window_proc(HWND window, UINT message,
         EndPaint(window, &paint);
         return 0;
     }
+    case WM_CTLCOLORSTATIC: {
+        // The help text is a plain (non-owner-drawn) STATIC label. Left
+        // unhandled it erases its own rect to an opaque system color before
+        // drawing its text, the same flat-box problem the checkboxes have.
+        // Painting is already done by the time this fires (WM_PAINT above
+        // covers the whole client area, including under this control), so
+        // returning NULL_BRUSH here just tells it to skip that erase and
+        // draw text straight over what is already there.
+        HDC dc = reinterpret_cast<HDC>(w_param);
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, RGB(240, 232, 210));
+        return reinterpret_cast<INT_PTR>(GetStockObject(NULL_BRUSH));
+    }
     case WM_DRAWITEM: {
         const auto* item = reinterpret_cast<const DRAWITEMSTRUCT*>(l_param);
         if (!item || !g_button_font) return FALSE;
+        if (bool* state = checkbox_state_for_id(item->CtlID)) {
+            bool checked = *state;
+            // Strict static acceptance always wins over the UI: these two
+            // must read as unchecked (as well as disabled) while it is
+            // active, same as before.
+            if (item->CtlID == kNativeMp2kButton ||
+                item->CtlID == kTurboAudioButton) {
+                checked = checked && !g_strict_static_route;
+            }
+            draw_checkbox_item(*item, checked);
+            return TRUE;
+        }
         const bool quit = item->CtlID == kQuitButton;
         const COLORREF fill = quit ? RGB(92, 42, 37) : RGB(180, 127, 35);
         const COLORREF border = quit ? RGB(202, 120, 95) : RGB(255, 220, 112);
@@ -1349,98 +1438,37 @@ LRESULT CALLBACK launcher_window_proc(HWND window, UINT message,
             DestroyWindow(window);
             return 0;
         }
-        if (LOWORD(w_param) == kWideDiagnosticsButton) {
-            g_widescreen_diagnostics = SendMessageW(
-                GetDlgItem(window, kWideDiagnosticsButton), BM_GETCHECK, 0, 0) ==
-                BST_CHECKED;
-            return 0;
-        }
-        if (LOWORD(w_param) == kExperimentalFixesButton) {
-            g_experimental_fixes = SendMessageW(
-                GetDlgItem(window, kExperimentalFixesButton), BM_GETCHECK, 0, 0) ==
-                BST_CHECKED;
-            return 0;
-        }
-        if (LOWORD(w_param) == kNativeMp2kButton) {
-            g_audio_settings.native_mp2k = SendMessageW(
-                GetDlgItem(window, kNativeMp2kButton), BM_GETCHECK, 0, 0) ==
-                BST_CHECKED;
-            if (!g_audio_settings.native_mp2k) {
-                g_audio_settings.turbo_decoupled = false;
-                HWND turbo_audio = GetDlgItem(window, kTurboAudioButton);
-                if (turbo_audio)
-                    SendMessageW(turbo_audio, BM_SETCHECK, BST_UNCHECKED, TRUE);
+        // Owner-drawn checkboxes have no OS-maintained check state (that is
+        // only automatic for BS_AUTOCHECKBOX), so a click just flips the
+        // flag this ID maps to and repaints it -- same table WM_DRAWITEM
+        // reads from, so a new checkbox only ever needs the one entry there.
+        if (bool* state = checkbox_state_for_id(LOWORD(w_param))) {
+            *state = !*state;
+            switch (LOWORD(w_param)) {
+            case kNativeMp2kButton:
+                if (!g_audio_settings.native_mp2k) {
+                    g_audio_settings.turbo_decoupled = false;
+                }
+                save_launcher_audio_settings(g_launcher_root, g_audio_settings);
+                layout_buttons(window);
+                break;
+            case kTurboAudioButton:
+                if (!g_audio_settings.native_mp2k) {
+                    g_audio_settings.turbo_decoupled = false;
+                }
+                save_launcher_audio_settings(g_launcher_root, g_audio_settings);
+                break;
+            case kCopySessionIdButton:
+                save_launcher_audio_settings(g_launcher_root, g_audio_settings);
+                break;
+            case kTestVariablesButton:
+                layout_buttons(window);
+                break;
+            default:
+                break;
             }
-            save_launcher_audio_settings(g_launcher_root, g_audio_settings);
-            layout_buttons(window);
-            return 0;
-        }
-        if (LOWORD(w_param) == kTurboAudioButton) {
-            g_audio_settings.turbo_decoupled =
-                g_audio_settings.native_mp2k &&
-                SendMessageW(GetDlgItem(window, kTurboAudioButton), BM_GETCHECK,
-                             0, 0) == BST_CHECKED;
-            if (!g_audio_settings.native_mp2k) {
-                SendMessageW(GetDlgItem(window, kTurboAudioButton), BM_SETCHECK,
-                             BST_UNCHECKED, TRUE);
-            }
-            save_launcher_audio_settings(g_launcher_root, g_audio_settings);
-            return 0;
-        }
-        if (LOWORD(w_param) == kCopySessionIdButton) {
-            g_audio_settings.copy_session_id_to_clipboard =
-                SendMessageW(GetDlgItem(window, kCopySessionIdButton),
-                             BM_GETCHECK, 0, 0) == BST_CHECKED;
-            save_launcher_audio_settings(g_launcher_root, g_audio_settings);
-            return 0;
-        }
-        if (LOWORD(w_param) == kTestVariablesButton) {
-            g_test_variables = SendMessageW(
-                                  GetDlgItem(window, kTestVariablesButton),
-                                  BM_GETCHECK, 0, 0) == BST_CHECKED;
-            layout_buttons(window);
-            return 0;
-        }
-        if (LOWORD(w_param) == kSelfHealRamButton) {
-            g_test_selfheal_ram = SendMessageW(
-                GetDlgItem(window, kSelfHealRamButton), BM_GETCHECK, 0, 0) ==
-                BST_CHECKED;
-            return 0;
-        }
-        if (LOWORD(w_param) == kCostProbeButton) {
-            g_test_cost_probe = SendMessageW(
-                GetDlgItem(window, kCostProbeButton), BM_GETCHECK, 0, 0) ==
-                BST_CHECKED;
-            return 0;
-        }
-        if (LOWORD(w_param) == kPresentCadenceButton) {
-            g_test_present_cadence = SendMessageW(
-                GetDlgItem(window, kPresentCadenceButton), BM_GETCHECK, 0, 0) ==
-                BST_CHECKED;
-            return 0;
-        }
-        if (LOWORD(w_param) == kBlitterShadowButton) {
-            g_test_blitter_shadow = SendMessageW(
-                GetDlgItem(window, kBlitterShadowButton), BM_GETCHECK, 0, 0) ==
-                BST_CHECKED;
-            return 0;
-        }
-        if (LOWORD(w_param) == kRecursionProbeButton) {
-            g_test_recursion_probe = SendMessageW(
-                GetDlgItem(window, kRecursionProbeButton), BM_GETCHECK, 0, 0) ==
-                BST_CHECKED;
-            return 0;
-        }
-        if (LOWORD(w_param) == kRamChurnProbeButton) {
-            g_test_ram_churn_probe = SendMessageW(
-                GetDlgItem(window, kRamChurnProbeButton), BM_GETCHECK, 0, 0) ==
-                BST_CHECKED;
-            return 0;
-        }
-        if (LOWORD(w_param) == kOamShadowTraceButton) {
-            g_test_oam_shadow_trace = SendMessageW(
-                GetDlgItem(window, kOamShadowTraceButton), BM_GETCHECK, 0, 0) ==
-                BST_CHECKED;
+            HWND clicked = GetDlgItem(window, LOWORD(w_param));
+            if (clicked) InvalidateRect(clicked, nullptr, FALSE);
             return 0;
         }
         if (LOWORD(w_param) == kPickRomButton) {
@@ -1485,6 +1513,10 @@ int show_launcher(const fs::path& root, const std::wstring& bios) {
                                 DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
                                 CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
                                 DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+    g_body_font = CreateFontW(15, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                              DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                              CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                              DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
 
     const wchar_t class_name[] = L"GoldenSunRecompiledLauncherWindow";
     WNDCLASSW window_class{};
@@ -1495,7 +1527,9 @@ int show_launcher(const fs::path& root, const std::wstring& bios) {
     window_class.hbrBackground = nullptr;
     RegisterClassW(&window_class);
 
-    RECT desired{0, 0, 720, 760};
+    // Tall enough that the panel still clears the logo even in the worst
+    // case (Test variables checked, all 10 children shown in one column).
+    RECT desired{0, 0, 720, 880};
     AdjustWindowRectEx(&desired, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU |
                                  WS_MINIMIZEBOX, FALSE, WS_EX_APPWINDOW);
     HWND window = CreateWindowExW(
@@ -1507,6 +1541,8 @@ int show_launcher(const fs::path& root, const std::wstring& bios) {
     if (!window) {
         if (g_button_font) DeleteObject(g_button_font);
         g_button_font = nullptr;
+        if (g_body_font) DeleteObject(g_body_font);
+        g_body_font = nullptr;
         g_splash_image.reset();
         Gdiplus::GdiplusShutdown(gdiplus_token);
         MessageBoxW(nullptr, L"The launcher window could not be created.",
@@ -1531,6 +1567,8 @@ int show_launcher(const fs::path& root, const std::wstring& bios) {
 
     if (g_button_font) DeleteObject(g_button_font);
     g_button_font = nullptr;
+    if (g_body_font) DeleteObject(g_body_font);
+    g_body_font = nullptr;
     g_splash_image.reset();
     UnregisterClassW(class_name, GetModuleHandleW(nullptr));
     Gdiplus::GdiplusShutdown(gdiplus_token);
@@ -1560,13 +1598,6 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         // This path is deliberately opt-in and uses the same cached ROM plus
         // exact SHA-1 validation as the normal Pick ROM button. It exists so
         // scripted replay can still enter through GoldenSunLauncher.exe.
-        // Developer replay captures may opt into the existing WIDE-01 trace
-        // without requiring the interactive checkbox. Normal launches still
-        // reset this choice to the explicit UI default below.
-        g_widescreen_diagnostics = inherited_environment_truthy(
-            L"GBARECOMP_VRAM_MAP_TRACE");
-        g_experimental_fixes = inherited_environment_truthy(
-            L"GBARECOMP_EXPERIMENTAL_FIXES");
         const fs::path cached_path = root / L"local" / L"launcher-rom.txt";
         const std::wstring cached_rom = read_cached_path(cached_path);
         std::wstring error;
