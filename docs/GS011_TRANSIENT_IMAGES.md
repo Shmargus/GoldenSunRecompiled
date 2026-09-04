@@ -9,7 +9,7 @@
 > The *numbers* — frame counts, binary sizes, registry counts, trace-event
 > totals, and which track aborts where — are a snapshot from 2026-08-07 and
 > have been overtaken many times since. Do not quote them as current. For
-> current state see `docs/STATUS.md`.
+> current state see `ROADMAP.md`.
 
 ## Status (2026-08-07 snapshot)
 
@@ -154,7 +154,7 @@ literal pool as code.
 Golden Sun DMA-copies short ROM routines into RAM and executes them there. The
 same runtime address hosts different routines at different times, so a runtime
 PC alone is never a valid dispatch key — the identity of the installed bytes is
-part of the key. This is the concrete instance of D-005 in `DECISIONS.md`.
+part of the key. This is the concrete instance of D-005 in `ARCHITECTURE.md`.
 
 Each image is generated as its own corpus with `gba_recompile --symbol-prefix`,
 and registered in `kTransientCodeImages` in `src/runner_main.cpp`. Before
@@ -165,7 +165,7 @@ translation of code that is no longer resident.
 
 The registry is the game runner's own adapter installed on the generic
 `g_runtime_ram_dispatch_hook` seam; the hook is consulted only for PCs in
-`0x02000000..0x04000000` (see `docs/history/OVERLAY_RUNTIME_SPIKE.md`).
+`0x02000000..0x04000000` (see `docs/OLD/history/OVERLAY_RUNTIME_SPIKE.md`).
 
 ## Image inventory
 
@@ -376,7 +376,7 @@ runner  sha256       06c1b32a9fce710c218bcfc583eb300d8e29e32a987d8c57ea5178cc5cb
 ```
 
 The corpus aggregate feeds each `.cpp` file's raw bytes to SHA-256 in lexical
-filename order, matching `docs/history/MAIN_TOML_BASELINE.md`.
+filename order, matching `docs/OLD/history/MAIN_TOML_BASELINE.md`.
 
 Registering the image advanced the strict-static run from 1,491,016 to
 1,882,605 recorded trace events (+26%). Trace events are mem-write/branch/
@@ -853,7 +853,7 @@ longer: relocation removed one unbounded axis, not the discovery work.
 
 Ignored-build evidence, not release artifacts or upstream pins. The corpus
 aggregate feeds each `.cpp` file's raw bytes to SHA-256 in lexical filename
-order, matching `docs/history/MAIN_TOML_BASELINE.md`.
+order, matching `docs/OLD/history/MAIN_TOML_BASELINE.md`.
 
 ```
 main.toml sha256          911d9c4f994a946bf7eba95df88c08bba92f04f51502b6c2f5ba527be6d89b1d
@@ -917,7 +917,7 @@ rebuild is strong identity evidence per AGENTS.md Section 4. Re-running
 `local/symbols/main-symbols.json`, `local/symbols/main-symbols-unresolved.json`,
 and `config/usa/main-data-exceptions.json` were corrected to record
 `evidence_revision = 84a80693003439acdbb78dd84538b0532461ad4b` - a provenance
-correction, not a re-import. See `UPSTREAM.md`.
+correction, not a re-import. See `ARCHITECTURE.md`.
 
 Two `main.toml` generations isolated the ELF-revision change from the
 `Func_a2680` seed:
@@ -1286,7 +1286,7 @@ still can't run this part of it," because the corpus generator did not emit
 an entry point there.
 
 This is the same underlying gap `build_overlay_toml.py`'s later
-`[[resume_range]]` generalization closed (see `CHANGELOG.md`, "The Mt. Aleph
+`[[resume_range]]` generalization closed (see `docs/OLD/CHANGELOG.md`, "The Mt. Aleph
 scene now completes"): the overlay generator originally validated each
 observed entry as one exact THUMB symbol and had no equivalent of
 `main.toml`'s `derive_resume_ranges` to split a seeded routine's extent around

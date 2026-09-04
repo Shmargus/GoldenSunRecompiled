@@ -32,9 +32,10 @@ the routing below, and load the specific file rather than its whole directory.
 | Overlays, RAM-resident code, dispatch identity | `docs/OVERLAYS.md`, `docs/GS011_TRANSIENT_IMAGES.md` |
 | Symbols, importing names or addresses | `docs/SYMBOL_IMPORT.md` |
 | Build failures, profiling, headless runs | the Builds section below, then `docs/DEBUGGING.md` |
-| Why something was decided the way it was | `DECISIONS.md` |
+| Why something was decided the way it was | `ARCHITECTURE.md` decision log |
 | Repository layout, where things live | `docs/WORKSPACE_LAYOUT.md` |
 | Audio — shelved, do not start unprompted | `docs/features/MP2K.md` |
+| ROM, BIOS, asset or licensing boundaries | `docs/LEGAL.md` |
 
 ### Never load these into context
 

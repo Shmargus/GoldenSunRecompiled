@@ -63,11 +63,8 @@ Belong here when Golden Sun-specific:
 Use synthetic fixture bytes and text; never commit ROM-derived binary fixtures.
 
 Historical milestone notes and closed acceptance records belong in
-`docs/history/`; they are not current test status. Use `docs/STATUS.md` for the
-current configured build and test result, `docs/NEXT_TASK.md` for the immediate
-acceptance scenario, and `docs/ACTIVE_ISSUES.md` for the short issue index.
-Open the linked `docs/issues/` or `docs/features/` file for the test's evidence
-and closure condition. Public Python tests remain the cheap check:
+`docs/OLD/history/`; they are not current test status. Use `ROADMAP.md` for the
+current configured build, the current milestone, and its acceptance condition. Public Python tests remain the cheap check:
 
 ```powershell
 python -m unittest discover -s tests -p "test_*.py"
