@@ -14,6 +14,9 @@
 #include "blitter_shadow_observer.h"
 #include "crash_handler.h"
 #include "function_tracer.h"
+#include "map_recorder.h"
+#include "obj_recorder.h"
+#include "room_buffer.h"
 #include "gba_bus.h"
 #include "gba_ppu.h"
 #include "gba_vram_trace.h"
@@ -178,13 +181,16 @@ namespace {
 constexpr const char* kRomSha1 =
     "5c4695205413df7db52b9a184815a07783999971";
 
+// One expanded view, not an aspect vocabulary: 360x240 is the native 240x160
+// grown 50% in both axes, chosen 2026-09-05. The earlier 288x160 widescreen
+// and the aspect cycle it belonged to are gone -- they predate the room
+// buffer and were built on the per-pixel margin path that failed three times.
 constexpr const char* kGoldenSunAspectLabels[] = {
     "Native 240x160",
-    "Widescreen 288x160",
-    "Expanded Widescreen 360x240",
+    "Expanded View 360x240",
 };
-constexpr std::uint16_t kGoldenSunAspectWidths[] = {240u, 288u, 360u};
-constexpr std::uint16_t kGoldenSunAspectHeights[] = {160u, 160u, 240u};
+constexpr std::uint16_t kGoldenSunAspectWidths[] = {240u, 360u};
+constexpr std::uint16_t kGoldenSunAspectHeights[] = {160u, 240u};
 
 std::uint32_t g_golden_sun_wide_extra_left = 0;
 std::uint32_t g_golden_sun_wide_extra_right = 0;
@@ -261,6 +267,11 @@ struct GoldenSunObjPlacementProvenance {
     std::uint16_t expected_attr0 = 0;
     std::uint16_t expected_attr1 = 0;
     std::uint16_t expected_attr2 = 0;
+    // Written by the F0 commit observer from the resolved placement, rather
+    // than by D4 from the staging record. D4 must not overwrite one of these
+    // within the same frame: it fires on a narrower gate and would replace a
+    // shadow's own recovered position with its body's.
+    bool commit_resolved = false;
 };
 
 // Diagnostic-only link between a B328 positive-Y candidate and the signed-Y
@@ -1723,7 +1734,7 @@ void record_golden_sun_b328_accepted_f0_writer(
     }
 }
 
-bool golden_sun_experimental_record_identity(std::uint32_t staging,
+bool golden_sun_obj_record_identity(std::uint32_t staging,
                                              std::uint32_t* record_base,
                                              bool* shadow) {
     constexpr std::uint32_t kRecordBase = 0x03002000u;
@@ -1786,6 +1797,148 @@ const GoldenSunObjF0Context* find_golden_sun_obj_f0_context(
     return found;
 }
 
+// One committed sprite's full-precision position, or the reason there isn't
+// one. See widescreen_policy.h's GoldenSunObjPlacementOutcome for why this
+// vocabulary exists and what each outcome means for vertical wrap.
+struct GoldenSunObjPlacement {
+    // False for an entry that is disabled, empty or dormant -- not a sprite,
+    // so neither the culler nor the census should count it.
+    bool considered = false;
+    gsr::widescreen::GoldenSunObjPlacementOutcome outcome =
+        gsr::widescreen::GoldenSunObjPlacementOutcome::SourceUnavailable;
+    // The guest actor record this sprite was traced to, when it was traced.
+    bool record_identified = false;
+    std::uint32_t staging = 0;
+    std::uint32_t record_base = 0;
+    bool shadow = false;
+    // Rotation/scaling sprite. Independent of `outcome`: its POSITION is
+    // recoverable like any other sprite's, but its on-screen BOUNDS need the
+    // affine transform, so the off-screen culler must still refuse it. Kept
+    // as its own flag rather than an outcome so the two questions -- "can we
+    // place it?" and "can we cull it?" -- stop being answered by one bit.
+    bool affine = false;
+    // Valid only when golden_sun_obj_placement_is_exact(outcome).
+    // For a shadow these are the SHADOW's own coordinates, recovered from its
+    // paired body -- not the body's. paired_offset_* is how far it sits from
+    // that body, reported so the recovery's one assumption (that the pair is
+    // closer together than half the truncated field) stays measured.
+    int resolved_x = 0;
+    int resolved_y = 0;
+    int paired_offset_x = 0;
+    int paired_offset_y = 0;
+    int width = 0;
+    int height = 0;
+    unsigned shape = 0;
+    unsigned size = 0;
+};
+
+// Recover a committed sprite's position from the guest's own pre-truncation
+// coordinate rather than from OAM.
+//
+// Extracted 2026-09-06 from the experimental off-screen culler, which was
+// the only caller. It is now shared with the GSR_OBJ_RECORD census
+// (obj_recorder.h), because the census has to measure exactly the lookup the
+// renderer would eventually depend on -- measuring a reimplementation of it
+// would prove nothing. Read-only: it inspects guest memory and the per-frame
+// F0 context table and changes neither.
+GoldenSunObjPlacement golden_sun_obj_resolve_placement(
+    std::uint16_t attr0, std::uint16_t attr1, std::uint16_t attr2,
+    std::uint64_t writer_frame, std::uint32_t writer_depth,
+    std::uint32_t writer_return_pc) {
+    using Outcome = gsr::widescreen::GoldenSunObjPlacementOutcome;
+    GoldenSunObjPlacement out;
+    const bool affine = (attr0 & 0x0100u) != 0u;
+    const bool already_disabled = !affine && (attr0 & 0x0200u) != 0u;
+    if (already_disabled || (attr0 == 0u && attr1 == 0u && attr2 == 0u))
+        return out;
+    out.considered = true;
+    out.affine = affine;
+    out.shape = static_cast<unsigned>((attr0 >> 14) & 0x3u);
+    out.size = static_cast<unsigned>((attr1 >> 14) & 0x3u);
+    if (!gsr::widescreen::golden_sun_obj_dimensions(out.shape, out.size,
+                                                    &out.width, &out.height)) {
+        out.outcome = Outcome::InvalidShapeSize;
+        return out;
+    }
+    // Affine sprites are resolved like any other. They used to return here,
+    // which measured 3,225 of 6,493 committed sprites (49.7%) as unplaceable
+    // in session objrec_20260906_110334 -- but that was the CULLER's
+    // limitation leaking into the placement answer. Golden Sun scales sprites
+    // constantly (walk squash, shadows), so refusing to place them left half
+    // the screen falling back to the 8-bit byte, which is exactly the
+    // population that wraps. `out.affine` carries the restriction to the
+    // culler instead. 2026-09-06.
+    const auto* context = find_golden_sun_obj_f0_context(
+        writer_frame, writer_depth, writer_return_pc, attr0, attr1, attr2);
+    std::uint32_t record_base = 0;
+    bool shadow = false;
+    if (!context || !golden_sun_obj_record_identity(context->staging,
+                                                    &record_base, &shadow)) {
+        out.outcome = Outcome::SourceUnavailable;
+        return out;
+    }
+    out.record_identified = true;
+    out.staging = context->staging;
+    out.record_base = record_base;
+    out.shadow = shadow;
+    // A shadow carries no coordinate of its own: it is placed from the body
+    // record it is paired with (body at +0x00, shadow at +0x0C), which is
+    // what keeps a body and its shadow from ever being placed by two
+    // different decisions.
+    const std::uint32_t body_source = record_base;
+    auto* staging = find_golden_sun_obj_staging(body_source);
+    std::uint16_t body_attr0 = 0, body_attr1 = 0, body_attr2 = 0;
+    const bool body_attrs_valid = read_golden_sun_obj_staging_attrs(
+        body_source, &body_attr0, &body_attr1, &body_attr2);
+    int width = out.width;
+    int height = out.height;
+    const bool body_dimensions_valid = body_attrs_valid &&
+        gsr::widescreen::golden_sun_obj_dimensions(
+            (body_attr0 >> 14) & 0x3u, (body_attr1 >> 14) & 0x3u, &width,
+            &height);
+    // The body's own affine bit is deliberately NOT a rejection here, for the
+    // same reason: a rotated sprite still has an exact top-left position, and
+    // that position is all the renderer needs.
+    const bool body_provenance_valid = staging && staging->valid &&
+        staging->x_valid && staging->y_valid &&
+        staging->auth_epoch == g_golden_sun_field_auth_epoch &&
+        staging->frame == writer_frame;
+    int checked_x = 0, checked_y = 0;
+    const bool body_raw_matches = body_provenance_valid &&
+        gsr::widescreen::golden_sun_obj_resolve_oam_x(
+            body_attr1 & 0x1FFu, true, staging->logical_x, &checked_x) &&
+        gsr::widescreen::golden_sun_obj_resolve_oam_y(
+            body_attr0 & 0xFFu, true, staging->logical_y, &checked_y);
+    const bool body_identity_matches = body_provenance_valid &&
+        (shadow || (body_attr0 == attr0 && body_attr1 == attr1 &&
+                    body_attr2 == attr2));
+    if (!body_attrs_valid || !body_dimensions_valid || !body_provenance_valid ||
+        !body_raw_matches || !body_identity_matches) {
+        out.outcome = Outcome::PlacementUnavailable;
+        return out;
+    }
+    out.width = width;
+    out.height = height;
+    if (shadow) {
+        // The body's position is not the shadow's. Recover the shadow's own
+        // coordinates from its paired body plus its own committed fields --
+        // without this the renderer would draw every shadow on top of the
+        // sprite it belongs to.
+        out.resolved_x = gsr::widescreen::golden_sun_obj_paired_coordinate(
+            staging->logical_x, attr1 & 0x1FFu, 9u);
+        out.resolved_y = gsr::widescreen::golden_sun_obj_paired_coordinate(
+            staging->logical_y, attr0 & 0x00FFu, 8u);
+        out.paired_offset_x = out.resolved_x - staging->logical_x;
+        out.paired_offset_y = out.resolved_y - staging->logical_y;
+        out.outcome = Outcome::PairedBody;
+    } else {
+        out.resolved_x = staging->logical_x;
+        out.resolved_y = staging->logical_y;
+        out.outcome = Outcome::Exact;
+    }
+    return out;
+}
+
 void trace_golden_sun_experimental_cull(
     int slot, std::uint32_t source, std::uint32_t raw_x,
     std::uint32_t raw_y, int resolved_x, int resolved_y, unsigned shape,
@@ -1826,7 +1979,8 @@ void golden_sun_obj_f0_entry_capture(std::uint32_t entry_pc) {
     if (!golden_sun_func1dc8_writer_pc(
             entry_pc, gsr::Func1dc8WriterRoute::EC) ||
         (!golden_sun_wide_diagnostics_enabled() &&
-         !golden_sun_experimental_fixes_enabled()) ||
+         !golden_sun_experimental_fixes_enabled() &&
+         !gsr::obj_recorder_enabled()) ||
         !golden_sun_expanded_obj_view_active()) return;
     const std::uint64_t frame = runtime_current_frame();
     const std::uint32_t depth = runtime_call_stack_depth();
@@ -1834,13 +1988,14 @@ void golden_sun_obj_f0_entry_capture(std::uint32_t entry_pc) {
     const std::uint32_t staging = g_cpu.R[6];
     link_golden_sun_b328_parentless_ec(
         frame, staging, depth, return_pc, entry_pc);
-    if (golden_sun_experimental_fixes_enabled()) {
+    if (golden_sun_experimental_fixes_enabled() ||
+        gsr::obj_recorder_enabled()) {
         std::uint16_t attr0 = 0, attr1 = 0, attr2 = 0;
         std::uint32_t record_base = 0;
         bool shadow = false;
         if (read_golden_sun_obj_staging_attrs(staging, &attr0, &attr1,
                                               &attr2) &&
-            golden_sun_experimental_record_identity(
+            golden_sun_obj_record_identity(
                 staging, &record_base, &shadow)) {
             remember_golden_sun_obj_f0_context(
                 frame, depth, return_pc, staging, record_base, shadow, attr0,
@@ -1934,23 +2089,23 @@ void golden_sun_oam_shadow_write_observer(std::uint32_t writer_pc,
     // diagnostics-only work inside self-gates on
     // golden_sun_wide_diagnostics_enabled() independently.
     if ((!golden_sun_wide_diagnostics_enabled() &&
-         !golden_sun_experimental_fixes_enabled()) ||
+         !golden_sun_experimental_fixes_enabled() &&
+         !gsr::obj_recorder_enabled()) ||
         !golden_sun_expanded_obj_view_active() ||
         !golden_sun_func1dc8_writer_pc(
             writer_pc, gsr::Func1dc8WriterRoute::F0) || size == 0u) return;
-    if (address < gsr::widescreen::kGoldenSunOamShadowStart ||
-        address >= gsr::widescreen::kGoldenSunOamShadowEnd ||
-        ((address - gsr::widescreen::kGoldenSunOamShadowStart) %
-            gsr::widescreen::kGoldenSunOamShadowSlotBytes) != 4u)
-        return;
-    const std::uint32_t offset = address -
-        gsr::widescreen::kGoldenSunOamShadowStart;
-    const int slot = static_cast<int>(offset /
-        gsr::widescreen::kGoldenSunOamShadowSlotBytes);
+    // Either sprite table, not just the first: the game builds its list in
+    // two places and uploads whichever is current, so watching one address
+    // left 31% of frames unobserved (session_20260906_131954, 79 of 256
+    // uploads). See kGoldenSunOamShadowAltStart.
+    const std::uint32_t table_base =
+        gsr::widescreen::golden_sun_oam_shadow_table_base(address);
+    const int slot = gsr::widescreen::golden_sun_oam_shadow_slot_in_any_table(
+        address, 4u);
+    if (table_base == 0u || slot < 0) return;
     const std::uint32_t slot_address =
-        gsr::widescreen::kGoldenSunOamShadowStart +
-        static_cast<std::uint32_t>(slot) *
-            gsr::widescreen::kGoldenSunOamShadowSlotBytes;
+        table_base + static_cast<std::uint32_t>(slot) *
+                         gsr::widescreen::kGoldenSunOamShadowSlotBytes;
     // WIDE-01 experimental off-screen cull safety net (launcher's
     // "Experimental Fixes" toggle only -- normal play, including plain
     // widescreen diagnostics with the toggle off, is byte-for-byte
@@ -1985,101 +2140,138 @@ void golden_sun_oam_shadow_write_observer(std::uint32_t writer_pc,
             bus_read_u16(slot_address + 2u),
             bus_read_u16(slot_address + 4u));
     }
-    if (golden_sun_experimental_fixes_enabled()) {
-        const std::uint16_t cull_attr0 = committed_attr0;
-        const std::uint16_t cull_attr1 = committed_attr1;
-        const std::uint16_t cull_attr2 = committed_attr2;
-        // Already disabled (or an empty/dormant entry) -- nothing to do.
-        // Matches the existing dormant-entry recognition in
-        // record_golden_sun_obj_y_transition above.
-        const bool cull_affine = (cull_attr0 & 0x0100u) != 0u;
-        const bool cull_already_disabled =
-            !cull_affine && (cull_attr0 & 0x0200u) != 0u;
-        if (!cull_already_disabled &&
-            !(cull_attr0 == 0u && cull_attr1 == 0u && cull_attr2 == 0u)) {
-            const unsigned cull_shape =
-                static_cast<unsigned>((cull_attr0 >> 14) & 0x3u);
-            const unsigned cull_size =
-                static_cast<unsigned>((cull_attr1 >> 14) & 0x3u);
-            int width = 0, height = 0;
-            const std::uint32_t raw_x = cull_attr1 & 0x1FFu;
-            const std::uint32_t raw_y = cull_attr0 & 0xFFu;
-            int resolved_x = 0, resolved_y = 0;
-            std::uint32_t source = 0;
-            bool should_cull = false;
-            const char* reason = "source-unavailable";
-            const bool dimensions_valid =
-                gsr::widescreen::golden_sun_obj_dimensions(
-                    cull_shape, cull_size, &width, &height);
-            const auto* context = find_golden_sun_obj_f0_context(
-                writer_frame, writer_depth, writer_return_pc, cull_attr0,
-                cull_attr1, cull_attr2);
-            if (!dimensions_valid) {
-                reason = "invalid-shape-size";
-            } else if (cull_affine) {
-                // Affine and double-size sprites need transformed bounds;
-                // leaving them visible is safer than estimating them.
-                reason = "affine-or-double-size";
-            } else {
-                bool source_is_shadow = false;
-                if (!context ||
-                    !golden_sun_experimental_record_identity(
-                        context->staging, &source, &source_is_shadow)) {
-                reason = "source-unavailable";
-                } else {
-                const std::uint32_t body_source = source;
-                auto* staging = find_golden_sun_obj_staging(body_source);
-                std::uint16_t body_attr0 = 0, body_attr1 = 0, body_attr2 = 0;
-                const bool body_attrs_valid = read_golden_sun_obj_staging_attrs(
-                    body_source, &body_attr0, &body_attr1, &body_attr2);
-                const bool body_dimensions_valid = body_attrs_valid &&
-                    gsr::widescreen::golden_sun_obj_dimensions(
-                        (body_attr0 >> 14) & 0x3u, (body_attr1 >> 14) & 0x3u,
-                        &width, &height);
-                const bool body_provenance_valid = staging && staging->valid &&
-                    staging->x_valid && staging->y_valid &&
-                    staging->auth_epoch == g_golden_sun_field_auth_epoch &&
-                    staging->frame == writer_frame && !((body_attr0 & 0x0100u) != 0u);
-                int checked_x = 0, checked_y = 0;
-                const bool body_raw_matches = body_provenance_valid &&
-                    gsr::widescreen::golden_sun_experimental_resolve_oam_x(
-                        body_attr1 & 0x1FFu, true, staging->logical_x,
-                        &checked_x) &&
-                    gsr::widescreen::golden_sun_experimental_resolve_oam_y(
-                        body_attr0 & 0xFFu, true, staging->logical_y,
-                        &checked_y);
-                const bool body_identity_matches = body_provenance_valid &&
-                    (source_is_shadow ||
-                     (body_attr0 == cull_attr0 && body_attr1 == cull_attr1 &&
-                      body_attr2 == cull_attr2));
-                if (!body_attrs_valid || !body_dimensions_valid ||
-                    !body_provenance_valid || !body_raw_matches ||
-                    !body_identity_matches) {
-                    reason = "placement-unavailable";
-                } else {
-                    resolved_x = staging->logical_x;
-                    resolved_y = staging->logical_y;
-                    should_cull =
-                        gsr::widescreen::golden_sun_experimental_sprite_fully_offscreen_top_left(
-                            resolved_x, resolved_y, width, height,
+    // Placement lookup, shared by the GSR_OBJ_RECORD census and the
+    // experimental off-screen culler. The census has to run without the
+    // culler being armed -- it measures, it must not change what is drawn --
+    // so the gate is either toggle while the culler's guest write below
+    // stays inside its own.
+    if (gsr::obj_recorder_enabled() ||
+        golden_sun_experimental_fixes_enabled()) {
+        const GoldenSunObjPlacement placement =
+            golden_sun_obj_resolve_placement(
+                committed_attr0, committed_attr1, committed_attr2,
+                writer_frame, writer_depth, writer_return_pc);
+        // Disabled, empty and dormant entries are not sprites: neither the
+        // culler nor the census counts them.
+        if (placement.considered) {
+            const std::uint32_t raw_x = committed_attr1 & 0x1FFu;
+            const std::uint32_t raw_y = committed_attr0 & 0x00FFu;
+            if (gsr::obj_recorder_enabled()) {
+                gsr::ObjPlacementSample sample;
+                sample.frame = writer_frame;
+                sample.slot = slot;
+                sample.slot_address = slot_address;
+                sample.writer_pc = writer_pc;
+                sample.return_pc = writer_return_pc;
+                sample.depth = writer_depth;
+                sample.staging = placement.staging;
+                sample.record_base = placement.record_base;
+                sample.shadow = placement.shadow;
+                sample.record_identified = placement.record_identified;
+                sample.affine = placement.affine;
+                sample.paired_offset_x = placement.paired_offset_x;
+                sample.paired_offset_y = placement.paired_offset_y;
+                sample.table_base = table_base;
+                sample.attr0 = committed_attr0;
+                sample.attr1 = committed_attr1;
+                sample.attr2 = committed_attr2;
+                sample.raw_x = raw_x;
+                sample.raw_y = raw_y;
+                sample.resolved_x = placement.resolved_x;
+                sample.resolved_y = placement.resolved_y;
+                sample.width = placement.width;
+                sample.height = placement.height;
+                sample.outcome = placement.outcome;
+                gsr::obj_recorder_note_placement(sample);
+            }
+            // Publish the commit-time position into the table the PPU's
+            // object providers read.
+            //
+            // This is the fix the recorder measured, not a diagnostic. The
+            // table used to be filled only on writer route D4, and its
+            // dominant failure was staleness -- 1,337,880 stale-frame
+            // rejections in session_20260906_113648, one sampled record 41
+            // frames old and describing a different sprite. Writing it here
+            // means the record is created by the same write it describes, so
+            // it cannot be stale, and the committed ATTRs are its identity,
+            // so a recycled OAM slot cannot inherit it. Affine sprites are
+            // included: their position is exact even though their bounds
+            // are not.
+            if (gsr::widescreen::golden_sun_obj_placement_is_exact(
+                    placement.outcome) &&
+                slot >= 0 && static_cast<std::size_t>(slot) <
+                    g_golden_sun_obj_pending_provenance.size()) {
+                auto& pending = g_golden_sun_obj_pending_provenance[
+                    static_cast<std::size_t>(slot)];
+                pending.valid = true;
+                pending.x_valid = true;
+                pending.y_valid = true;
+                pending.logical_x =
+                    static_cast<std::int16_t>(placement.resolved_x);
+                pending.logical_y =
+                    static_cast<std::int16_t>(placement.resolved_y);
+                pending.frame = writer_frame;
+                pending.auth_epoch = g_golden_sun_field_auth_epoch;
+                pending.writer_branch_pc = writer_pc;
+                pending.target_address = slot_address;
+                pending.writer_generation = 0;
+                pending.oam_identity_valid = true;
+                pending.expected_attr0 = committed_attr0;
+                pending.expected_attr1 = committed_attr1;
+                pending.expected_attr2 = committed_attr2;
+                pending.commit_resolved = true;
+                // Publish immediately rather than waiting for the
+                // shadow->OAM DMA. That handoff fires only for the table it
+                // recognises, so on every frame uploaded from the other one
+                // the renderer kept serving records several frames old --
+                // measured at 3 frames in session_20260906_131954, and a
+                // stale record fails its own consistency check, which marks
+                // the sprite untrusted. An untrusted sprite falls back to the
+                // wrapping byte AND is confined to the native window, which
+                // is exactly the "shadows jump and cull early" report.
+                //
+                // Safe to publish mid-build because a record carries its
+                // sprite's exact ATTR0/1/2 and is only ever applied to a
+                // sprite whose bytes match: a half-built table yields records
+                // that go unused, never records applied to the wrong sprite.
+                g_golden_sun_obj_visible_provenance[
+                    static_cast<std::size_t>(slot)] = pending;
+            }
+            if (golden_sun_experimental_fixes_enabled()) {
+                // Only a sprite with a full-precision position may be
+                // culled; the truncated byte is exactly what cannot be
+                // trusted to say a sprite is off-screen.
+                // `!placement.affine` preserves the culler's behaviour
+                // unchanged now that affine sprites resolve a position:
+                // bounds still need the transform, so they are never culled.
+                const bool exact = !placement.affine &&
+                    gsr::widescreen::golden_sun_obj_placement_is_exact(
+                        placement.outcome);
+                const bool should_cull = exact &&
+                    gsr::widescreen::
+                        golden_sun_experimental_sprite_fully_offscreen_top_left(
+                            placement.resolved_x, placement.resolved_y,
+                            placement.width, placement.height,
                             g_golden_sun_wide_extra_left,
                             g_golden_sun_wide_extra_right,
                             g_golden_sun_wide_extra_top,
                             g_golden_sun_wide_extra_bottom);
-                    reason = source_is_shadow ? "paired-body-placement"
-                                              : "exact-placement";
+                trace_golden_sun_experimental_cull(
+                    slot, placement.record_base, raw_x, raw_y,
+                    placement.resolved_x, placement.resolved_y,
+                    placement.shape, placement.size, placement.width,
+                    placement.height, should_cull,
+                    gsr::widescreen::golden_sun_obj_placement_outcome_name(
+                        placement.outcome));
+                if (should_cull) {
+                    const std::uint16_t hidden_attr0 =
+                        static_cast<std::uint16_t>(
+                            committed_attr0 |
+                            static_cast<std::uint16_t>(0x0200u));
+                    g_golden_sun_experimental_cull_write_in_progress = true;
+                    bus_write_u16(slot_address, hidden_attr0);
+                    g_golden_sun_experimental_cull_write_in_progress = false;
                 }
-                }
-            }
-            trace_golden_sun_experimental_cull(
-                slot, source, raw_x, raw_y, resolved_x, resolved_y, cull_shape,
-                cull_size, width, height, should_cull, reason);
-            if (should_cull) {
-                const std::uint16_t hidden_attr0 = static_cast<std::uint16_t>(
-                    cull_attr0 | static_cast<std::uint16_t>(0x0200u));
-                g_golden_sun_experimental_cull_write_in_progress = true;
-                bus_write_u16(slot_address, hidden_attr0);
-                g_golden_sun_experimental_cull_write_in_progress = false;
             }
         }
     }
@@ -4662,6 +4854,12 @@ void write_golden_sun_wide_scroll_trace_csv() {
 
 void maybe_report_golden_sun_cull_trace();
 
+// With the room buffer supplying margin content, no raster line needs
+// pillarboxing: the buffer blanks per sample exactly where it has no answer.
+unsigned golden_sun_room_buffer_margin_policy(std::uint16_t, const std::uint8_t*) {
+    return 0u;
+}
+
 unsigned golden_sun_wide_margin_policy_callback(
     std::uint16_t dispcnt, const std::uint8_t* io) {
     maybe_report_golden_sun_cull_trace();
@@ -5067,6 +5265,7 @@ void golden_sun_obj_staging_handoff(std::uint32_t entry_pc) {
                          g_golden_sun_obj_pending_provenance.size()) return;
     auto& output = g_golden_sun_obj_pending_provenance[
         static_cast<std::size_t>(slot)];
+    if (output.commit_resolved && output.frame == staging->frame) return;
 
     // The authenticated D4 entry executes `ldmia r6!, {r6,r7,r8}` before its
     // following store
@@ -5789,6 +5988,11 @@ void golden_sun_wide_ewram_write_observer(std::uint32_t address,
     // current-epoch CPU ownership is observed.
     g_golden_sun_field_authored.mark_write(address, size);
     record_golden_sun_field_table_write(address, size);
+    // Chained rather than replacing the above: the room-load EWRAM write
+    // recorder (GSR_MAP_RECORD) needs the same every-store feed to recover
+    // the room-bounds struct offsets. No-ops in one branch when that
+    // recorder is disabled.
+    gsr::map_recorder_on_ewram_write(address, size);
 }
 
 void golden_sun_fast_iwram_write_observer(std::uint32_t address,
@@ -5881,8 +6085,21 @@ void install_golden_sun_widescreen(std::uint32_t extra_left,
         wide_report_armed = true;
         std::atexit(report_golden_sun_wide_diagnostics_at_exit);
     }
-    gba::g_ws_margin_policy =
-        golden_sun_wide_margin_policy_callback;
+    // The margin policy is a survivor of the old widescreen implementation:
+    // it classifies each raster line and pillarboxes (blacks) the margins
+    // whenever it cannot vouch for what would be drawn there. That made sense
+    // when margin content was invented per pixel. With the room buffer it is
+    // actively wrong -- it blacked Goma Cave Entrance out entirely while
+    // towns, which its heuristics happen to accept, drew fine. The buffer
+    // blanks per sample when it genuinely has no answer, which is the same
+    // protection without the guesswork.
+    // NOT nullptr: the PPU reads a null policy as "use the legacy
+    // pillarbox globals" (margin_is_pillarboxed's use_legacy_pillarbox),
+    // so removing the policy switches an older blanking path ON. Install a
+    // policy that pillarboxes nothing instead.
+    gba::g_ws_margin_policy = gsr::room_buffer_rendering()
+        ? golden_sun_room_buffer_margin_policy
+        : golden_sun_wide_margin_policy_callback;
     gba::g_ws_margin_diagnostics = golden_sun_wide_diagnostics_enabled()
         ? golden_sun_wide_margin_diagnostics_callback : nullptr;
     gba::g_ws_tilemap_provider = golden_sun_wide_tilemap_provider;
@@ -5904,7 +6121,8 @@ void install_golden_sun_widescreen(std::uint32_t extra_left,
         golden_sun_wide_dma_descriptor_observer);
     gba::vram_trace::set_oam_shadow_write_observer(
         (golden_sun_wide_diagnostics_enabled() ||
-         golden_sun_experimental_fixes_enabled())
+         golden_sun_experimental_fixes_enabled() ||
+         gsr::obj_recorder_enabled())
             ? golden_sun_oam_shadow_write_observer : nullptr);
     gba::g_ws_bg_x_provider_layers = 0xFu; // BG0 + Mode0 field layers.
     g_runtime_thumb_alu_imm_override = nullptr;
@@ -7379,8 +7597,16 @@ void golden_sun_function_entry_observer(std::uint32_t entry_pc) {
     golden_sun_obj_f0_entry_capture(entry_pc);
     golden_sun_obj_staging_handoff(entry_pc);
     blitter_function_entry(entry_pc);
-    // Costs one predictable branch when the tracer is disabled.
+    // Each of these costs one predictable branch when its own toggle is
+    // disabled, and neither depends on the other being enabled -- see
+    // map_recorder.h's header comment on why the two stay independent.
     gsr::function_tracer_on_entry(entry_pc);
+    gsr::map_recorder_on_entry(entry_pc);
+    gsr::map_recorder_on_function_args(entry_pc, g_cpu.R[0], g_cpu.R[1],
+                                       g_cpu.R[2], g_cpu.R[3]);
+    gsr::room_buffer_on_function_args(entry_pc, g_cpu.R[0], g_cpu.R[1],
+                                      g_cpu.R[2]);
+    gsr::room_buffer_on_entry(entry_pc);
 }
 
 void blitter_shadow_dispatch(std::uint32_t pc, int thumb) {
@@ -8567,6 +8793,16 @@ int main(int argc, char** argv) {
     options.builtin_rom_sha1 = kRomSha1;
     options.function_entry_observer = golden_sun_function_entry_observer;
     gsr::function_tracer_init();
+    // After the tracer: map_recorder_init() chains onto whatever the
+    // tracer just installed in host_config_ui.h's single extra-draw slot
+    // (see map_recorder.cpp) so both toggles' UIs can coexist.
+    gsr::map_recorder_init();
+    // Independent of the map recorder: its own env flag, its own session
+    // directory, no shared state. See obj_recorder.h.
+    gsr::obj_recorder_init();
+    // After the recorder, for the same extra-draw chaining reason: each of
+    // these captures whatever the previous one installed.
+    gsr::room_buffer_init();
     options.max_view_width = 360;
     options.max_view_height = 240;
     options.frame_interpolation_available = true;
@@ -8579,12 +8815,12 @@ int main(int argc, char** argv) {
     options.launcher_game_config = "game.toml";
     options.launcher_expose_widescreen = true;
     options.launcher_expose_adaptive_view = false;
-    options.widescreen_view_width = 288;
-    options.widescreen_view_height = 160;
+    options.widescreen_view_width = 360;
+    options.widescreen_view_height = 240;
     options.launcher_aspect_labels = kGoldenSunAspectLabels;
     options.launcher_aspect_view_widths = kGoldenSunAspectWidths;
     options.launcher_aspect_view_heights = kGoldenSunAspectHeights;
-    options.launcher_num_aspects = 3;
+    options.launcher_num_aspects = 2;
     g_runtime_ram_dispatch_hook = verified_ram_dispatch;
     g_runtime_ram_identity_confirmed_hook = verified_ram_identity_confirmed;
     g_runtime_call_return_hook = verified_ram_dispatch_return_hook;

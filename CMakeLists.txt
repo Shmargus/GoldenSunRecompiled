@@ -544,6 +544,9 @@ if(GSR_BUILD_LOCAL_RUNNER)
     add_executable(GoldenSunRecomp
         src/runner_main.cpp
         src/function_tracer.cpp
+        src/map_recorder.cpp
+        src/obj_recorder.cpp
+        src/room_buffer.cpp
         ${GSR_GENERATED_SOURCES}
         ${GSR_TRANSIENT_FUNC2D5C_SOURCES}
         ${GSR_TRANSIENT_FUNCA37C_SOURCES}

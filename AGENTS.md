@@ -28,6 +28,7 @@ the routing below, and load the specific file rather than its whole directory.
 |---|---|
 | Map data, room layout, reconstructing a room (milestone 1) | `ROADMAP.md` milestone 1 and the map section of `FACTS.md`; the tables live at `0x02010000` and `0x02020000` |
 | Rendering, presentation, the room buffer | `ARCHITECTURE.md` — repository boundary and native presentation sections |
+| NPCs, sprites, shadows, object placement | `ROADMAP.md` "Sprite placement" (it lists what was already tried and rejected) and the sprite section of `FACTS.md`; the recorder is `src/obj_recorder.h` |
 | The function tracer | `src/function_tracer.h` first, then `.cpp` only if changing it |
 | Overlays, RAM-resident code, dispatch identity | `docs/OVERLAYS.md`, `docs/GS011_TRANSIENT_IMAGES.md` |
 | Symbols, importing names or addresses | `docs/SYMBOL_IMPORT.md` |
@@ -111,9 +112,34 @@ check theories. If further testing means choosing between approaches, ask first.
 
 ## Communication
 
-Short. Plain language, not jargon. Normally say only what was wrong, what
-changed, and what to test. No long technical explanations unless asked, no
-narrating each step, no dumping logs.
+**The user is not a programmer.** Write for someone who knows Golden Sun and
+knows what they want the project to do, and who does not read code.
+
+Short. Normally say only what was wrong, what changed, and what to test. No
+long technical explanations unless asked, no narrating each step, no dumping
+logs.
+
+Say findings in terms of the game and what it means for the project, not in
+terms of the machine:
+
+- Not "8 writer PCs in three ROM loops" — "we found the game code that draws
+  the world map, in three places".
+- Not "the EWRAM observer was never installed" — "the recorder was listening
+  on a channel nothing was sending to, so it recorded nothing".
+- Not "512 records spanning cycles 7.8M–57.2M" — "it filled up in the first
+  few seconds, before you reached the world map".
+
+Addresses, register names, function names and file paths are fine when they
+are the *answer* — the user files them away and passes them on. They are not
+fine as the *explanation*. Give the plain sentence first; put the identifiers
+after it, in brackets or on their own line, for the record.
+
+Every finding should answer, in one sentence: does this move the milestone
+forward, block it, or rule something out? A finding reported without that is
+not finished.
+
+`FACTS.md` is the exception: it is written for whoever investigates next, so
+precision wins there. The message to the user is not.
 
 ## Builds
 

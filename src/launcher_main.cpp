@@ -52,7 +52,11 @@ bool g_test_ram_churn_probe = k_launcher_test_defaults.ram_churn_probe;
 bool g_test_oam_shadow_trace = k_launcher_test_defaults.oam_shadow_trace;
 bool g_test_obj_park_census = k_launcher_test_defaults.obj_park_census;
 bool g_test_map_record = k_launcher_test_defaults.map_record;
+bool g_test_obj_record = k_launcher_test_defaults.obj_record;
 bool g_test_function_tracer = k_launcher_test_defaults.function_tracer;
+bool g_test_vram_trace = k_launcher_test_defaults.vram_map_trace;
+bool g_test_room_buffer = k_launcher_test_defaults.room_buffer;
+bool g_test_room_buffer_render = k_launcher_test_defaults.room_buffer_render;
 
 struct LauncherAudioSettings {
     bool native_mp2k = false;
@@ -843,10 +847,22 @@ int run_game(const fs::path& root, const std::wstring& rom,
         {L"GSR_BLITTER_SHADOW", g_test_blitter_shadow},
         {L"GSR_RECURSION_PROBE", g_test_recursion_probe},
         {L"GSR_RAM_CHURN_PROBE", g_test_ram_churn_probe},
-        {L"GSR_OAM_SHADOW_TRACE", g_test_oam_shadow_trace},
+        // The sprite recorder implies this one. Every committed sprite
+        // reaches the recorder through the OAM-shadow write observer, and
+        // gbarecomp only calls that observer while this variable is set
+        // (trace_oam_shadow_write_committed in gba_vram_trace.cpp), so
+        // ticking "Record sprite placement" alone recorded zero sprites in
+        // session objrec_20260906_105459. Coupled here rather than in the
+        // runtime so the user still sees one checkbox per diagnostic.
+        {L"GSR_OAM_SHADOW_TRACE",
+         g_test_oam_shadow_trace || g_test_obj_record},
         {L"GBARECOMP_OBJ_PARK_CENSUS", g_test_obj_park_census},
         {L"GSR_MAP_RECORD", g_test_map_record},
+        {L"GSR_OBJ_RECORD", g_test_obj_record},
         {L"GBARECOMP_FN_TRACER", g_test_function_tracer},
+        {L"GBARECOMP_VRAM_MAP_TRACE", g_test_vram_trace},
+        {L"GSR_ROOM_BUFFER", g_test_room_buffer},
+        {L"GSR_ROOM_BUFFER_RENDER", g_test_room_buffer_render},
     };
     for (const TestEnvironmentVariable& variable : test_environment_variables) {
         const bool self_heal =
@@ -986,6 +1002,10 @@ constexpr int kOamShadowTraceButton = 1014;
 constexpr int kObjParkCensusButton = 1017;
 constexpr int kMapRecordButton = 1019;
 constexpr int kFunctionTracerButton = 1020;
+constexpr int kVramMapTraceButton = 1021;
+constexpr int kRoomBufferButton = 1022;
+constexpr int kRoomBufferRenderButton = 1023;
+constexpr int kObjRecordButton = 1024;
 
 fs::path g_launcher_root;
 std::wstring g_launcher_bios;
@@ -1074,7 +1094,7 @@ void layout_buttons(HWND window) {
     const int test_variables_y = cursor;
     cursor += kRowHeight;
     const int children_top = cursor + kRowGap;
-    constexpr int kChildCount = 10;
+    constexpr int kChildCount = 14;
     const int child_width = kContentWidth - kIndent;
     if (g_test_variables) {
         cursor = children_top +
@@ -1120,7 +1140,9 @@ void layout_buttons(HWND window) {
         kSelfHealRamButton,    kCostProbeButton,      kPresentCadenceButton,
         kBlitterShadowButton,  kRecursionProbeButton, kRamChurnProbeButton,
         kOamShadowTraceButton, kObjParkCensusButton,
-        kMapRecordButton,      kFunctionTracerButton,
+        kMapRecordButton,      kFunctionTracerButton, kVramMapTraceButton,
+        kRoomBufferButton,     kRoomBufferRenderButton,
+        kObjRecordButton,
     };
     for (int i = 0; i < kChildCount; ++i) {
         HWND child = GetDlgItem(window, child_ids[i]);
@@ -1225,7 +1247,11 @@ bool* checkbox_state_for_id(int id) {
     case kOamShadowTraceButton: return &g_test_oam_shadow_trace;
     case kObjParkCensusButton: return &g_test_obj_park_census;
     case kMapRecordButton: return &g_test_map_record;
+    case kObjRecordButton: return &g_test_obj_record;
     case kFunctionTracerButton: return &g_test_function_tracer;
+    case kVramMapTraceButton: return &g_test_vram_trace;
+    case kRoomBufferButton: return &g_test_room_buffer;
+    case kRoomBufferRenderButton: return &g_test_room_buffer_render;
     case kNativeMp2kButton: return &g_audio_settings.native_mp2k;
     case kTurboAudioButton: return &g_audio_settings.turbo_decoupled;
     case kCopySessionIdButton:
@@ -1292,6 +1318,9 @@ LRESULT CALLBACK launcher_window_proc(HWND window, UINT message,
         g_test_obj_park_census = k_launcher_test_defaults.obj_park_census;
         g_test_map_record = k_launcher_test_defaults.map_record;
         g_test_function_tracer = k_launcher_test_defaults.function_tracer;
+        g_test_vram_trace = k_launcher_test_defaults.vram_map_trace;
+        g_test_room_buffer = k_launcher_test_defaults.room_buffer;
+        g_test_room_buffer_render = k_launcher_test_defaults.room_buffer_render;
         CreateWindowExW(0, L"BUTTON", L"Pick ROM",
                         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
                         0, 0, 0, 0, window,
@@ -1320,12 +1349,15 @@ LRESULT CALLBACK launcher_window_proc(HWND window, UINT message,
         const TestChildControl children[] = {
             {kSelfHealRamButton, L"Self-heal RAM"},
             {kFunctionTracerButton, L"Function tracer"},
-            // Hidden 2026-09-04 to keep the launcher focused on the two
-            // toggles current work needs. The flags, ids and environment
-            // plumbing all remain, so restoring one is a matter of
-            // uncommenting its line here. "Record map data per room" is
-            // additionally dead: the GSR_MAP_RECORD diagnostic it drove no
-            // longer exists (see gsr_map_record_identity in runner_main.cpp).
+            {kMapRecordButton, L"Record map + scene data"},
+            {kObjRecordButton, L"Record sprite placement"},
+            {kVramMapTraceButton, L"VRAM map write trace"},
+            {kRoomBufferButton, L"Room buffer self-check"},
+            {kRoomBufferRenderButton, L"Draw field from room buffer"},
+            // Hidden 2026-09-04 to keep the launcher focused on the toggles
+            // current work needs. The flags, ids and environment plumbing
+            // all remain, so restoring one is a matter of uncommenting its
+            // line here.
             // {kCostProbeButton, L"Cost probe"},
             // {kPresentCadenceButton, L"Present cadence"},
             // {kBlitterShadowButton, L"Blitter shadow"},
@@ -1333,7 +1365,6 @@ LRESULT CALLBACK launcher_window_proc(HWND window, UINT message,
             // {kRamChurnProbeButton, L"RAM churn probe"},
             // {kOamShadowTraceButton, L"OAM shadow writer trace"},
             // {kObjParkCensusButton, L"Log off-screen sprite positions"},
-            // {kMapRecordButton, L"Record map data per room"},
         };
         for (const TestChildControl& child : children) {
             CreateWindowExW(0, L"BUTTON", child.label,

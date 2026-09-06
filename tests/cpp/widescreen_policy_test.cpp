@@ -2,6 +2,8 @@
 #include <array>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
+#include <iterator>
 #include <utility>
 #include <vector>
 
@@ -178,7 +180,10 @@ int main() {
             b328_parent, "widescreen_policy_test: inactive B328 widened")) {
         return 1;
     }
-    for (std::int32_t x : {240, 299}) {
+    // 335 = 240 + extra_right(60) + kExpandedObjSlackX(36) - 1: the band now
+    // carries ~10% of the view past the right edge so an actor whose own
+    // reference point has just left the view still submits the sprite it owes.
+    for (std::int32_t x : {240, 299, 335}) {
         object_decision = 0xFFFFFFFFu;
         if (!golden_sun_expanded_viewport_branch_override(
                 0x0800B324u, 1u, 360u, 240u, 60u, 60u, 40u, 40u, x,
@@ -189,7 +194,7 @@ int main() {
     }
     object_decision = 0xFFFFFFFFu;
     if (golden_sun_expanded_viewport_branch_override(
-            0x0800B324u, 1u, 360u, 240u, 60u, 60u, 40u, 40u, 300,
+            0x0800B324u, 1u, 360u, 240u, 60u, 60u, 40u, 40u, 336,
             &object_decision) || object_decision != 0xFFFFFFFFu) {
         std::puts("widescreen_policy_test: out-of-range OBJ X admitted");
         return 1;
@@ -222,10 +227,12 @@ int main() {
         std::puts("widescreen_policy_test: B388 lower band mismatch");
         return 1;
     }
+    // The upper-X limit now carries kExpandedObjSlackX past the view edge:
+    // 2 * (136 + (60 + 36 + 1) / 2) = 368, so 368 is the last admitted operand.
     if (!expect_route(0x0800B3DCu, 0u, 273, true, 1u) ||
-        !expect_route(0x0800B3DCu, 0u, 332, true, 1u) ||
+        !expect_route(0x0800B3DCu, 0u, 368, true, 1u) ||
         !expect_route(0x0800B3DCu, 0u, 272, false, 0u) ||
-        !expect_route(0x0800B3DCu, 0u, 333, false, 0u) ||
+        !expect_route(0x0800B3DCu, 0u, 369, false, 0u) ||
         !expect_route(0x0800B3DCu, 1u, 300, false, 0u) ||
         !expect_route(0x0800B3ECu, 0u, 209, true, 1u) ||
         !expect_route(0x0800B3ECu, 0u, 248, true, 1u) ||
@@ -236,7 +243,9 @@ int main() {
         return 1;
     }
     constexpr std::uint32_t c6fa_old_max = 0x012FFFFEu;
-    constexpr std::uint32_t c6fa_new_max = c6fa_old_max + (60u << 16);
+    // extra_right plus kExpandedObjSlackX, matching
+    // golden_sun_field_list_x_upper_literal.
+    constexpr std::uint32_t c6fa_new_max = c6fa_old_max + ((60u + 36u) << 16);
     constexpr std::int32_t c6fa_lower = -static_cast<std::int32_t>(60u << 16);
     if (!expect_route(0x0800C6FAu, 0u, c6fa_lower, true, 1u) ||
         !expect_route(0x0800C6FAu, 0u, c6fa_lower - 1, false, 0u) ||
@@ -1465,18 +1474,18 @@ int main() {
     // a real positive bottom-margin sprite, not only wrapped Y=-96.
     {
         int resolved = 0;
-        if (!golden_sun_experimental_resolve_oam_y(160u, true, 160,
+        if (!golden_sun_obj_resolve_oam_y(160u, true, 160,
                                                    &resolved) ||
             resolved != 160 ||
-            golden_sun_experimental_resolve_oam_y(160u, false, 0,
+            golden_sun_obj_resolve_oam_y(160u, false, 0,
                                                   &resolved)) {
             std::puts("widescreen_policy_test: ambiguous Y did not fail closed");
             return 1;
         }
-        if (!golden_sun_experimental_resolve_oam_x(256u, true, 256,
+        if (!golden_sun_obj_resolve_oam_x(256u, true, 256,
                                                    &resolved) ||
             resolved != 256 ||
-            golden_sun_experimental_resolve_oam_x(256u, false, 0,
+            golden_sun_obj_resolve_oam_x(256u, false, 0,
                                                   &resolved)) {
             std::puts("widescreen_policy_test: ambiguous X did not fail closed");
             return 1;
@@ -1619,6 +1628,121 @@ int main() {
             entry_backdrop == 0x1234u) {
             std::puts("widescreen_policy_test: BG2 unexpectedly resolved the "
                       "terrain layer's map cell");
+            return 1;
+        }
+    }
+
+    // ---- sprite placement outcomes --------------------------------------
+    //
+    // These names are written into GSR_OBJ_RECORD's coverage.csv column
+    // headers and read back by tools/decode_obj.py, so a silent rename would
+    // break the analysis of an already-recorded session rather than fail to
+    // compile. Pin them.
+    {
+        struct Expected {
+            GoldenSunObjPlacementOutcome outcome;
+            const char* name;
+            bool exact;
+        };
+        const Expected expected[] = {
+            {GoldenSunObjPlacementOutcome::Exact, "exact-placement", true},
+            {GoldenSunObjPlacementOutcome::PairedBody,
+             "paired-body-placement", true},
+            {GoldenSunObjPlacementOutcome::SourceUnavailable,
+             "source-unavailable", false},
+            {GoldenSunObjPlacementOutcome::PlacementUnavailable,
+             "placement-unavailable", false},
+            {GoldenSunObjPlacementOutcome::AffineOrDoubleSize,
+             "affine-or-double-size", false},
+            {GoldenSunObjPlacementOutcome::InvalidShapeSize,
+             "invalid-shape-size", false},
+        };
+        if (std::size(expected) !=
+            static_cast<std::size_t>(GoldenSunObjPlacementOutcome::Count)) {
+            std::puts("widescreen_policy_test: placement outcome table is not "
+                      "exhaustive");
+            return 1;
+        }
+        for (const Expected& e : expected) {
+            if (std::strcmp(golden_sun_obj_placement_outcome_name(e.outcome),
+                            e.name) != 0) {
+                std::puts("widescreen_policy_test: placement outcome name "
+                          "changed");
+                return 1;
+            }
+            if (golden_sun_obj_placement_is_exact(e.outcome) != e.exact) {
+                std::puts("widescreen_policy_test: placement outcome "
+                          "exactness changed");
+                return 1;
+            }
+        }
+    }
+
+    // A sprite is only ever placed from the guest's full-precision value
+    // when that value truncates back to the byte OAM actually carries --
+    // otherwise the record belongs to a different occupant of the slot. Row
+    // -101 and row 155 share byte 155 (measured, session_20260906_001314),
+    // which is the whole reason the recorder exists, so check both readings
+    // of that exact byte.
+    {
+        int out = 0;
+        if (!golden_sun_obj_resolve_oam_y(155u, true, -101, &out) ||
+            out != -101) {
+            std::puts("widescreen_policy_test: exact Y did not accept the "
+                      "negative reading of byte 155");
+            return 1;
+        }
+        if (!golden_sun_obj_resolve_oam_y(155u, true, 155, &out) ||
+            out != 155) {
+            std::puts("widescreen_policy_test: exact Y did not accept the "
+                      "positive reading of byte 155");
+            return 1;
+        }
+        if (golden_sun_obj_resolve_oam_y(155u, true, -102, &out)) {
+            std::puts("widescreen_policy_test: exact Y accepted a value that "
+                      "does not truncate to the committed byte");
+            return 1;
+        }
+    }
+    // A shadow is placed from its body's exact coordinate plus its own
+    // truncated field. Two things must hold for that to be sound: the result
+    // must truncate back to exactly the byte OAM carries, and a small offset
+    // must read as small rather than as a wrap.
+    {
+        // Body high above the view at row -101; shadow eight rows below it.
+        const int body_y = -101;
+        const std::uint32_t shadow_raw =
+            static_cast<std::uint32_t>(body_y + 8) & 0xFFu;
+        const int shadow_y =
+            golden_sun_obj_paired_coordinate(body_y, shadow_raw, 8u);
+        if (shadow_y != body_y + 8) {
+            std::puts("widescreen_policy_test: paired row recovery lost a "
+                      "shadow below a body above the view");
+            return 1;
+        }
+        if ((static_cast<std::uint32_t>(shadow_y) & 0xFFu) != shadow_raw) {
+            std::puts("widescreen_policy_test: paired row does not truncate "
+                      "back to the committed byte");
+            return 1;
+        }
+        // The same byte read against a body in the bottom margin must give
+        // the bottom-margin row -- the collision that defeats the byte alone
+        // is exactly what the paired body resolves.
+        const int low_body = 155;
+        const std::uint32_t low_raw =
+            static_cast<std::uint32_t>(low_body + 8) & 0xFFu;
+        if (golden_sun_obj_paired_coordinate(low_body, low_raw, 8u) !=
+            low_body + 8) {
+            std::puts("widescreen_policy_test: paired row recovery failed in "
+                      "the bottom margin");
+            return 1;
+        }
+        // Negative offsets, and the 9-bit column field.
+        if (golden_sun_obj_paired_coordinate(40, 24u, 8u) != 24 ||
+            golden_sun_obj_paired_coordinate(
+                -20, static_cast<std::uint32_t>(-8) & 0x1FFu, 9u) != -8) {
+            std::puts("widescreen_policy_test: paired coordinate recovery "
+                      "mishandled a negative offset");
             return 1;
         }
     }

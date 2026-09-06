@@ -28,6 +28,21 @@ inline constexpr std::uint32_t kNativeHeight = 160u;
 // read only the measured 60px/40px margins around the authentic canvas.
 inline constexpr std::int32_t kExpandedExtraX = 60;
 inline constexpr std::int32_t kExpandedExtraY = 40;
+
+// The guest culls an actor by its OWN reference point, not by the rectangle
+// its sprite ends up occupying, so an actor whose point has just left the view
+// can still owe it several columns of sprite. Stopping the widened bands
+// exactly at the view edge therefore drops those sprites a moment early --
+// visible as NPCs and shadows winking out at the right-hand edge. Carry the
+// bands ~10% of the view further out (2026-09-06, asked for by the user after
+// watching NPCs vanish at the right).
+//
+// Horizontal only. The vertical band cannot be extended past the view's own
+// bottom row: OAM Y is eight bits, so a row below 240+ex_bottom shares its
+// byte with a row in the top margin, and admitting more of them would put
+// stray sprites there instead. See the OAM read-back in render_scanline_wide.
+inline constexpr std::int32_t kExpandedObjSlackX =
+    (static_cast<std::int32_t>(kNativeWidth) + 2 * kExpandedExtraX) / 10;
 inline constexpr std::int32_t kExpandedWidth =
     static_cast<std::int32_t>(kNativeWidth) + 2 * kExpandedExtraX;
 inline constexpr std::int32_t kExpandedHeight =
@@ -109,7 +124,8 @@ inline constexpr std::uint32_t golden_sun_actor_precull_negative_y_padding(
 
 inline constexpr std::uint32_t golden_sun_actor_precull_right_half_limit(
     std::uint32_t extra_right) {
-    return 136u + ((extra_right + 1u) / 2u);
+    return 136u + ((extra_right +
+                    static_cast<std::uint32_t>(kExpandedObjSlackX) + 1u) / 2u);
 }
 
 inline constexpr std::uint32_t golden_sun_actor_precull_bottom_limit(
@@ -121,7 +137,9 @@ inline constexpr std::uint32_t golden_sun_actor_precull_bottom_limit(
 // unsigned 16.16 form; the Y lower bound is signed -32px in 16.16 form.
 inline constexpr std::uint32_t golden_sun_field_list_x_upper_literal(
     std::uint32_t extra_right) {
-    return 0x012FFFFEu + (extra_right << 16);
+    return 0x012FFFFEu +
+           ((extra_right + static_cast<std::uint32_t>(kExpandedObjSlackX))
+            << 16);
 }
 
 inline constexpr std::uint32_t golden_sun_field_list_y_lower_literal(
@@ -153,10 +171,13 @@ inline constexpr bool golden_sun_expanded_viewport_branch_override(
     // route without making this generic policy depend on runtime state.
     const bool object_y_route = pc == 0x0800B27Eu;
     if (object_x_route) {
-        // B322 compares r4 against 239; admit only x=240..299.
+        // B322 compares r4 against 239; admit x=240 out to the view's right
+        // edge plus the actor-reference slack above (240..335 as measured).
         if (compared_value < static_cast<std::int32_t>(kNativeWidth) ||
             compared_value >= static_cast<std::int32_t>(
-                kNativeWidth + extra_right) || !original_decision) {
+                kNativeWidth + extra_right +
+                static_cast<std::uint32_t>(kExpandedObjSlackX)) ||
+            !original_decision) {
             return false;
         }
         *out_decision = 0u;
@@ -328,13 +349,55 @@ inline constexpr std::size_t kGoldenSunOamShadowSlotCount =
 inline constexpr std::uint32_t kGoldenSunOamStart = 0x07000000u;
 inline constexpr std::uint32_t kGoldenSunOamBytes = 1024u;
 
+// The game builds its sprite list in more than one place and uploads
+// whichever is current, so watching a single address misses whole frames.
+// Measured from the upload DMAs themselves (source, destination 0x07000000,
+// 1024 bytes): `session_20260906_131954` took 177 of 256 uploads from
+// kGoldenSunOamShadowStart and 79 from the address below;
+// `session_20260906_113648` split 196/60. A third address, 0x03002000,
+// supplied 10 of 256 in `session_20260906_105904`, but that range is reused
+// for unrelated purposes (actor records, a transient code image) and is
+// deliberately NOT recognised here without evidence of its geometry.
+//
+// Size and stride are not assumed: the upload is 1024 bytes to OAM, which is
+// the hardware's 128 slots of 8 bytes.
+inline constexpr std::uint32_t kGoldenSunOamShadowAltStart = 0x03005AE0u;
+inline constexpr std::uint32_t kGoldenSunOamShadowAltEnd =
+    kGoldenSunOamShadowAltStart + kGoldenSunOamBytes;
+
+// Base address of whichever sprite table `address` falls in, or 0.
+inline constexpr std::uint32_t golden_sun_oam_shadow_table_base(
+    std::uint32_t address) {
+    if (address >= kGoldenSunOamShadowStart && address < kGoldenSunOamShadowEnd)
+        return kGoldenSunOamShadowStart;
+    if (address >= kGoldenSunOamShadowAltStart &&
+        address < kGoldenSunOamShadowAltEnd)
+        return kGoldenSunOamShadowAltStart;
+    return 0u;
+}
+
+// Slot index within whichever table `address` belongs to, or -1. The two
+// tables share one slot numbering because only one of them is uploaded per
+// frame; a record carries its sprite's exact ATTR0/1/2 as identity, so a
+// record left behind by the other table can never be applied to the wrong
+// sprite -- it simply fails to match.
+inline constexpr int golden_sun_oam_shadow_slot_in_any_table(
+    std::uint32_t address, std::uint32_t byte_in_slot) {
+    const std::uint32_t base = golden_sun_oam_shadow_table_base(address);
+    if (base == 0u) return -1;
+    const std::uint32_t offset = address - base;
+    if ((offset % kGoldenSunOamShadowSlotBytes) != byte_in_slot) return -1;
+    return static_cast<int>(offset / kGoldenSunOamShadowSlotBytes);
+}
+
 // This is the only transfer that makes the shadow provenance visible to the
 // renderer. Keep the descriptor contract exact so another DMA cannot publish
 // a partially updated or unrelated OAM image.
 inline constexpr bool golden_sun_obj_provenance_dma_handoff(
     std::uint32_t source, std::uint32_t destination, std::uint32_t bytes,
     std::uint16_t control) {
-    return source == kGoldenSunOamShadowStart &&
+    return (source == kGoldenSunOamShadowStart ||
+            source == kGoldenSunOamShadowAltStart) &&
            destination == kGoldenSunOamStart && bytes == kGoldenSunOamBytes &&
            (control & 0x0060u) == 0u;
 }
@@ -1578,7 +1641,7 @@ inline constexpr int golden_sun_experimental_resign_oam_y(std::uint32_t raw8) {
 // Resolve only coordinates that are either exact pre-truncation provenance or
 // outside the hardware sign ambiguity.  A false result means the caller must
 // keep the sprite; no signed value is guessed.
-inline constexpr bool golden_sun_experimental_resolve_oam_x(
+inline constexpr bool golden_sun_obj_resolve_oam_x(
     std::uint32_t raw9, bool exact, int exact_x, int* out_x) {
     if (!out_x) return false;
     const std::uint32_t raw = raw9 & 0x1FFu;
@@ -1593,7 +1656,7 @@ inline constexpr bool golden_sun_experimental_resolve_oam_x(
     return true;
 }
 
-inline constexpr bool golden_sun_experimental_resolve_oam_y(
+inline constexpr bool golden_sun_obj_resolve_oam_y(
     std::uint32_t raw8, bool exact, int exact_y, int* out_y) {
     if (!out_y) return false;
     const std::uint32_t raw = raw8 & 0xFFu;
@@ -1656,6 +1719,99 @@ inline constexpr bool golden_sun_obj_dimensions(unsigned shape,
     *out_width = kWidths[shape][size];
     *out_height = kHeights[shape][size];
     return true;
+}
+
+// ---- sprite placement outcomes -------------------------------------------
+//
+// Why this vocabulary exists as policy rather than as loose strings in
+// runner_main.cpp: the OBJ position the PPU reads back is truncated (X to 9
+// bits, Y to 8), and a view taller than 160 rows cannot be addressed by 8
+// bits at all -- rows -104..199 need 304 values and a byte names 256, so the
+// bottom margin and the band above the view share bytes (measured
+// 2026-09-06; see ROADMAP.md). The only escape is to take the guest's own
+// full-precision coordinate at the moment it computes it, before the
+// truncation, and treat OAM as an identity tag instead of a position. That
+// is what golden_sun_obj_resolve_oam_x/y above check, and these outcomes
+// name every way that lookup can end.
+//
+// The recorder (src/obj_recorder.cpp) counts committed sprites by outcome so
+// coverage can be measured before the renderer is rewired to trust the
+// table. `Exact` and `PairedBody` are the two that carry a full-precision
+// position; everything else falls back to the truncated byte and is where
+// vertical wrap comes from.
+enum class GoldenSunObjPlacementOutcome : std::uint8_t {
+    // Full-precision position recovered for this sprite's own record.
+    Exact = 0,
+    // A shadow, positioned from its paired body record (body at record+0x00,
+    // shadow at record+0x0C -- see golden_sun_obj_record_identity).
+    PairedBody,
+    // The committed sprite could not be traced back to a guest actor record
+    // at all. This is the outcome that matters most: it is the population an
+    // object buffer would have to grow to cover.
+    SourceUnavailable,
+    // Traced to a record, but that record carried no usable coordinate this
+    // frame (stale epoch, wrong frame, or the truncated bytes disagreed).
+    PlacementUnavailable,
+    // Rotation/scaling sprites need transformed bounds; not attempted.
+    AffineOrDoubleSize,
+    // ATTR shape/size decoded outside the standard table.
+    InvalidShapeSize,
+    Count,
+};
+
+inline constexpr const char* golden_sun_obj_placement_outcome_name(
+    GoldenSunObjPlacementOutcome outcome) {
+    switch (outcome) {
+    case GoldenSunObjPlacementOutcome::Exact: return "exact-placement";
+    case GoldenSunObjPlacementOutcome::PairedBody:
+        return "paired-body-placement";
+    case GoldenSunObjPlacementOutcome::SourceUnavailable:
+        return "source-unavailable";
+    case GoldenSunObjPlacementOutcome::PlacementUnavailable:
+        return "placement-unavailable";
+    case GoldenSunObjPlacementOutcome::AffineOrDoubleSize:
+        return "affine-or-double-size";
+    case GoldenSunObjPlacementOutcome::InvalidShapeSize:
+        return "invalid-shape-size";
+    case GoldenSunObjPlacementOutcome::Count: break;
+    }
+    return "unknown";
+}
+
+// Recover a sprite's own full-precision coordinate from a paired sprite's
+// exact one plus its own truncated OAM field.
+//
+// A shadow carries no coordinate of its own: the guest computes it from the
+// body it belongs to, and only the truncated result reaches OAM. Knowing the
+// body's exact row does not by itself place the shadow, which sits some rows
+// below it -- so take the difference between the two in the truncated field,
+// read it as signed, and add it back. The result truncates to exactly the
+// byte OAM carries, and it is unique so long as the true offset between the
+// pair is within half the field's range. A shadow is drawn touching the
+// sprite it belongs to, so that holds with enormous margin; the recorder
+// reports the largest offset it actually sees so the assumption stays
+// measured rather than assumed.
+//
+// `bits` is the width of the truncated field: 8 for OAM Y, 9 for OAM X.
+inline constexpr int golden_sun_obj_paired_coordinate(int exact_paired,
+                                                      std::uint32_t raw,
+                                                      unsigned bits) {
+    const std::uint32_t mask = (1u << bits) - 1u;
+    const std::uint32_t half = 1u << (bits - 1u);
+    const std::uint32_t delta =
+        (raw - static_cast<std::uint32_t>(exact_paired)) & mask;
+    return exact_paired + (delta >= half
+                               ? static_cast<int>(delta) -
+                                     static_cast<int>(mask + 1u)
+                               : static_cast<int>(delta));
+}
+
+// A sprite is safe to draw from the table -- and therefore immune to the
+// 8-bit vertical wrap -- only in these two outcomes.
+inline constexpr bool golden_sun_obj_placement_is_exact(
+    GoldenSunObjPlacementOutcome outcome) {
+    return outcome == GoldenSunObjPlacementOutcome::Exact ||
+           outcome == GoldenSunObjPlacementOutcome::PairedBody;
 }
 
 // Extra generosity is added only on the negative (left/top) side, where the

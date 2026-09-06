@@ -19,7 +19,11 @@ struct LauncherTestDefaults {
     bool obj_park_census = false;
     bool margin_tile_log = false;
     bool map_record = false;
+    bool obj_record = false;
     bool function_tracer = false;
+    bool vram_map_trace = false;
+    bool room_buffer = false;
+    bool room_buffer_render = false;
 };
 
 constexpr LauncherTestDefaults launcher_test_defaults() {
