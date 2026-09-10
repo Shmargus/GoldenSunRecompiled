@@ -101,6 +101,128 @@ void obj_recorder_init();
 // measure without the culler being armed.
 bool obj_recorder_enabled();
 
+// Ordered diagnostic events; attributes are identity metadata, no asset data.
+// One-shot EC-entry observation joined to the F0 destination. Unlike the
+// placement context, it retains sources outside the actor array. It is never
+// consulted by rendering. `state` distinguishes no entry, a stale/different
+// invocation, unreadable RAM, changed attributes, and an exact source handoff.
+struct ObjSourceCapture {
+    const char* state = "not-sampled";
+    std::uint64_t frame = UINT64_MAX, epoch = 0;
+    std::uint32_t pc = 0, source = 0, target = 0, depth = 0, return_pc = 0;
+    std::uint16_t attr0 = 0, attr1 = 0, attr2 = 0;
+    // Flags: 1=RAM attributes read; 2=known actor identity; 4=staging found;
+    // 8=staged X valid; 16=staged Y valid. These are observations, not trust.
+    std::uint32_t flags = 0;
+    std::uint32_t stage_source = 0;
+    std::uint64_t stage_frame = UINT64_MAX, stage_epoch = 0;
+    int stage_x = 0, stage_y = 0;
+};
+
+struct ObjLifetimeSample {
+    const char* event = "commit";
+    const char* reason = "ok";
+    std::uint64_t frame = 0, epoch = 0, dma = 0;
+    int slot = -1;
+    std::uint32_t source = 0, staging = 0;
+    std::uint64_t context_frame = UINT64_MAX, body_frame = UINT64_MAX;
+    std::uint64_t body_epoch = 0;
+    std::uint32_t checks = 0;
+    std::uint16_t attr0 = 0, attr1 = 0, attr2 = 0;
+    std::uint64_t provenance_frame = UINT64_MAX, provenance_epoch = 0;
+    std::uint32_t target = 0;
+    std::uint16_t expected0 = 0, expected1 = 0, expected2 = 0;
+    ObjSourceCapture entry{};
+};
+// For a `commit` row with reason `record-identity`, `staging` is the raw F0
+// entry pointer retained for diagnosis; it is not trusted actor identity.
+// The row's ATTR fields are the committed OAM words; the diagnostic context
+// is selected only when all three words matched at the F0 entry.
+void obj_recorder_note_lifetime(const ObjLifetimeSample& sample);
+
+// Tracked writer observation for OAM-shadow table slots touched by the
+// current capture. Only addresses, PCs, transfer metadata and OAM identity
+// attributes are recorded; no guest payload is retained.
+struct ObjShadowWriteSample {
+    const char* event = "cpu";
+    std::uint64_t frame = 0, epoch = 0, dma = 0;
+    int slot = -1;
+    std::uint32_t writer_pc = 0;
+    std::uint32_t address = 0, size = 0;
+    std::uint32_t source = 0, destination = 0;
+    std::uint16_t control = 0;
+    int start_mode = 0;
+    // Bits 0..2 say which ATTR0/1/2 words were part of this write. Missing
+    // words in a partial DMA are left zero in the row.
+    std::uint8_t attr_mask = 0;
+    std::uint16_t attr0 = 0, attr1 = 0, attr2 = 0;
+};
+void obj_recorder_note_shadow_write(const ObjShadowWriteSample& sample);
+
+// One CPU store to one of the two measured EWRAM object-source regions.
+// This is a writer census only: the callback runs before the store, so it
+// records the writer and field location without retaining guest payload.
+struct ObjEwramWriteSample {
+    std::uint64_t frame = 0, epoch = 0;
+    const char* region = "unknown";
+    std::uint32_t writer_pc = 0;
+    std::uint32_t address = 0, offset = 0, size = 0;
+};
+void obj_recorder_note_ewram_write(const ObjEwramWriteSample& sample);
+
+// Narrow Region B boulder trace. These are scalar handoff observations only:
+// the two measured source fields, the register state at their writers and at
+// the source/commit seams, and the committed OAM identity. It does not retain
+// the surrounding EWRAM record or any asset payload.
+struct ObjBoulderTraceSample {
+    const char* event = "unknown";
+    const char* source_state = "unknown";
+    const char* outcome = "unknown";
+    std::uint64_t frame = 0, epoch = 0;
+    int slot = -1;
+    std::uint32_t source = 0, source_offset = 0;
+    std::uint32_t target = 0, writer_pc = 0, return_pc = 0, depth = 0;
+    std::uint32_t entry_pc = 0, entry_depth = 0, entry_return_pc = 0;
+    // Guest register snapshots at the measured writer/calculation handoffs.
+    // The register names are intentionally retained; their field meaning is
+    // what this trace is meant to establish.
+    std::uint32_t r0 = 0, r1 = 0, r2 = 0, r3 = 0, r5 = 0, r6 = 0;
+    std::uint32_t r7 = 0, r9 = 0, r10 = 0, r11 = 0;
+    std::uint32_t store_value = 0;
+    std::uint32_t field_a_value = 0, field_b_value = 0;
+    bool candidate_fields_valid = false;
+    std::uint16_t attr0 = 0, attr1 = 0, attr2 = 0;
+    std::uint32_t raw_x = 0, raw_y = 0;
+    int resolved_x = 0, resolved_y = 0;
+};
+void obj_recorder_note_boulder_trace(const ObjBoulderTraceSample& sample);
+
+// One placement event joined to the measured source fields and live GBA
+// display scroll state. Candidate fields are named by offset because their
+// position meaning is still an open measurement question. Only the two
+// offsets observed in Region B writer traffic are read.
+struct ObjCameraSample {
+    const char* event = "f0";
+    const char* reason = "unknown";
+    const char* source_state = "unknown";
+    const char* source_region = "unknown";
+    std::uint64_t frame = 0, epoch = 0;
+    int slot = -1;
+    std::uint32_t writer_pc = 0, target = 0, source = 0;
+    std::uint64_t entry_frame = UINT64_MAX, entry_epoch = 0;
+    std::uint32_t entry_pc = 0, entry_depth = 0, entry_return_pc = 0;
+    std::uint16_t attr0 = 0, attr1 = 0, attr2 = 0;
+    std::uint16_t dispcnt = 0;
+    std::uint16_t bg0_hofs = 0, bg0_vofs = 0;
+    std::uint16_t bg1_hofs = 0, bg1_vofs = 0;
+    std::uint16_t bg2_hofs = 0, bg2_vofs = 0;
+    std::uint16_t bg3_hofs = 0, bg3_vofs = 0;
+    std::uint32_t field_a_offset = 0, field_a_value = 0;
+    std::uint32_t field_b_offset = 0, field_b_value = 0;
+    bool candidate_fields_valid = false;
+};
+void obj_recorder_note_camera_sample(const ObjCameraSample& sample);
+
 // Hot path: one committed sprite, already resolved. Tallies it, rolls the
 // per-frame row over when the frame changes, and files unsourced sprites by
 // call site. No-ops in one branch when the recorder is off.

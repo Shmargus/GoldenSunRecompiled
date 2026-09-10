@@ -29,11 +29,12 @@ Modes
       Full per-call-site table rather than the worst few.
 
   decode_obj.py <session_dir> --records
-      Per-actor-record table. The runner recognises records at 0x03002000
-      with stride 0x38 up to 0x030022E0 -- thirteen of them. If a town
-      commits sprites this table cannot account for, an object buffer has to
-      be keyed on something wider, and that shows up here as records seen
-      versus sprites unaccounted for in the summary.
+      Per-actor-record table. The runner admits any record-shaped pointer in
+      the 0x03002000 array (stride 0x38) and lets the provenance gates
+      authenticate it. If a town commits sprites this table
+      cannot account for, an object buffer has to be keyed on something wider,
+      and that shows up here as records seen versus sprites unaccounted for in
+      the summary.
 
   decode_obj.py <session_dir> --frames
       Per-frame coverage, so a scene transition or a specific moment of

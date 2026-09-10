@@ -54,14 +54,17 @@ bool g_test_obj_park_census = k_launcher_test_defaults.obj_park_census;
 bool g_test_map_record = k_launcher_test_defaults.map_record;
 bool g_test_obj_record = k_launcher_test_defaults.obj_record;
 bool g_test_function_tracer = k_launcher_test_defaults.function_tracer;
+bool g_test_text_record = k_launcher_test_defaults.text_record;
 bool g_test_vram_trace = k_launcher_test_defaults.vram_map_trace;
 bool g_test_room_buffer = k_launcher_test_defaults.room_buffer;
-bool g_test_room_buffer_render = k_launcher_test_defaults.room_buffer_render;
+bool g_test_swi_log = k_launcher_test_defaults.swi_log;
+bool g_test_bios_pc_log = k_launcher_test_defaults.bios_pc_log;
 
 struct LauncherAudioSettings {
     bool native_mp2k = false;
     bool turbo_decoupled = false;
     bool copy_session_id_to_clipboard = false;
+    bool enhanced_options = false;
 };
 
 // Root-launcher settings live outside config/local.json: that file contains
@@ -108,6 +111,8 @@ LauncherAudioSettings load_launcher_audio_settings(const fs::path& root) {
             settings.turbo_decoupled = value;
         } else if (in_launcher && key == "CopySessionIdToClipboard") {
             settings.copy_session_id_to_clipboard = value;
+        } else if (in_launcher && key == "EnhancedOptions") {
+            settings.enhanced_options = value;
         }
     }
     if (!settings.native_mp2k) settings.turbo_decoupled = false;
@@ -154,6 +159,9 @@ void save_launcher_audio_settings(const fs::path& root,
            << "[Launcher]\n"
            << "CopySessionIdToClipboard="
            << (settings.copy_session_id_to_clipboard ? "true" : "false")
+           << "\n"
+           << "EnhancedOptions="
+           << (settings.enhanced_options ? "true" : "false")
            << "\n";
 }
 
@@ -776,7 +784,7 @@ int run_game(const fs::path& root, const std::wstring& rom,
         inherited_environment_value(L"GBARECOMP_INPUT_REPLAY");
     std::wstring automatic_input_path;
     if (logging && input_replay.empty() && explicit_input_record.empty() &&
-        g_test_function_tracer) {
+        (g_test_function_tracer || g_test_text_record)) {
         automatic_input_path = gsr::choose_unique_input_record_path(
             log_path, [](const std::wstring& candidate) {
                 return fs::exists(fs::path(candidate));
@@ -784,7 +792,7 @@ int run_game(const fs::path& root, const std::wstring& rom,
     }
     const auto input_record_policy =
         gsr::resolve_launcher_input_record_policy(
-            g_test_function_tracer, explicit_input_record,
+        (g_test_function_tracer || g_test_text_record), explicit_input_record,
             !input_replay.empty(), automatic_input_path);
     if (input_record_policy.replay_conflict) {
         if (log_file != INVALID_HANDLE_VALUE) CloseHandle(log_file);
@@ -794,7 +802,8 @@ int run_game(const fs::path& root, const std::wstring& rom,
                     L"Golden Sun Recompiled", MB_OK | MB_ICONERROR);
         return 1;
     }
-    if (g_test_function_tracer && input_replay.empty() &&
+    if ((g_test_function_tracer || g_test_text_record) &&
+        input_replay.empty() &&
         explicit_input_record.empty() && !input_record_policy.enabled) {
         if (log_file != INVALID_HANDLE_VALUE) CloseHandle(log_file);
         MessageBoxW(window,
@@ -847,22 +856,19 @@ int run_game(const fs::path& root, const std::wstring& rom,
         {L"GSR_BLITTER_SHADOW", g_test_blitter_shadow},
         {L"GSR_RECURSION_PROBE", g_test_recursion_probe},
         {L"GSR_RAM_CHURN_PROBE", g_test_ram_churn_probe},
-        // The sprite recorder implies this one. Every committed sprite
-        // reaches the recorder through the OAM-shadow write observer, and
-        // gbarecomp only calls that observer while this variable is set
-        // (trace_oam_shadow_write_committed in gba_vram_trace.cpp), so
-        // ticking "Record sprite placement" alone recorded zero sprites in
-        // session objrec_20260906_105459. Coupled here rather than in the
-        // runtime so the user still sees one checkbox per diagnostic.
+        // Keep this coupled to the sprite recorder so it also enables the
+        // bounded OAM-shadow write printout. The runner's placement observer
+        // is armed independently for recording and Enhanced Options.
         {L"GSR_OAM_SHADOW_TRACE",
          g_test_oam_shadow_trace || g_test_obj_record},
         {L"GBARECOMP_OBJ_PARK_CENSUS", g_test_obj_park_census},
         {L"GSR_MAP_RECORD", g_test_map_record},
         {L"GSR_OBJ_RECORD", g_test_obj_record},
-        {L"GBARECOMP_FN_TRACER", g_test_function_tracer},
+        {L"GSR_TEXT_RECORD", g_test_text_record},
+        {L"GBARECOMP_FN_TRACER",
+         g_test_function_tracer || g_test_text_record},
         {L"GBARECOMP_VRAM_MAP_TRACE", g_test_vram_trace},
         {L"GSR_ROOM_BUFFER", g_test_room_buffer},
-        {L"GSR_ROOM_BUFFER_RENDER", g_test_room_buffer_render},
     };
     for (const TestEnvironmentVariable& variable : test_environment_variables) {
         const bool self_heal =
@@ -877,6 +883,45 @@ int run_game(const fs::path& root, const std::wstring& rom,
             child_environment.set(variable.name, L"0");
         } else {
             child_environment.unset(variable.name);
+        }
+    }
+
+    // Enhanced Options combines the existing expanded-sprite/shadow safety
+    // net with room-buffer rendering. The room-buffer self-check stays an
+    // independent Test variables control.
+    child_environment.set(L"GBARECOMP_EXPERIMENTAL_FIXES",
+                          g_audio_settings.enhanced_options ? L"1" : L"0");
+    // Rendering is owned by Enhanced Options; clear any inherited value when
+    // it is off so a normal launch cannot silently enable it.
+    child_environment.unset(L"GSR_ROOM_BUFFER_RENDER");
+    if (g_audio_settings.enhanced_options)
+        child_environment.set(L"GSR_ROOM_BUFFER_RENDER", L"1");
+
+    // BIOS inventory logs are session-only diagnostics. Remove inherited
+    // values first, then add the launcher-owned paths only when their
+    // corresponding checkboxes are enabled.
+    child_environment.unset(L"GBARECOMP_SWI_LOG");
+    child_environment.unset(L"GBARECOMP_BIOS_PC_LOG");
+    const bool swi_log_enabled = gsr::launcher_test_variable_enabled(
+        g_test_variables, false, g_test_swi_log);
+    const bool bios_pc_log_enabled = gsr::launcher_test_variable_enabled(
+        g_test_variables, false, g_test_bios_pc_log);
+    if (swi_log_enabled || bios_pc_log_enabled) {
+        const fs::path bios_inventory_dir =
+            root / L"logs" / L"bios_inventory";
+        std::error_code bios_inventory_ec;
+        fs::create_directories(bios_inventory_dir, bios_inventory_ec);
+        if (!bios_inventory_ec) {
+            if (swi_log_enabled) {
+                child_environment.set(
+                    L"GBARECOMP_SWI_LOG",
+                    (bios_inventory_dir / L"swi.csv").wstring());
+            }
+            if (bios_pc_log_enabled) {
+                child_environment.set(
+                    L"GBARECOMP_BIOS_PC_LOG",
+                    (bios_inventory_dir / L"bios_pc.csv").wstring());
+            }
         }
     }
 
@@ -1004,8 +1049,11 @@ constexpr int kMapRecordButton = 1019;
 constexpr int kFunctionTracerButton = 1020;
 constexpr int kVramMapTraceButton = 1021;
 constexpr int kRoomBufferButton = 1022;
-constexpr int kRoomBufferRenderButton = 1023;
 constexpr int kObjRecordButton = 1024;
+constexpr int kSwiLogButton = 1025;
+constexpr int kBiosPcLogButton = 1026;
+constexpr int kEnhancedOptionsButton = 1027;
+constexpr int kTextRecordButton = 1028;
 
 fs::path g_launcher_root;
 std::wstring g_launcher_bios;
@@ -1057,6 +1105,7 @@ void layout_buttons(HWND window) {
     HWND turbo_audio = GetDlgItem(window, kTurboAudioButton);
     HWND audio_help = GetDlgItem(window, kAudioHelpText);
     HWND copy_session_id = GetDlgItem(window, kCopySessionIdButton);
+    HWND enhanced_options = GetDlgItem(window, kEnhancedOptionsButton);
     HWND test_variables = GetDlgItem(window, kTestVariablesButton);
 
     // The help text wraps to as many lines as its content needs at the
@@ -1087,6 +1136,11 @@ void layout_buttons(HWND window) {
     const int copy_session_id_y = cursor;
     cursor += kRowHeight + kGroupGap;
 
+    // Enhanced Options is a normal launcher setting, separate from the
+    // session-only diagnostic controls below.
+    const int enhanced_options_y = cursor;
+    cursor += kRowHeight + kGroupGap;
+
     // Test variables group. The children stack below the master checkbox,
     // full content width, so a long label (e.g. "Log off-screen sprite
     // positions") never gets clipped; adding another entry to `children[]`
@@ -1094,7 +1148,7 @@ void layout_buttons(HWND window) {
     const int test_variables_y = cursor;
     cursor += kRowHeight;
     const int children_top = cursor + kRowGap;
-    constexpr int kChildCount = 14;
+    constexpr int kChildCount = 16;
     const int child_width = kContentWidth - kIndent;
     if (g_test_variables) {
         cursor = children_top +
@@ -1131,6 +1185,11 @@ void layout_buttons(HWND window) {
         MoveWindow(copy_session_id, content_x, panel_top + copy_session_id_y,
                    kContentWidth, kRowHeight, TRUE);
     }
+    if (enhanced_options) {
+        MoveWindow(enhanced_options, content_x,
+                   panel_top + enhanced_options_y, kContentWidth, kRowHeight,
+                   TRUE);
+    }
     if (test_variables) {
         MoveWindow(test_variables, content_x, panel_top + test_variables_y,
                    kContentWidth, kRowHeight, TRUE);
@@ -1141,8 +1200,8 @@ void layout_buttons(HWND window) {
         kBlitterShadowButton,  kRecursionProbeButton, kRamChurnProbeButton,
         kOamShadowTraceButton, kObjParkCensusButton,
         kMapRecordButton,      kFunctionTracerButton, kVramMapTraceButton,
-        kRoomBufferButton,     kRoomBufferRenderButton,
-        kObjRecordButton,
+        kRoomBufferButton,     kObjRecordButton,
+        kSwiLogButton,         kBiosPcLogButton, kTextRecordButton,
     };
     for (int i = 0; i < kChildCount; ++i) {
         HWND child = GetDlgItem(window, child_ids[i]);
@@ -1251,7 +1310,10 @@ bool* checkbox_state_for_id(int id) {
     case kFunctionTracerButton: return &g_test_function_tracer;
     case kVramMapTraceButton: return &g_test_vram_trace;
     case kRoomBufferButton: return &g_test_room_buffer;
-    case kRoomBufferRenderButton: return &g_test_room_buffer_render;
+    case kSwiLogButton: return &g_test_swi_log;
+    case kBiosPcLogButton: return &g_test_bios_pc_log;
+    case kTextRecordButton: return &g_test_text_record;
+    case kEnhancedOptionsButton: return &g_audio_settings.enhanced_options;
     case kNativeMp2kButton: return &g_audio_settings.native_mp2k;
     case kTurboAudioButton: return &g_audio_settings.turbo_decoupled;
     case kCopySessionIdButton:
@@ -1318,9 +1380,11 @@ LRESULT CALLBACK launcher_window_proc(HWND window, UINT message,
         g_test_obj_park_census = k_launcher_test_defaults.obj_park_census;
         g_test_map_record = k_launcher_test_defaults.map_record;
         g_test_function_tracer = k_launcher_test_defaults.function_tracer;
+        g_test_text_record = k_launcher_test_defaults.text_record;
         g_test_vram_trace = k_launcher_test_defaults.vram_map_trace;
         g_test_room_buffer = k_launcher_test_defaults.room_buffer;
-        g_test_room_buffer_render = k_launcher_test_defaults.room_buffer_render;
+        g_test_swi_log = k_launcher_test_defaults.swi_log;
+        g_test_bios_pc_log = k_launcher_test_defaults.bios_pc_log;
         CreateWindowExW(0, L"BUTTON", L"Pick ROM",
                         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
                         0, 0, 0, 0, window,
@@ -1336,11 +1400,17 @@ LRESULT CALLBACK launcher_window_proc(HWND window, UINT message,
         // so it can sit on the panel's real background instead of painting
         // its own opaque box; their initial checked state is simply whatever
         // the backing global already holds; no BM_SETCHECK needed.
-        // The default is intentionally OFF for every launcher invocation.
+        // Test-variable children default to their fresh-session policy; the
+        // persistent Enhanced Options setting is loaded before WM_CREATE.
         CreateWindowExW(0, L"BUTTON", L"Test variables",
                         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
                         0, 0, 0, 0, window,
                         reinterpret_cast<HMENU>(kTestVariablesButton),
+                        GetModuleHandleW(nullptr), nullptr);
+        CreateWindowExW(0, L"BUTTON", L"Enhanced Options",
+                        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                        0, 0, 0, 0, window,
+                        reinterpret_cast<HMENU>(kEnhancedOptionsButton),
                         GetModuleHandleW(nullptr), nullptr);
         struct TestChildControl {
             int id;
@@ -1349,11 +1419,13 @@ LRESULT CALLBACK launcher_window_proc(HWND window, UINT message,
         const TestChildControl children[] = {
             {kSelfHealRamButton, L"Self-heal RAM"},
             {kFunctionTracerButton, L"Function tracer"},
+            {kTextRecordButton, L"Record text progression"},
             {kMapRecordButton, L"Record map + scene data"},
             {kObjRecordButton, L"Record sprite placement"},
             {kVramMapTraceButton, L"VRAM map write trace"},
             {kRoomBufferButton, L"Room buffer self-check"},
-            {kRoomBufferRenderButton, L"Draw field from room buffer"},
+            {kSwiLogButton, L"Record BIOS SWI calls"},
+            {kBiosPcLogButton, L"Record BIOS PC inventory"},
             // Hidden 2026-09-04 to keep the launcher focused on the toggles
             // current work needs. The flags, ids and environment plumbing
             // all remain, so restoring one is a matter of uncommenting its
@@ -1498,6 +1570,9 @@ LRESULT CALLBACK launcher_window_proc(HWND window, UINT message,
             case kCopySessionIdButton:
                 save_launcher_audio_settings(g_launcher_root, g_audio_settings);
                 break;
+            case kEnhancedOptionsButton:
+                save_launcher_audio_settings(g_launcher_root, g_audio_settings);
+                break;
             case kTestVariablesButton:
                 layout_buttons(window);
                 break;
@@ -1565,7 +1640,8 @@ int show_launcher(const fs::path& root, const std::wstring& bios) {
     RegisterClassW(&window_class);
 
     // Tall enough that the panel still clears the logo even in the worst
-    // case (Test variables checked, all 10 children shown in one column).
+    // case (Test variables checked, all diagnostic children shown in one
+    // column).
     RECT desired{0, 0, 720, 880};
     AdjustWindowRectEx(&desired, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU |
                                  WS_MINIMIZEBOX, FALSE, WS_EX_APPWINDOW);

@@ -1,7 +1,328 @@
 # Roadmap
 
-Written 2026-09-04. Replaces the previous roadmap, status, next-task and
-backlog files, all kept in `docs/OLD/`.
+## Resume here -- inspect the in-game options and dialogue renderers, 2026-09-10
+
+The boulder placement investigation is shelved at the user's request. The
+latest capture (`session_20260910_141441` / `objrec_20260910_141449`) verified
+the new `0x08094980` post-call trace: all `3,272` Region B result rows stored
+zero at source `+0x10`, while exact joins still showed changing final OAM
+positions. No placement fix is justified. When resumed, capture the earlier
+source that builds F0's packed attributes/coordinates; the camera-versus-object
+question remains open.
+
+Current work is limited to the game-owned options screen and dialogue/text
+rendering. Establish their existing drawing paths and any measured text-speed
+control before considering changes. Keep the boulder trace and its evidence
+intact.
+
+## Shelved -- capture the cutscene source before filtering, 2026-09-09
+
+Garet and the chest are confirmed working; the four pushers and boulder remain
+unresolved. Source review found that the previous `context=none` census cannot
+prove EC was never entered: its contexts are populated only after an IWRAM-only
+attribute read and actor-identity admission (or recorder-only rejection capture).
+An unreadable/non-IWRAM source leaves no context even when EC ran. No context is
+also distinct from no B324/B328 coordinate capture; those are separate hooks.
+
+`Record sprite placement` now captures EC's actual R6 source and R0 destination
+before those filters, then consumes the observation at the corresponding F0
+write. New `entry_*` columns in `lifetime.csv` distinguish missing entry,
+invocation mismatch, unreadable RAM, changed attributes, and a matched source.
+Only physical EWRAM/IWRAM attributes are read; no asset payload is recorded.
+Existing captured coordinates for that source (or its known paired body) are
+included when present. Rendering and all placement checks are unchanged.
+
+That capture path has since been run and extended with the bounded producer
+trace recorded above; no further boulder run is planned while this line is
+shelved.
+
+## Previous -- second sprite source is unfound, 2026-09-09
+
+Garet and the chest render fully in the expanded view; the boulder cutscene
+does not, and the reason is now measured rather than suspected.
+
+`session_20260909_213843` ran the `[wide-obj-nearmiss]` census. Of `5,073`
+sprites left without a position, `3,432` had no captured record for their call
+at all -- the staging seam never runs for them -- and the largest single group,
+`2,264`, is one call site (`0x030038f0` returning to `0x030038b4`) and one
+sprite class (tall, semi-transparent, `ATTR2` `0xd524`) that never appears among
+the successes. Everything that works is square 256-colour sprites out of the
+`0x03002000` actor array.
+
+So the remaining work is not tuning the placement path. It is finding the second
+structure these sprites are staged in and the instructions that write it, the
+way the `0x03002000` array and `B324`/`B328` were found. Do not loosen the
+identity, frame or provenance checks further to chase it -- they already reject
+nothing that reaches them (`f0_placed == f0_identified` in every run).
+
+Full session write-up for the user: [WIDE_SPRITE_CLIPPING.md](WIDE_SPRITE_CLIPPING.md).
+
+
+## Previous -- context-key mismatch on one call site, 2026-09-09
+
+`session_20260909_211709` / `logs/objrec_20260909_211716`: the one-frame window
+worked. Coverage `19.82%` -> `33.42%`, `context-frame` failures `3,479` -> `219`.
+The user still sees the boulder and the four pushers cropped.
+
+The failure moved: `3,988` commits now fail with `context-no-match`, meaning the
+frame's context table exists but holds no entry for those sprites. They are one
+call site (writer `0x030038f0` returning to `0x030038b4`: `2,707` failures,
+`80` successes) and one sprite class (256-colour tall sprites, `ATTR2` `0xd524`)
+that never appears among the successes. Since EC entry and the F0 store sit in
+one invocation of the same routine, depth and return_pc cannot disagree for a
+sprite -- only the attributes can. Either the EC seam does not run for that
+call, or it runs against a different structure and reads the wrong attributes.
+
+`[wide-obj-nearmiss]` was added to separate those two. On a failed lookup it
+searches by `(frame, depth, return_pc)` alone and prints, deduped and bounded,
+whether any context existed for that call and what pointer it held.
+
+Needs a rebuild and a rerun of the boulder cutscene. The `[wide-obj-nearmiss]`
+lines at the end of the log are the whole result; `context=none` on
+`return_pc=0x030038b4` means the EC seam never runs for that call, while
+`context=yes` with a staging pointer names the structure those sprites come
+from.
+
+
+## Previous -- per-frame context stamp widened to one frame, 2026-09-09
+
+Garet and the chest render fully. The boulder cutscene does not: the four
+pushers and the boulder are still cropped. The capture
+`logs/objrec_20260909_203451` says why, and it is not the identity predicate --
+that now rejects nothing.
+
+All `3,479` failures out of `4,339` committed sprites have reason
+`context-frame` and `checks=0`, with zero `context-no-match`. In `647` of the
+`788` frames both successes and failures occur, and in every one of those `647`
+frames all failures come before all successes. The context table is wiped at
+the frame's first staging entry, so everything committed earlier in the frame
+is compared against the previous frame's stamp and refused while the matching
+record is still sitting in the table.
+
+`golden_sun_obj_record_frame_current` now accepts a record up to one frame old
+in the context lookup and the body provenance check. One frame is the measured
+bound -- the table is cleared once per frame -- and the exact `ATTR0/1/2` match
+and OAM-byte truncation check still decide trust. `[wide-obj-hooks]` gained
+`f0_placed_prev_frame`.
+
+Needs a rebuild and a rerun of the boulder cutscene. Expect `f0_placed` to rise
+well past `860/4,339` with most of the gain in `f0_placed_prev_frame`. If
+`f0_placed` rises but sprites land in the wrong place, the one-frame window is
+too generous and the next question is the staging record's own lifetime.
+
+
+## Previous -- actor-record allowlist removed, 2026-09-09
+
+The rerun after the production-gate fix, `session_20260909_190746`, confirms
+both seams are live: `[wide-obj-hooks]` reports `fast_iwram=armed
+oam_commit=armed`, `169,186` observer calls, and all `2,702` F0 commits
+reaching the placement resolver. Only `882` of them (`32.6%`) were traced to an
+actor record. The remaining `1,820` were refused by the identity predicate's
+hardcoded address range before any provenance check ran -- that is the ceiling
+that made "authenticate one more pointer" unable to generalise past Garet.
+
+`golden_sun_obj_record_identity` now checks the shape of the actor array
+(base `0x03002000`, stride `0x38`, body `+0x00`, shadow `+0x0C`, record inside
+IWRAM) instead of an audited address range plus a per-actor exception. The
+authentication that actually decides trust is unchanged and still downstream:
+staged `ATTR0/1/2` must equal the committed OAM attributes, staged coordinates
+must truncate to the committed OAM bytes, and the staging entry must carry the
+same frame and auth epoch. `[wide-obj-hooks]` gained `f0_considered` and
+`f0_placed` so one Enhanced run reports how many committed sprites ended with a
+trusted full-precision position.
+
+Needs a rebuild and a rerun of the prologue chest scene. Expect `f0_identified`
+to approach `f0_placements` and `f0_placed` to rise from near zero; if
+`f0_identified` climbs but `f0_placed` does not, the next question is the
+provenance gates, not identity.
+
+
+## Previous -- production F0 seam armed for Enhanced, 2026-09-09
+
+The first rerun after the measured `0x03002348` identity fix was
+`session_20260909_174751`; the user still saw Garet clipped. Its log confirms
+the same savestate at frame `8531`, Enhanced timing and the expanded
+room-buffer view, but no F0 writer, OAM-shadow, object-recorder or cull rows.
+The child was the rebuilt `build/gs011_opt/GoldenSunRecomp.exe` (written
+`17:00:53`, before the `17:47:51` run), and the root launcher was
+`GoldenSunLauncher.exe` (written `13:32:47`).
+
+The missing rows alone do not identify the cause. Source and executable
+inspection found the production gate: generated fast-IWRAM writes were armed
+only for VRAM diagnostics, and the reusable committed OAM callback was also
+suppressed when diagnostic print tracing was off. The measured F0 writer at
+`0x030038F0` therefore bypassed the placement resolver in a normal Enhanced
+run, so the `0x03002348` identity correction could not affect rendering. The
+source now arms the fast seam for Enhanced/recording, gates committed
+callbacks with the existing primary/alternate OAM-table predicate, and invokes
+the payload-free callback independently of print tracing. `run_game()` now
+clears both vram-trace observer slots and the range gate before each run. It
+also emits one bounded `[wide-obj-hooks]` exit line in Enhanced runs with the
+observer, F0, placement and identity counts. No gameplay success is claimed
+until the user rebuilds and reruns the marked scene.
+
+## Previous -- Garet body provenance source measured, 2026-09-09
+
+The targeted capture `session_20260909_154121` closes the source gap behind
+the marked `garet_partial.png` window. Across frames `8531..9209`, every
+`record-identity` commit row carries the same authenticated EC/F0 source
+`0x03002348` (body `N=15` at the measured `0x38` stride), with the source
+attributes matching the committed OAM attributes in the same frame. At the
+window's end, frame `9082` slot `10` has the candidate body's attributes but
+stale provenance; its matching source commit is frame `9080`, slot `10`, and
+the intervening DMA is frame `9081`.
+
+The identity predicate preserves the original half-open range
+`[0x03002000,0x030022E0)` and admits only the additionally authenticated body
+pointer `0x03002348` (`N=15`). The `N=13` shadow `0x030022E4`, `N=14` body and
+shadow `0x03002310`/`0x0300231C`, and `N=15` shadow `0x03002354` remain rejected.
+Existing frame, epoch, complete-attribute and hardware-truncation checks still
+gate the source handoff. This is a source fix only; no build or gameplay
+verification was run here. The user must manually rebuild and rerun the marked
+scene to verify that the full body appears in the expanded top margin.
+
+## Resume here -- normal shadow path verified; D8 bypass remains, 2026-09-08
+
+Latest user test: `session_20260908_210056`; matching capture:
+`logs/objrec_20260908_210104`. The user reports that the shadow problem looks
+fixed. The capture verifies the normal D4 path: all `3,815` shadow entry tokens
+have a matching `store-token-found` event, with only `6` `handoff-body-stale`
+events and no paired-body-check rejection. It also retains a bounded D8 gap:
+the same shadow-shaped attributes as the prior representative occur at slot 8
+in frame 373104 with `store-token-missing`; the DMA publishes them with
+provenance from frame 373086 and the renderer records `stale-frame`. Attributes
+do not prove actor identity, so this is evidence of a remaining writer path,
+not a global sprite count. The paired-body correction is therefore confirmed
+for normal D4 entry, while a true D8 resume/bypass remains unclassified. See
+"Latest writer capture" below.
+
+The measured failure is stale or missing shadow provenance at rendering:
+without a trusted full-precision position, the renderer confines the shadow
+to the native rectangle. Detailed counts and event identities are in FACTS.md,
+"Sprites, NPCs and shadows".
+
+What is ruled out or cannot be inferred:
+
+- The alternate table does not explain the representative failing primary
+  slot or the dominant recorded failures. Alternate-table gaps still exist.
+- Upload does not always discard correct provenance: DMA 176 preserves the
+  later matching commit. This does not establish that every upload is sound.
+- That later commit has different attributes from the failing shadow.
+  Reusing slot 14 does not identify the same actor or prove its placement
+  was available before the failed render.
+- Checks 31 includes commit resolution; it is not evidence of an unresolved
+  commit. Aggregate placement coverage is not renderer acceptance coverage.
+- RAM PCs 0x030001A4/0x030001A8 identify a clear-fill routine, not a proven
+  shadow producer. Do not hook them or fixed OAM slots as a shadow fix.
+
+Next: if another visible shadow failure is found, isolate the D8 bypass before
+considering an instruction-level resume seam. Keep the writer recorder enabled
+and do not relax identity/frame checks or undo the working body/no-wrap
+corrections.
+
+## Planned next architectural task -- BIOS removal, 2026-09-08
+
+The shadow status above is unchanged. BIOS removal is planned, not implemented;
+the source-grounded work sequence is in
+[BIOS_REMOVAL_PLAN.md](BIOS_REMOVAL_PLAN.md).
+
+## Current recording setup
+
+`lifetime.csv` orders commits, full OAM upload snapshots and renderer
+observations. It includes context rejection reasons, body staging frame and
+epoch, attributes and provenance. Renderer failures outside raw Y159..199
+are now recorded too. The DMA counter is diagnostic only. Buffered output
+continues through the session rather than expiring at an initial sample cap.
+The follow-up `shadow_writes.csv` tracks every affected primary or alternate
+table slot and contains no guest payload bytes.
+
+The successful capture used these launcher toggles: Self-heal RAM, Record
+sprite placement, VRAM map write trace, and Draw field from room buffer.
+Other test variables were off. VRAM trace is required to observe generated
+fast IWRAM stores; sprite recording alone arms only the normal store path.
+The `session_20260908_173410` and `session_20260908_210056` writer captures
+used these settings after the manual rebuild. Launch root
+`GoldenSunLauncher.exe`.
+
+## Latest writer capture -- D8 paired-body handoff corrected, 2026-09-08
+
+The supplied `session_20260908_173410` matches
+`logs/objrec_20260908_173418`. It has `2,303` primary commits (`1,925`
+full precision), including `1,511` shadows (`1,505` full precision). The
+writer trace contains `1,332` shadow-shaped D4 stores at
+`0x030038D8` with no same-frame lifetime commit; every one is present in a
+same-identity DMA in the same or one of the next two frames. By comparison,
+the `0x030038F0` F0 writer has `1,418` shadow-shaped stores and `1,190`
+same-frame commits. This keeps the table/upload path ruled out for the D4
+loss.
+
+The representative new row is slot `5`, frame `373104`, with
+`ATTR0/1/2=0x6104/0x07C0/0x0800` at `0x030038D8`. The identity is published
+by DMA, but a later renderer row is `no-provenance`; the authenticated D4
+handoff log covers slots `0` through `4` and `11`, not slot `5`. Source audit
+now explains that gap: D4 captures the shadow source before the lookup, then
+the old lookup searched for body+0x0C in a table keyed by the body base. The
+source now maps that source through `golden_sun_obj_record_identity` before
+the handoff, reusing the paired-body resolver. No gameplay result is claimed
+until the user reruns the matching capture.
+
+The generated resume path consumes `g_runtime_resume_pc` and jumps to the
+D8 label before the function-entry hook. That remains a separate, unmeasured
+possibility; the session has no alias/resume event. The current correction
+addresses the proven normal-entry shadow lookup mismatch by reusing the body
+record's staging provenance. The user must rerun before any resume seam is
+considered. No gameplay success is claimed.
+
+The prior `session_20260908_152234` matches
+`logs/objrec_20260908_152249`. Its writer trace follows the failing identity
+through a real table write and the next full upload, so the table itself is
+not losing the shadow. The current representative is slot 14: a shadow
+identity written at frame 373209 by `0x030038D8` is uploaded next and rendered
+at frame 373211 with stale frame provenance.
+
+`0x030038D8` is the second instruction of the verified D4 writer, immediately
+after entry `0x030038D4`; the accepted `0x030038F0` PC is a separate F0 writer.
+The source now admits the D4 STM only when its preceding entry is authenticated.
+The D4 entry hook captures the actual R6 staging pointer immediately before the
+no-writeback LDM and keeps it for a same-frame store. For shadows, that pointer
+is body+0x0C while the coordinate table is keyed by the paired body base; the
+source now maps that record before publishing provenance. OAM attributes are
+not used to guess source identity. The existing frame, epoch, table-target,
+attribute and truncation gates remain in force. The manual rerun must establish
+whether any remaining D8 store bypasses the normal entry path before a resume
+seam is considered.
+
+## Latest writer capture -- normal D4 path verified, D8 bypass remains, 2026-09-08
+
+The supplied `session_20260908_210056` matches
+`logs/objrec_20260908_210104`. It has `5,096` primary commits (`4,453`
+full precision), including `3,568` shadows (`3,553` full precision). The D4
+trace has `3,815` shadow `entry-token-found` rows and the same `3,815` shadow
+`store-token-found` rows. There are `6` `handoff-body-stale` rows and no
+`handoff-body-checks` rows. The `2,414` `store-token-missing` rows have no
+source address and cannot be assigned to an actor from this capture.
+
+In the overlapping frames `373079..373493`, deduplicated shadow-signature
+renderer observations (`ATTR2=0x0800`, active `ATTR0`) changed from `133`
+`no-provenance`, `149` `accepted`, and `1,440` `stale-frame` in the previous
+capture to `8`, `449`, and `417`. These are renderer observations, not sprite
+counts. The prior representative's `ATTR0/1/2=0x6104/0x07C0/0x0800` appears
+at slot `8`, frame `373104`, in the new capture: its D8 event is
+`store-token-missing`, its DMA row is published with provenance frame `373086`,
+and its render row is `stale-frame`. This confirms the normal D4 paired-body
+correction and leaves a specific D8 bypass/resume path unclassified.
+
+## Manual builds -- user only
+
+Never start a build unless the user explicitly changes that instruction.
+When a source change needs one, tell the user. Root `build_lto.bat` calls
+`scripts/build_lto.ps1` for the existing `build/gs011_opt` LTO build, setting
+MAKE with forward slashes. Default ceilings: 90% CPU and job-wide committed
+memory equal to 90% of installed RAM, not usage targets. Optional overrides:
+`build_lto.bat -CpuPercent 80 -RamPercent 75`. Resource-limit enforcement has
+not been independently measured. Do not present the older September 6
+executable timestamp as the latest build: September 8 captures exercised
+newer recorder code, without a newly audited executable timestamp here.
 
 ## The goal
 
@@ -148,7 +469,7 @@ playing and all four are fixed: per-layer offsets rounded to a multiple of the
 ring (broke every indoor room), the callback answering outside Mode 0 (broke
 battles), a camera cached a frame behind the renderer, and a Mode 0 frame
 carrying the world map's BGCNT during the transition. A residual "shimmer" on
-fine detail while walking was **confirmed native** � it happens with every
+fine detail while walking was **confirmed native** — it happens with every
 toggle off.
 
 Each layer's grid region now comes from its own scroll register, live, rather
@@ -220,12 +541,15 @@ Known open, in the order they should be taken:
    conflated with the clamp regression and with a build that contained none of
    the fixes. Re-test before theorising.
 3. **Sprite pop-in** with 64 px slack — untested.
-4. **Performance** — never measured. The hook is consulted per pixel, which is
-   the shape that made the old widescreen slow. Use `GBARECOMP_COST_PROBE=1`.
+4. **Performance** — the room-buffer source is consulted per sample, while
+   OBJ placement providers run once per OAM slot per rendered scanline. The
+   remaining cost is not attributed yet; use `GBARECOMP_COST_PROBE=1`.
 5. **Remove the temporary diagnostics** once the above settle:
    `g_ws_expanded_diag` in the PPU, and the refusal/rect reports in
    `room_buffer.cpp`. The room-rect report also has a display bug (it prints
    one line per frame instead of deduplicating).
+6. **Name-entry screen** — user-reported graphical corruption with Expanded
+   View enabled (2026-09-09; screenshot). Troubleshooting is deferred.
 
 Method note, because it kept paying off: every real cause this session was
 found by a counter, not by reasoning about the code. Three separate wrong
@@ -233,8 +557,11 @@ diagnoses were stated confidently before the numbers arrived. Instrument
 first.
 
 Still open:
-- **Cost.** The hook is consulted per pixel, which is the shape that made the
-  old widescreen slow. Not yet measured; use `GBARECOMP_COST_PROBE=1`.
+- **Cost.** The room-buffer path repeats camera, room-rect and layer-scroll
+  reads for each supplied sample. The expanded OBJ X and Y providers also
+  resolve the same slot provenance independently. Neither impact is measured;
+  use `GBARECOMP_COST_PROBE=1` for a controlled baseline before caching either
+  result.
 - **The margins themselves.** Drawing beyond 240x160 is the point of the
   milestone and has not been attempted.
 - The check's residual few percent is presumed streaming lag; the
@@ -488,12 +815,11 @@ fresh and synchronised -- take both:
   the visible record does not match the sprite being drawn, consult the
   pending record as a second candidate before giving up.
 
-That is safe by construction and needs no new judgement: a record carries its
-sprite's exact ATTR0/1/2, and is only ever used on a sprite whose bytes match
-exactly. Offering a second candidate can never place a record on the wrong
-sprite -- it can only rescue one that would otherwise have fallen back to the
-byte. It should recover the freshness that helped shadows without the
-prematurity that hurt bodies.
+Exact ATTR0/1/2 agreement is necessary but is not a lifetime proof: positions
+separated by an OAM wrap can share those bytes. Keep the matching visible
+record first, keep X and Y from the same record, and bound any pending fallback
+by its source and lifetime. The 2026-09-06 rerun below confirms the
+jump/wrap result; early disappearance remains under investigation.
 
 **Still open.**
 
@@ -506,6 +832,67 @@ prematurity that hurt bodies.
 - A hard-coded `*out_y = -97` edge-alias path remains in
   `golden_sun_wide_obj_attr_y_provider`. It did not fire in any measured
   session; it is a candidate for removal once the above is confirmed.
+
+### Follow-up: body visibility is independent of the earlier component
+
+The measured 162111 guest-cull case is corrected in the B328 policy. A
+matching earlier B27E may have remained culled while the body itself is
+still inside the bottom margin. The body now uses its own 160..199 band;
+no cutoff or grace period was enlarged, and all execution-identity checks
+remain. The policy regression test and runner compile pass. Normal full
+build succeeded at 21:23:08; session 212401 reports bodies look correct.
+The confirmed no-wrap renderer behavior is unchanged. Other missing-position
+coverage remains open; aggregate renderer samples are not a sprite census.
+
+### Correction rerun; jumping/wrapping fixed, early disappearance remains -- 2026-09-06
+
+The premature publication and cross-table handoff are removed. Providers
+prefer a matching visible record, then a same-frame primary-table pending
+record with matching epoch, complete attributes and both coordinates. X and
+Y are selected together. The compositor now actually uses the recorded X
+and keeps unknown positions confined to the native rectangle; it no longer
+turns wrapped OAM coordinates into trusted margin placement. Affine doubled
+bounds and shifted screen coordinates are used for culling.
+
+The user reran the full executable with Self-heal RAM, Record sprite placement
+and Draw field from room buffer in `logs/session_20260906_162111.log`: sprite
+and shadow jumping/wrapping were no longer observed, but sprites still
+disappear too early while an NPC remained in the expanded view. The
+`wide-obj-y-transition-summary` values are renderer/provider diagnostic
+samples, not sprite counts: `no-provenance/offscreen=24,231,840`,
+`stale-frame/native=3,360`, and `stale-frame/offscreen=2,274,720`
+(`2,278,080` stale-frame samples total). The optional experimental culler
+reported `logs=0 dropped=0`; this shows that path was inactive, not that
+guest culling was inactive. A bounded `wide-obj-y-cull-decision` sample had
+44 decisions: 36 overridden and 8 retained (`original=1 final=1
+overridden=0`). Retained samples at frames 373434--373437 are record
+`0x03002070`, with B27E operands `225..222` and B328 operands `199..196`;
+matching objrec data has body commits `0` but shadow commits `274` (`263`
+exact). The retained sample is bounded and is not a population count.
+
+The normal full build succeeded (2026-09-06, 16:18 local), and no new gameplay
+coverage percentage is claimed.
+
+Follow-up session `20260906_212401`: bodies looked correct, but shadows still
+clipped at the native 240x160 bounds. Matching recorder
+`logs/objrec_20260906_212409/summary.txt` reports `4,677` shadow commits and
+`4,658` full-precision (`99.59%`). The run completed `73` primary OAM DMA
+uploads, each with `109/128` slots reporting `raw_y>=160`. Bounded transition
+samples contain `61` no-provenance cases: `59` for slot 17 (`0x03003504`),
+frames `374481..374552`, raw Y `161..194`, and one for slot 21
+(`0x03003524`) at frame `374481`, raw Y `166`. The OAM shadow trace observed
+writes to those slots from RAM PCs `0x030001A4` and `0x030001A8`, but the
+final audit identifies a clear-fill routine, not a proven shadow producer.
+Those writes were not matched to the failing frame/generation. The proposed
+hook was stopped without implementation. Missing provenance causes native
+clipping; its actual producer/upload lifetime must still be established.
+
+Next acceptance should repeat the four-margin
+walk and room change while checking record `0x03002070` and the writer relation
+between B27E and B328. VRAM map write trace is only needed for a
+background/map symptom. The second table writer and unsourced body commits
+remain unresolved; same-frame pending fallback cannot recover older missing
+records.
 
 ### Tooling -- the sprite recorder (`GSR_OBJ_RECORD`)
 

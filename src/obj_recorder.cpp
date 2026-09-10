@@ -121,6 +121,107 @@ void flush_coverage() {
     g_coverage_rows = 0;
 }
 
+std::string g_lifetime_buf;
+std::size_t g_lifetime_rows = 0;
+bool g_lifetime_header = false;
+std::uint64_t g_lifetime_sequence = 0;
+void flush_lifetime() {
+    if (g_lifetime_buf.empty()) return;
+    ensure_session_dir();
+    const std::string path = g_session_dir + "/lifetime.csv";
+    FILE* f = std::fopen(path.c_str(), "a");
+    if (!f) { note_write_failure(path); }
+    else {
+        if (std::fwrite(g_lifetime_buf.data(), 1, g_lifetime_buf.size(), f) !=
+            g_lifetime_buf.size()) note_write_failure(path);
+        if (std::fclose(f) != 0) note_write_failure(path);
+    }
+    g_lifetime_buf.clear();
+    g_lifetime_rows = 0;
+}
+
+std::string g_shadow_write_buf;
+std::size_t g_shadow_write_rows = 0;
+bool g_shadow_write_header = false;
+std::uint64_t g_shadow_write_sequence = 0;
+void flush_shadow_writes() {
+    if (g_shadow_write_buf.empty()) return;
+    ensure_session_dir();
+    const std::string path = g_session_dir + "/shadow_writes.csv";
+    FILE* f = std::fopen(path.c_str(), "a");
+    if (!f) { note_write_failure(path); }
+    else {
+        if (std::fwrite(g_shadow_write_buf.data(), 1,
+                        g_shadow_write_buf.size(), f) !=
+            g_shadow_write_buf.size()) note_write_failure(path);
+        if (std::fclose(f) != 0) note_write_failure(path);
+    }
+    g_shadow_write_buf.clear();
+    g_shadow_write_rows = 0;
+}
+
+std::string g_ewram_write_buf;
+std::size_t g_ewram_write_rows = 0;
+bool g_ewram_write_header = false;
+std::uint64_t g_ewram_write_sequence = 0;
+std::uint64_t g_total_ewram_writes = 0;
+void flush_ewram_writes() {
+    if (g_ewram_write_buf.empty()) return;
+    ensure_session_dir();
+    const std::string path = g_session_dir + "/ewram_writes.csv";
+    FILE* f = std::fopen(path.c_str(), "a");
+    if (!f) { note_write_failure(path); }
+    else {
+        if (std::fwrite(g_ewram_write_buf.data(), 1,
+                        g_ewram_write_buf.size(), f) !=
+            g_ewram_write_buf.size()) note_write_failure(path);
+        if (std::fclose(f) != 0) note_write_failure(path);
+    }
+    g_ewram_write_buf.clear();
+    g_ewram_write_rows = 0;
+}
+
+std::string g_boulder_trace_buf;
+std::size_t g_boulder_trace_rows = 0;
+bool g_boulder_trace_header = false;
+std::uint64_t g_boulder_trace_sequence = 0;
+std::uint64_t g_total_boulder_trace_rows = 0;
+void flush_boulder_trace() {
+    if (g_boulder_trace_buf.empty()) return;
+    ensure_session_dir();
+    const std::string path = g_session_dir + "/boulder_trace.csv";
+    FILE* f = std::fopen(path.c_str(), "a");
+    if (!f) { note_write_failure(path); }
+    else {
+        if (std::fwrite(g_boulder_trace_buf.data(), 1,
+                        g_boulder_trace_buf.size(), f) !=
+            g_boulder_trace_buf.size()) note_write_failure(path);
+        if (std::fclose(f) != 0) note_write_failure(path);
+    }
+    g_boulder_trace_buf.clear();
+    g_boulder_trace_rows = 0;
+}
+
+std::string g_camera_buf;
+std::size_t g_camera_rows = 0;
+bool g_camera_header = false;
+std::uint64_t g_camera_sequence = 0;
+std::uint64_t g_total_camera_samples = 0;
+void flush_camera() {
+    if (g_camera_buf.empty()) return;
+    ensure_session_dir();
+    const std::string path = g_session_dir + "/object_camera.csv";
+    FILE* f = std::fopen(path.c_str(), "a");
+    if (!f) { note_write_failure(path); }
+    else {
+        if (std::fwrite(g_camera_buf.data(), 1, g_camera_buf.size(), f) !=
+            g_camera_buf.size()) note_write_failure(path);
+        if (std::fclose(f) != 0) note_write_failure(path);
+    }
+    g_camera_buf.clear();
+    g_camera_rows = 0;
+}
+
 void close_frame() {
     if (!g_frame_open) return;
     g_frame_open = false;
@@ -207,12 +308,13 @@ CallSite* find_or_add_site(const ObjPlacementSample& s) {
 
 // ---- actor records (records.csv) -----------------------------------------
 //
-// golden_sun_obj_record_identity recognises records at 0x03002000, stride
-// 0x38, ending at 0x030022E0 -- thirteen of them. Whether thirteen is the
-// whole cast or only the near-camera slice is unknown and matters a great
-// deal: if a town commits more distinct sprites than these records can
-// account for, an object buffer has to be built on something wider than this
-// table. Counting the records actually seen answers that directly.
+// golden_sun_obj_record_identity admits any pointer shaped like an actor
+// record: base 0x03002000, stride 0x38, body at +0x00 and its paired shadow
+// at +0x0C, bounded only by IWRAM. It used to stop at 0x030022E0 plus one
+// hand-authenticated body (0x03002348), which left every actor past the
+// audited prefix without a trusted position. Admission is not proof: callers
+// retain the same-frame, epoch, complete-ATTR and hardware-truncation
+// provenance gates, which is what actually authenticates a record.
 constexpr std::size_t kRecordLimit = 64;
 struct RecordTally {
     bool valid = false;
@@ -435,6 +537,14 @@ void write_summary() {
                  static_cast<unsigned long long>(g_wrap_band_unresolved),
                  pct(g_wrap_band_unresolved, g_wrap_band_committed));
 
+    std::fprintf(f, "\nmeasured EWRAM object-source writes\n");
+    std::fprintf(f, "  recorded            : %llu\n",
+                 static_cast<unsigned long long>(g_total_ewram_writes));
+    std::fprintf(f, "  camera joins        : %llu\n",
+                 static_cast<unsigned long long>(g_total_camera_samples));
+    std::fprintf(f, "  boulder trace rows  : %llu\n",
+                 static_cast<unsigned long long>(g_total_boulder_trace_rows));
+
     std::fprintf(f, "\ntable limits\n");
     std::fprintf(f, "  call sites overflow    : %llu\n",
                  static_cast<unsigned long long>(g_sites_overflow));
@@ -506,6 +616,11 @@ void write_records() {
 }
 
 void write_all() {
+    flush_lifetime();
+    flush_shadow_writes();
+    flush_ewram_writes();
+    flush_boulder_trace();
+    flush_camera();
     close_frame();
     flush_coverage();
     flush_unsourced();
@@ -525,6 +640,150 @@ void obj_recorder_init() {
 }
 
 bool obj_recorder_enabled() { return g_enabled; }
+
+void obj_recorder_note_lifetime(const ObjLifetimeSample& s) {
+    if (!g_enabled) return;
+    if (!g_lifetime_header) {
+        g_lifetime_header = true;
+        g_lifetime_buf += "sequence,event,reason,frame,epoch,dma,slot,source,staging,context_frame,body_frame,body_epoch,checks,attr0,attr1,attr2,provenance_frame,provenance_epoch,target,expected0,expected1,expected2,entry_state,entry_frame,entry_epoch,entry_pc,entry_source,entry_target,entry_depth,entry_return_pc,entry_attr0,entry_attr1,entry_attr2,entry_flags,entry_stage_source,entry_stage_frame,entry_stage_epoch,entry_stage_x,entry_stage_y\n";
+    }
+    g_lifetime_buf += std::to_string(++g_lifetime_sequence);
+    g_lifetime_buf += ','; g_lifetime_buf += s.event;
+    g_lifetime_buf += ','; g_lifetime_buf += s.reason;
+    const std::uint64_t values[] = {s.frame, s.epoch, s.dma,
+        static_cast<std::uint64_t>(s.slot), s.source, s.staging,
+        s.context_frame, s.body_frame, s.body_epoch, s.checks,
+        s.attr0, s.attr1, s.attr2, s.provenance_frame, s.provenance_epoch,
+        s.target, s.expected0, s.expected1, s.expected2};
+    for (auto v : values) {
+        g_lifetime_buf += ','; g_lifetime_buf += std::to_string(v);
+    }
+    g_lifetime_buf += ','; g_lifetime_buf += s.entry.state;
+    const std::uint64_t entry_values[] = {
+        s.entry.frame, s.entry.epoch, s.entry.pc, s.entry.source,
+        s.entry.target, s.entry.depth, s.entry.return_pc,
+        s.entry.attr0, s.entry.attr1, s.entry.attr2, s.entry.flags,
+        s.entry.stage_source, s.entry.stage_frame, s.entry.stage_epoch};
+    for (auto v : entry_values) {
+        g_lifetime_buf += ','; g_lifetime_buf += std::to_string(v);
+    }
+    // Keep negative full-precision coordinates signed in the CSV.
+    g_lifetime_buf += ','; g_lifetime_buf += std::to_string(s.entry.stage_x);
+    g_lifetime_buf += ','; g_lifetime_buf += std::to_string(s.entry.stage_y);
+    g_lifetime_buf += '\n';
+    // Reuse the existing flush cadence; no cap that expires before gameplay.
+    if (++g_lifetime_rows >= kCoverageFlushRows) flush_lifetime();
+}
+
+void obj_recorder_note_shadow_write(const ObjShadowWriteSample& s) {
+    if (!g_enabled) return;
+    if (!g_shadow_write_header) {
+        g_shadow_write_header = true;
+        g_shadow_write_buf +=
+            "sequence,event,frame,epoch,dma,slot,writer_pc,address,size,"
+            "source,destination,control,start_mode,attr_mask,attr0,attr1,attr2\n";
+    }
+    g_shadow_write_buf += std::to_string(++g_shadow_write_sequence);
+    g_shadow_write_buf += ','; g_shadow_write_buf += s.event;
+    const std::uint64_t values[] = {
+        s.frame, s.epoch, s.dma, static_cast<std::uint64_t>(s.slot),
+        s.writer_pc, s.address, s.size, s.source, s.destination,
+        s.control, static_cast<std::uint64_t>(s.start_mode), s.attr_mask, s.attr0,
+        s.attr1, s.attr2};
+    for (auto v : values) {
+        g_shadow_write_buf += ','; g_shadow_write_buf += std::to_string(v);
+    }
+    g_shadow_write_buf += '\n';
+    if (++g_shadow_write_rows >= kCoverageFlushRows) flush_shadow_writes();
+}
+
+void obj_recorder_note_ewram_write(const ObjEwramWriteSample& s) {
+    if (!g_enabled) return;
+    if (!g_ewram_write_header) {
+        g_ewram_write_header = true;
+        g_ewram_write_buf +=
+            "sequence,frame,epoch,region,writer_pc,address,offset,size\n";
+    }
+    char buf[256];
+    std::snprintf(
+        buf, sizeof(buf), "%llu,%llu,%llu,%s,0x%08x,0x%08x,0x%04x,%u\n",
+        static_cast<unsigned long long>(++g_ewram_write_sequence),
+        static_cast<unsigned long long>(s.frame),
+        static_cast<unsigned long long>(s.epoch), s.region, s.writer_pc,
+        s.address, s.offset, s.size);
+    g_ewram_write_buf += buf;
+    ++g_total_ewram_writes;
+    if (++g_ewram_write_rows >= kCoverageFlushRows) flush_ewram_writes();
+}
+
+void obj_recorder_note_boulder_trace(const ObjBoulderTraceSample& s) {
+    if (!g_enabled) return;
+    if (!g_boulder_trace_header) {
+        g_boulder_trace_header = true;
+        g_boulder_trace_buf +=
+            "sequence,event,source_state,outcome,frame,epoch,slot,source,"
+            "source_offset,target,writer_pc,return_pc,depth,entry_pc,"
+            "entry_depth,entry_return_pc,r0,r1,r2,r3,r5,r6,r7,r9,r10,r11,"
+            "store_value,field_a_value,field_b_value,candidate_fields_valid,"
+            "attr0,attr1,attr2,raw_x,raw_y,resolved_x,resolved_y\n";
+    }
+    const char* event = s.event ? s.event : "unknown";
+    const char* source_state = s.source_state ? s.source_state : "unknown";
+    const char* outcome = s.outcome ? s.outcome : "unknown";
+    char buf[1600];
+    std::snprintf(
+        buf, sizeof(buf),
+        "%llu,%s,%s,%s,%llu,%llu,%d,0x%08x,0x%08x,0x%08x,0x%08x,"
+        "0x%08x,%u,0x%08x,%u,0x%08x,0x%08x,0x%08x,0x%08x,0x%08x,"
+        "0x%08x,0x%08x,0x%08x,0x%08x,0x%08x,0x%08x,0x%08x,0x%08x,"
+        "0x%08x,%u,0x%04x,0x%04x,0x%04x,%u,%u,%d,%d\n",
+        static_cast<unsigned long long>(++g_boulder_trace_sequence), event,
+        source_state, outcome, static_cast<unsigned long long>(s.frame),
+        static_cast<unsigned long long>(s.epoch), s.slot, s.source,
+        s.source_offset, s.target, s.writer_pc, s.return_pc, s.depth,
+        s.entry_pc, s.entry_depth, s.entry_return_pc, s.r0, s.r1, s.r2,
+        s.r3, s.r5, s.r6, s.r7, s.r9, s.r10, s.r11, s.store_value,
+        s.field_a_value, s.field_b_value, s.candidate_fields_valid ? 1u : 0u,
+        static_cast<unsigned>(s.attr0), static_cast<unsigned>(s.attr1),
+        static_cast<unsigned>(s.attr2), s.raw_x, s.raw_y, s.resolved_x,
+        s.resolved_y);
+    g_boulder_trace_buf += buf;
+    ++g_total_boulder_trace_rows;
+    if (++g_boulder_trace_rows >= kCoverageFlushRows) flush_boulder_trace();
+}
+
+void obj_recorder_note_camera_sample(const ObjCameraSample& s) {
+    if (!g_enabled) return;
+    if (!g_camera_header) {
+        g_camera_header = true;
+        g_camera_buf +=
+            "sequence,event,reason,source_state,source_region,frame,epoch,"
+            "slot,writer_pc,target,source,entry_frame,entry_epoch,entry_pc,"
+            "entry_depth,entry_return_pc,attr0,attr1,attr2,dispcnt,"
+            "bg0_hofs,bg0_vofs,bg1_hofs,bg1_vofs,bg2_hofs,bg2_vofs,"
+            "bg3_hofs,bg3_vofs,field_a_offset,field_a_value,field_b_offset,"
+            "field_b_value,candidate_fields_valid\n";
+    }
+    g_camera_buf += std::to_string(++g_camera_sequence);
+    g_camera_buf += ','; g_camera_buf += s.event;
+    g_camera_buf += ','; g_camera_buf += s.reason;
+    g_camera_buf += ','; g_camera_buf += s.source_state;
+    g_camera_buf += ','; g_camera_buf += s.source_region;
+    const std::uint64_t values[] = {
+        s.frame, s.epoch, static_cast<std::uint64_t>(s.slot), s.writer_pc,
+        s.target, s.source, s.entry_frame, s.entry_epoch, s.entry_pc,
+        s.entry_depth, s.entry_return_pc, s.attr0, s.attr1, s.attr2,
+        s.dispcnt, s.bg0_hofs, s.bg0_vofs, s.bg1_hofs, s.bg1_vofs,
+        s.bg2_hofs, s.bg2_vofs, s.bg3_hofs, s.bg3_vofs, s.field_a_offset,
+        s.field_a_value, s.field_b_offset, s.field_b_value,
+        s.candidate_fields_valid ? 1u : 0u};
+    for (auto v : values) {
+        g_camera_buf += ','; g_camera_buf += std::to_string(v);
+    }
+    g_camera_buf += '\n';
+    ++g_total_camera_samples;
+    if (++g_camera_rows >= kCoverageFlushRows) flush_camera();
+}
 
 void obj_recorder_note_placement(const ObjPlacementSample& s) {
     if (!g_enabled) return;  // OFF: one predictable branch, nothing else.

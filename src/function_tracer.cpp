@@ -20,6 +20,7 @@
 #include "frame_timing.h"
 #include "gba_bus.h"
 #include "gba_ppu.h"
+#include "gba_vram_trace.h"
 #include "host_config_ui.h"
 #include "runtime_arm.h"
 #include "runtime_bus_bridge.h"
@@ -66,6 +67,7 @@ TracerSlot& find_slot(std::uint32_t pc) {
 }
 
 bool g_enabled = false;
+bool g_text_record = false;
 
 // ---- D4: write-failure tracking ------------------------------------------
 // Sticky for the session (not cleared on the next successful write): a
@@ -950,6 +952,12 @@ void draw_tracer_window() {
     // U3: progress meter toward mapping every function.
     ImGui::Text("Functions seen -- session: %zu, all-time: %zu",
                g_session_seen_pcs.size(), g_all_seen_pcs.size());
+    if (g_text_record) {
+        ImGui::TextWrapped(
+            "Text recording: label and mark Normal/Fast settings and the "
+            "same dialogue step; windows compare calls, frame timing, and "
+            "BG0 writes in text_vram_writes.csv.");
+    }
     // U2: stays up until the next window closes.
     if (g_has_last_close) {
         ImGui::TextColored(
@@ -1024,9 +1032,13 @@ bool tracer_wants_keyboard() { return false; }
 void function_tracer_init() {
     const char* e = std::getenv("GBARECOMP_FN_TRACER");
     g_enabled = e != nullptr && e[0] != '\0' && e[0] != '0';
+    const char* text = std::getenv("GSR_TEXT_RECORD");
+    g_text_record = text != nullptr && text[0] != '\0' && text[0] != '0';
     if (!g_enabled) return;
 
     ensure_session_dir();
+    if (g_text_record)
+        gba::vram_trace::set_text_trace_directory(g_session_dir.c_str());
     load_fingerprints();
     g_window_label = "unlabeled";
     g_window_start_frame = runtime_current_frame();

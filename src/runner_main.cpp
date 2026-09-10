@@ -192,6 +192,30 @@ constexpr const char* kGoldenSunAspectLabels[] = {
 constexpr std::uint16_t kGoldenSunAspectWidths[] = {240u, 360u};
 constexpr std::uint16_t kGoldenSunAspectHeights[] = {160u, 240u};
 
+// These are the two object-source spans measured by the bounded writer
+// census. Their endpoints are inclusive observed source addresses, not an
+// inferred allocation extent.
+constexpr std::uint32_t kGoldenSunObjSourceRegionAStart = 0x02033164u;
+constexpr std::uint32_t kGoldenSunObjSourceRegionAEnd = 0x02033848u;
+constexpr std::uint32_t kGoldenSunObjSourceRegionBStart = 0x020367c4u;
+constexpr std::uint32_t kGoldenSunObjSourceRegionBEnd = 0x02036b84u;
+
+const char* golden_sun_obj_source_region(std::uint32_t source) {
+    if (source >= kGoldenSunObjSourceRegionAStart &&
+        source <= kGoldenSunObjSourceRegionAEnd) return "region_a";
+    if (source >= kGoldenSunObjSourceRegionBStart &&
+        source <= kGoldenSunObjSourceRegionBEnd) return "region_b";
+    return nullptr;
+}
+
+void fill_golden_sun_obj_boulder_registers(
+    gsr::ObjBoulderTraceSample* sample);
+void fill_golden_sun_obj_boulder_source_fields(
+    gsr::ObjBoulderTraceSample* sample, std::uint32_t source,
+    std::uint32_t pending_offset, std::uint32_t pending_value);
+void record_golden_sun_obj_boulder_ec_entry(
+    const gsr::ObjSourceCapture& observed);
+
 std::uint32_t g_golden_sun_wide_extra_left = 0;
 std::uint32_t g_golden_sun_wide_extra_right = 0;
 std::uint32_t g_golden_sun_wide_extra_top = 0;
@@ -225,6 +249,9 @@ GoldenSunObjStagingProvenance* find_golden_sun_obj_staging(
     std::uint32_t staging_address);
 bool golden_sun_func1dc8_writer_pc(std::uint32_t pc,
                                    gsr::Func1dc8WriterRoute route);
+bool golden_sun_func1dc8_d4_store_pc(std::uint32_t pc);
+void golden_sun_obj_staging_handoff(std::uint32_t entry_pc,
+    std::uint32_t staging_address_override, std::uint32_t destination_override);
 void reset_golden_sun_func1dc8_writer_diagnostics();
 // WIDE-01 body/shadow identity trace (see the full definition and comment
 // near kGoldenSunObjCommitOrderLimit below); forward-declared so the EC/F0
@@ -237,6 +264,10 @@ void note_golden_sun_obj_commit_order(GoldenSunObjCommitOrderRoute route,
                                       std::uint16_t attr2, bool x_valid,
                                       std::int16_t logical_x, bool y_valid,
                                       std::int16_t logical_y);
+void record_golden_sun_obj_d4_event(
+    const char* reason, int slot, std::uint32_t staging_address,
+    std::uint32_t destination,
+    const GoldenSunObjStagingProvenance* body_staging);
 struct RelocatableCodeImage;
 bool relocatable_resident_at(const RelocatableCodeImage& image,
                              std::uint32_t base, bool* prefix_passed);
@@ -361,6 +392,22 @@ struct GoldenSunObjStagingProvenance {
 std::array<GoldenSunObjStagingProvenance, 256>
     g_golden_sun_obj_staging_provenance{};
 
+// The D4 entry hook runs immediately before its LDM and therefore sees the
+// actual source pointer in R6. Keep that authenticated source across a
+// same-frame resume to the D8 STM; never reconstruct it from OAM attributes.
+struct GoldenSunObjD4SourceCapture {
+    bool valid = false;
+    bool blocked = false;
+    std::uint64_t frame = UINT64_MAX;
+    std::uint64_t auth_epoch = 0;
+    std::uint32_t entry_pc = 0;
+    std::uint32_t staging_address = 0;
+    std::uint32_t target_address = 0;
+};
+std::array<GoldenSunObjD4SourceCapture,
+           gsr::widescreen::kGoldenSunOamShadowSlotCount>
+    g_golden_sun_obj_d4_source_captures{};
+
 // F0's entry sees the source record before the generated writer advances R6;
 // the later OAM write sees the destination slot. Keep that exact handoff for
 // one frame so culling never has to infer a source from a reused OAM slot.
@@ -379,7 +426,20 @@ struct GoldenSunObjF0Context {
 std::array<GoldenSunObjF0Context,
            gsr::widescreen::kGoldenSunOamShadowSlotCount>
     g_golden_sun_obj_f0_contexts{};
+// Identity-invalid entries are kept separately for the recorder. They must
+// never participate in the trusted context lookup, even when Enhanced
+// Options and recording are enabled together.
+std::array<GoldenSunObjF0Context,
+           gsr::widescreen::kGoldenSunOamShadowSlotCount>
+    g_golden_sun_obj_f0_rejected_contexts{};
 std::uint64_t g_golden_sun_obj_f0_context_frame = UINT64_MAX;
+// Recorder-only, one pending source per hardware slot. The exact destination
+// address also distinguishes the primary and alternate shadow tables; a
+// collision fails the join instead of borrowing another table's source.
+std::array<gsr::ObjSourceCapture,
+           gsr::widescreen::kGoldenSunOamShadowSlotCount>
+    g_golden_sun_obj_f0_source_observations{};
+std::uint64_t g_obj_lifetime_dma = 0;
 std::array<GoldenSunObjB27EParentRoute, 256>
     g_golden_sun_obj_b27e_parent_routes{};
 std::array<std::uint64_t,
@@ -804,6 +864,16 @@ std::array<GoldenSunExperimentalCullLogState,
 unsigned g_golden_sun_experimental_cull_logs = 0;
 std::uint64_t g_golden_sun_experimental_cull_logs_dropped = 0;
 bool g_golden_sun_experimental_cull_write_in_progress = false;
+// Payload-free production seam census. These counters distinguish a missing
+// fast-IWRAM callback from a writer-identity or source-identity rejection in
+// a normal Enhanced run without enabling the full recorder.
+std::uint64_t g_golden_sun_obj_oam_observer_calls = 0;
+std::uint64_t g_golden_sun_obj_f0_commits = 0;
+std::uint64_t g_golden_sun_obj_f0_placement_calls = 0;
+std::uint64_t g_golden_sun_obj_f0_identified = 0;
+std::uint64_t g_golden_sun_obj_f0_considered = 0;
+std::uint64_t g_golden_sun_obj_f0_placed = 0;
+std::uint64_t g_golden_sun_obj_f0_placed_prev_frame = 0;
 
 const char* golden_sun_field_margin_region(int hw_x, int screen_y,
                                            std::size_t* out_region);
@@ -1734,32 +1804,115 @@ void record_golden_sun_b328_accepted_f0_writer(
     }
 }
 
+void record_golden_sun_shadow_cpu_writes(
+    std::uint32_t writer_pc, std::uint32_t address, std::uint32_t size) {
+    if (!gsr::obj_recorder_enabled() || size == 0u) return;
+    const std::uint64_t write_first = address;
+    const std::uint64_t write_last = write_first + size;
+    const std::uint32_t tables[] = {
+        gsr::widescreen::kGoldenSunOamShadowStart,
+        gsr::widescreen::kGoldenSunOamShadowAltStart};
+    for (const std::uint32_t table : tables) {
+        const std::uint64_t table_first = table;
+        const std::uint64_t table_last = table_first +
+            gsr::widescreen::kGoldenSunOamBytes;
+        if (write_first >= table_last || write_last <= table_first) continue;
+        const std::uint64_t overlap_first =
+            std::max(write_first, table_first);
+        const std::uint64_t overlap_last =
+            std::min(write_last, table_last);
+        const int first_slot = static_cast<int>(
+            (overlap_first - table_first) /
+            gsr::widescreen::kGoldenSunOamShadowSlotBytes);
+        const int last_slot = static_cast<int>(
+            (overlap_last - 1u - table_first) /
+            gsr::widescreen::kGoldenSunOamShadowSlotBytes);
+        for (int slot = first_slot; slot <= last_slot; ++slot) {
+            const std::uint32_t slot_address = table +
+                static_cast<std::uint32_t>(slot) *
+                    gsr::widescreen::kGoldenSunOamShadowSlotBytes;
+            const std::uint16_t attr0 = bus_read_u16(slot_address);
+            const std::uint16_t attr1 = bus_read_u16(slot_address + 2u);
+            const std::uint16_t attr2 = bus_read_u16(slot_address + 4u);
+            const auto touched = [&](std::uint32_t offset) {
+                const std::uint64_t attr_first = slot_address + offset;
+                const std::uint64_t attr_last = attr_first + 2u;
+                return write_first < attr_last && write_last > attr_first;
+            };
+            gsr::ObjShadowWriteSample sample;
+            sample.event = "cpu";
+            sample.frame = runtime_current_frame();
+            sample.epoch = g_golden_sun_field_auth_epoch;
+            sample.dma = g_obj_lifetime_dma;
+            sample.slot = slot;
+            sample.writer_pc = writer_pc;
+            sample.address = address;
+            sample.size = size;
+            sample.attr_mask = static_cast<std::uint8_t>(
+                (touched(0u) ? 1u : 0u) | (touched(2u) ? 2u : 0u) |
+                (touched(4u) ? 4u : 0u));
+            sample.attr0 = attr0;
+            sample.attr1 = attr1;
+            sample.attr2 = attr2;
+            gsr::obj_recorder_note_shadow_write(sample);
+        }
+    }
+}
+
 bool golden_sun_obj_record_identity(std::uint32_t staging,
                                              std::uint32_t* record_base,
                                              bool* shadow) {
+    // The measured actor-record array: base 0x03002000, stride 0x38, body
+    // coordinates at +0x00 and the paired shadow at +0x0C (FACTS.md,
+    // "Sprites, NPCs and shadows").
+    //
+    // This predicate used to stop at a measured 0x030022E0 and then admit one
+    // hand-authenticated extra body, 0x03002348 (N=15). That end was never a
+    // property of the guest -- it was how far the producer audit had reached
+    // -- so every actor past the audited prefix was refused a trusted
+    // position and fell back to the native rectangle, which is what clips a
+    // sprite standing in the expanded top margin. Authenticating one actor at
+    // a time does not scale to the whole cast, so what is checked here is the
+    // shape of the array, and the bound is hardware rather than an audit
+    // boundary.
+    //
+    // Admission is deliberately not proof. The caller
+    // (golden_sun_obj_resolve_placement) still requires the record's own
+    // staged ATTR0/1/2 to equal the committed OAM attributes, its staged
+    // coordinates to truncate to the committed OAM bytes, and its staging
+    // entry to carry the same frame and the same auth epoch. A pointer that
+    // is merely stride-aligned cannot pass those gates.
     constexpr std::uint32_t kRecordBase = 0x03002000u;
-    constexpr std::uint32_t kRecordEnd = 0x030022E0u;
     constexpr std::uint32_t kRecordStride = 0x38u;
-    if (!record_base || !shadow || staging < kRecordBase ||
-        staging >= kRecordEnd) return false;
+    // Hardware bound only: the whole record must lie inside IWRAM so the
+    // caller's record reads stay in range.
+    constexpr std::uint32_t kIwramEnd = 0x03008000u;
+    if (!record_base || !shadow || staging < kRecordBase) return false;
     const std::uint32_t offset = staging - kRecordBase;
     const std::uint32_t sub_offset = offset % kRecordStride;
     if (sub_offset != 0u && sub_offset != 0x0Cu) return false;
-    *record_base = staging - sub_offset;
+    const std::uint32_t base = staging - sub_offset;
+    if (base > kIwramEnd - kRecordStride) return false;
+    *record_base = base;
     *shadow = sub_offset == 0x0Cu;
     return true;
 }
 
-void remember_golden_sun_obj_f0_context(
+void reset_golden_sun_obj_f0_contexts_for_frame(std::uint64_t frame) {
+    if (g_golden_sun_obj_f0_context_frame == frame) return;
+    g_golden_sun_obj_f0_contexts = {};
+    g_golden_sun_obj_f0_rejected_contexts = {};
+    g_golden_sun_obj_f0_context_frame = frame;
+}
+
+void remember_golden_sun_obj_f0_context_in(
+    std::array<GoldenSunObjF0Context,
+               gsr::widescreen::kGoldenSunOamShadowSlotCount>& contexts,
     std::uint64_t frame, std::uint32_t depth, std::uint32_t return_pc,
     std::uint32_t staging, std::uint32_t record_base, bool shadow,
     std::uint16_t attr0, std::uint16_t attr1, std::uint16_t attr2) {
-    if (g_golden_sun_obj_f0_context_frame != frame) {
-        g_golden_sun_obj_f0_contexts = {};
-        g_golden_sun_obj_f0_context_frame = frame;
-    }
     GoldenSunObjF0Context* context = nullptr;
-    for (auto& candidate : g_golden_sun_obj_f0_contexts) {
+    for (auto& candidate : contexts) {
         if (candidate.valid && candidate.staging == staging &&
             candidate.depth == depth && candidate.return_pc == return_pc) {
             context = &candidate;
@@ -1767,7 +1920,7 @@ void remember_golden_sun_obj_f0_context(
         }
     }
     if (!context) {
-        for (auto& candidate : g_golden_sun_obj_f0_contexts) {
+        for (auto& candidate : contexts) {
             if (!candidate.valid) {
                 context = &candidate;
                 break;
@@ -1781,26 +1934,213 @@ void remember_golden_sun_obj_f0_context(
                 attr0, attr1, attr2};
 }
 
+void remember_golden_sun_obj_f0_context(
+    std::uint64_t frame, std::uint32_t depth, std::uint32_t return_pc,
+    std::uint32_t staging, std::uint32_t record_base, bool shadow,
+    std::uint16_t attr0, std::uint16_t attr1, std::uint16_t attr2) {
+    reset_golden_sun_obj_f0_contexts_for_frame(frame);
+    remember_golden_sun_obj_f0_context_in(
+        g_golden_sun_obj_f0_contexts, frame, depth, return_pc, staging,
+        record_base, shadow, attr0, attr1, attr2);
+}
+
+void remember_golden_sun_obj_f0_rejected_context(
+    std::uint64_t frame, std::uint32_t depth, std::uint32_t return_pc,
+    std::uint32_t staging, std::uint16_t attr0, std::uint16_t attr1,
+    std::uint16_t attr2) {
+    reset_golden_sun_obj_f0_contexts_for_frame(frame);
+    remember_golden_sun_obj_f0_context_in(
+        g_golden_sun_obj_f0_rejected_contexts, frame, depth, return_pc,
+        staging, 0u, false, attr0, attr1, attr2);
+}
+
+// How stale a per-frame record may be and still describe the sprite being
+// committed.
+//
+// Measured in logs/objrec_20260909_203451 (the boulder cutscene): of 4,339
+// committed sprites, 3,479 failed with reason "context-frame" -- the context
+// table's stamp did not equal the commit's frame -- and not one failed with
+// "context-no-match". In all 647 frames that contained both a success and a
+// failure, every failure came before every success, with no interleaving at
+// all. That is the signature of ordering, not of a sprite the hooks never
+// see: the table is cleared at the frame's first staging entry, so everything
+// committed before that point is looked up against the previous frame's stamp
+// and refused even though the matching record is still resident. Because the
+// table is cleared exactly once per frame, one frame is the whole window --
+// this is the measured bound, not a chosen tolerance.
+//
+// Age is not what authenticates a record, and never was. The caller still
+// requires an exact ATTR0/1/2 match and requires the staged coordinates to
+// truncate to the committed OAM bytes, so a stale position that no longer
+// describes this sprite is still rejected.
+constexpr std::uint64_t kGoldenSunObjRecordMaxFrameAge = 1u;
+
+bool golden_sun_obj_record_frame_current(std::uint64_t writer_frame,
+                                         std::uint64_t record_frame) {
+    return record_frame <= writer_frame &&
+           writer_frame - record_frame <= kGoldenSunObjRecordMaxFrameAge;
+}
+
 const GoldenSunObjF0Context* find_golden_sun_obj_f0_context(
     std::uint64_t frame, std::uint32_t depth, std::uint32_t return_pc,
-    std::uint16_t attr0, std::uint16_t attr1, std::uint16_t attr2) {
-    if (g_golden_sun_obj_f0_context_frame != frame) return nullptr;
+    std::uint16_t attr0, std::uint16_t attr1, std::uint16_t attr2,
+    const char** reason) {
+    *reason = "context-frame";
+    if (!golden_sun_obj_record_frame_current(
+            frame, g_golden_sun_obj_f0_context_frame)) return nullptr;
+    *reason = "context-no-match";
     const GoldenSunObjF0Context* found = nullptr;
     for (const auto& candidate : g_golden_sun_obj_f0_contexts) {
-        if (!candidate.valid || candidate.frame != frame ||
+        if (!candidate.valid ||
+            !golden_sun_obj_record_frame_current(frame, candidate.frame) ||
             candidate.depth != depth || candidate.return_pc != return_pc ||
             candidate.attr0 != attr0 || candidate.attr1 != attr1 ||
             candidate.attr2 != attr2) continue;
-        if (found) return nullptr; // duplicate identity: fail closed
+        if (found) { *reason = "context-duplicate"; return nullptr; }
+        found = &candidate;
+    }
+    if (found) *reason = "ok";
+    return found;
+}
+
+
+const GoldenSunObjF0Context* find_golden_sun_obj_f0_rejected_context(
+    std::uint64_t frame, std::uint32_t depth, std::uint32_t return_pc,
+    std::uint16_t attr0, std::uint16_t attr1, std::uint16_t attr2,
+    const char** reason) {
+    if (!golden_sun_obj_record_frame_current(
+            frame, g_golden_sun_obj_f0_context_frame)) return nullptr;
+    const GoldenSunObjF0Context* found = nullptr;
+    for (const auto& candidate : g_golden_sun_obj_f0_rejected_contexts) {
+        if (!candidate.valid ||
+            !golden_sun_obj_record_frame_current(frame, candidate.frame) ||
+            candidate.depth != depth || candidate.return_pc != return_pc ||
+            candidate.attr0 != attr0 || candidate.attr1 != attr1 ||
+            candidate.attr2 != attr2) continue;
+        if (found) {
+            if (reason) *reason = "context-duplicate";
+            return nullptr;
+        }
         found = &candidate;
     }
     return found;
 }
 
+// Why a committed sprite found no matching context.
+//
+// Measured 2026-09-09 in logs/objrec_20260909_211716: after the one-frame
+// window, 3,988 of 6,319 commits fail with "context-no-match" and only 219
+// with "context-frame", so a context table for the right frame exists and
+// simply has no entry for these sprites. They cluster on one call site
+// (writer 0x030038f0 returning to 0x030038b4, 2,707 failures against 80
+// successes) and on one sprite class (256-colour tall sprites, ATTR2 0xd524)
+// that never appears among the successes.
+//
+// The context key is (frame, depth, return_pc, ATTR0/1/2). EC entry and the
+// F0 store are two points in the same routine invocation, so depth and
+// return_pc cannot disagree for one sprite -- which leaves two candidates,
+// and this census separates them: either the EC seam never ran for that call
+// (no context with that depth/return_pc at all), or it ran and read a
+// different ATTR triple than the one committed, in which case the pointer it
+// read from is what we need to see. Bounded, deduped, diagnostics-only, and
+// consulted by nothing that draws.
+struct GoldenSunObjContextNearMiss {
+    bool used = false;
+    std::uint32_t return_pc = 0;
+    std::uint32_t depth = 0;
+    std::uint32_t staging = 0;
+    bool any_context = false;
+    std::uint16_t context_attr0 = 0, context_attr1 = 0, context_attr2 = 0;
+    std::uint16_t committed_attr0 = 0, committed_attr1 = 0, committed_attr2 = 0;
+    std::uint64_t hits = 0;
+};
+constexpr std::size_t kGoldenSunObjContextNearMissLimit = 32;
+std::array<GoldenSunObjContextNearMiss, kGoldenSunObjContextNearMissLimit>
+    g_golden_sun_obj_context_near_misses{};
+std::uint64_t g_golden_sun_obj_context_near_miss_overflow = 0;
+
+void note_golden_sun_obj_context_near_miss(
+    std::uint64_t frame, std::uint32_t depth, std::uint32_t return_pc,
+    std::uint16_t attr0, std::uint16_t attr1, std::uint16_t attr2) {
+    // Find any context from this same call, ignoring the attributes that are
+    // exactly what failed to match.
+    const GoldenSunObjF0Context* found = nullptr;
+    for (const auto* table : {&g_golden_sun_obj_f0_contexts,
+                              &g_golden_sun_obj_f0_rejected_contexts}) {
+        for (const auto& candidate : *table) {
+            if (!candidate.valid || candidate.depth != depth ||
+                candidate.return_pc != return_pc ||
+                !golden_sun_obj_record_frame_current(frame, candidate.frame))
+                continue;
+            found = &candidate;
+            break;
+        }
+        if (found) break;
+    }
+    const std::uint32_t staging = found ? found->staging : 0u;
+    GoldenSunObjContextNearMiss* slot = nullptr;
+    for (auto& candidate : g_golden_sun_obj_context_near_misses) {
+        if (candidate.used && candidate.return_pc == return_pc &&
+            candidate.depth == depth && candidate.staging == staging &&
+            candidate.any_context == (found != nullptr)) {
+            slot = &candidate;
+            break;
+        }
+    }
+    if (!slot) {
+        for (auto& candidate : g_golden_sun_obj_context_near_misses) {
+            if (candidate.used) continue;
+            candidate = {};
+            candidate.used = true;
+            candidate.return_pc = return_pc;
+            candidate.depth = depth;
+            candidate.staging = staging;
+            candidate.any_context = found != nullptr;
+            candidate.context_attr0 = found ? found->attr0 : 0u;
+            candidate.context_attr1 = found ? found->attr1 : 0u;
+            candidate.context_attr2 = found ? found->attr2 : 0u;
+            candidate.committed_attr0 = attr0;
+            candidate.committed_attr1 = attr1;
+            candidate.committed_attr2 = attr2;
+            slot = &candidate;
+            break;
+        }
+    }
+    if (!slot) {
+        ++g_golden_sun_obj_context_near_miss_overflow;
+        return;
+    }
+    ++slot->hits;
+}
+
+void report_golden_sun_obj_context_near_misses() {
+    for (const auto& miss : g_golden_sun_obj_context_near_misses) {
+        if (!miss.used) continue;
+        std::fprintf(stderr,
+                     "[wide-obj-nearmiss] return_pc=0x%08x depth=%u "
+                     "context=%s staging=0x%08x "
+                     "ctx_attr=%04x/%04x/%04x oam_attr=%04x/%04x/%04x "
+                     "hits=%llu\n",
+                     miss.return_pc, miss.depth,
+                     miss.any_context ? "yes" : "none", miss.staging,
+                     miss.context_attr0, miss.context_attr1, miss.context_attr2,
+                     miss.committed_attr0, miss.committed_attr1,
+                     miss.committed_attr2,
+                     static_cast<unsigned long long>(miss.hits));
+    }
+    if (g_golden_sun_obj_context_near_miss_overflow != 0u) {
+        std::fprintf(stderr, "[wide-obj-nearmiss-overflow] dropped=%llu\n",
+                     static_cast<unsigned long long>(
+                         g_golden_sun_obj_context_near_miss_overflow));
+    }
+}
+
+
 // One committed sprite's full-precision position, or the reason there isn't
 // one. See widescreen_policy.h's GoldenSunObjPlacementOutcome for why this
 // vocabulary exists and what each outcome means for vertical wrap.
 struct GoldenSunObjPlacement {
+    gsr::ObjLifetimeSample diagnostic{};
     // False for an entry that is disabled, empty or dormant -- not a sprite,
     // so neither the culler nor the census should count it.
     bool considered = false;
@@ -1857,6 +2197,7 @@ GoldenSunObjPlacement golden_sun_obj_resolve_placement(
     out.size = static_cast<unsigned>((attr1 >> 14) & 0x3u);
     if (!gsr::widescreen::golden_sun_obj_dimensions(out.shape, out.size,
                                                     &out.width, &out.height)) {
+        out.diagnostic.reason = "invalid-shape-size";
         out.outcome = Outcome::InvalidShapeSize;
         return out;
     }
@@ -1869,11 +2210,32 @@ GoldenSunObjPlacement golden_sun_obj_resolve_placement(
     // population that wraps. `out.affine` carries the restriction to the
     // culler instead. 2026-09-06.
     const auto* context = find_golden_sun_obj_f0_context(
-        writer_frame, writer_depth, writer_return_pc, attr0, attr1, attr2);
+        writer_frame, writer_depth, writer_return_pc, attr0, attr1, attr2,
+        &out.diagnostic.reason);
+    // Rejected contexts are diagnostic-only and are considered only after
+    // the trusted lookup fails. This keeps them from creating ambiguity for
+    // an otherwise valid placement when both toggles are enabled.
+    if (!context && gsr::obj_recorder_enabled()) {
+        context = find_golden_sun_obj_f0_rejected_context(
+            writer_frame, writer_depth, writer_return_pc, attr0, attr1,
+            attr2, &out.diagnostic.reason);
+    }
+    if (!context) {
+        note_golden_sun_obj_context_near_miss(writer_frame, writer_depth,
+                                              writer_return_pc, attr0, attr1,
+                                              attr2);
+    }
+    out.diagnostic.context_frame = g_golden_sun_obj_f0_context_frame;
+    // For an identity-rejected F0 source, retain the raw pointer in the
+    // lifetime row so the next capture can verify it at the writer seam. It
+    // remains untrusted: record_identified stays false and the predicate
+    // below still controls placement/culling.
+    if (context) out.diagnostic.staging = context->staging;
     std::uint32_t record_base = 0;
     bool shadow = false;
     if (!context || !golden_sun_obj_record_identity(context->staging,
                                                     &record_base, &shadow)) {
+        if (context) out.diagnostic.reason = "record-identity";
         out.outcome = Outcome::SourceUnavailable;
         return out;
     }
@@ -1902,7 +2264,12 @@ GoldenSunObjPlacement golden_sun_obj_resolve_placement(
     const bool body_provenance_valid = staging && staging->valid &&
         staging->x_valid && staging->y_valid &&
         staging->auth_epoch == g_golden_sun_field_auth_epoch &&
-        staging->frame == writer_frame;
+        golden_sun_obj_record_frame_current(writer_frame, staging->frame);
+    out.diagnostic.staging = context->staging;
+    if (staging) {
+        out.diagnostic.body_frame = staging->frame;
+        out.diagnostic.body_epoch = staging->auth_epoch;
+    }
     int checked_x = 0, checked_y = 0;
     const bool body_raw_matches = body_provenance_valid &&
         gsr::widescreen::golden_sun_obj_resolve_oam_x(
@@ -1912,8 +2279,18 @@ GoldenSunObjPlacement golden_sun_obj_resolve_placement(
     const bool body_identity_matches = body_provenance_valid &&
         (shadow || (body_attr0 == attr0 && body_attr1 == attr1 &&
                     body_attr2 == attr2));
+    // Independent bits retain simultaneous failures, rather than only the first.
+    out.diagnostic.checks = (body_attrs_valid ? 1u : 0u) |
+        (body_dimensions_valid ? 2u : 0u) | (staging && staging->valid ? 4u : 0u) |
+        (staging && staging->x_valid ? 8u : 0u) |
+        (staging && staging->y_valid ? 16u : 0u) |
+        (staging && staging->auth_epoch == g_golden_sun_field_auth_epoch ? 32u : 0u) |
+        (staging && golden_sun_obj_record_frame_current(
+             writer_frame, staging->frame) ? 64u : 0u) |
+        (body_raw_matches ? 128u : 0u) | (body_identity_matches ? 256u : 0u);
     if (!body_attrs_valid || !body_dimensions_valid || !body_provenance_valid ||
         !body_raw_matches || !body_identity_matches) {
+        out.diagnostic.reason = "body-checks";
         out.outcome = Outcome::PlacementUnavailable;
         return out;
     }
@@ -1972,6 +2349,222 @@ void trace_golden_sun_experimental_cull(
                  size, width, height, culled ? "culled" : "kept", reason);
 }
 
+void observe_golden_sun_obj_f0_source(
+    std::uint32_t entry_pc, std::uint64_t frame, std::uint32_t depth,
+    std::uint32_t return_pc, std::uint32_t source) {
+    if (!gsr::obj_recorder_enabled()) return;
+    const std::uint32_t target = g_cpu.R[0];
+    const int slot =
+        gsr::widescreen::golden_sun_oam_shadow_slot_in_any_table(target, 0u);
+    if (slot < 0) return;
+    auto& observed = g_golden_sun_obj_f0_source_observations[
+        static_cast<std::size_t>(slot)];
+    observed = {};
+    observed.state = "entry";
+    observed.frame = frame;
+    observed.epoch = g_golden_sun_field_auth_epoch;
+    observed.pc = entry_pc;
+    observed.source = source;
+    observed.target = target;
+    observed.depth = depth;
+    observed.return_pc = return_pc;
+
+    // The authenticated EC LDM consumes three words. Observe only their OAM
+    // identity fields and only in physical RAM, never ROM, BIOS or MMIO.
+    // Placement's IWRAM-only reader remains unchanged: this wider read is
+    // diagnostic evidence for an unknown source, not permission to draw it.
+    const bool readable = (source & 3u) == 0u &&
+        ((source >= 0x02000000u && source <= 0x02040000u - 12u) ||
+         (source >= 0x03000000u && source <= 0x03008000u - 12u));
+    if (readable) {
+        const auto word1 = bus_read_u32(source + 4u);
+        const auto word2 = bus_read_u32(source + 8u);
+        observed.attr0 = static_cast<std::uint16_t>(word1);
+        observed.attr1 = static_cast<std::uint16_t>(word1 >> 16);
+        observed.attr2 = static_cast<std::uint16_t>(word2);
+        observed.flags |= 1u;
+    }
+    std::uint32_t base = 0;
+    bool shadow = false;
+    const bool known = golden_sun_obj_record_identity(source, &base, &shadow);
+    if (known) observed.flags |= 2u;
+    observed.stage_source = known && shadow ? base : source;
+    const auto* staged = find_golden_sun_obj_staging(observed.stage_source);
+    if (staged) {
+        observed.flags |= 4u | (staged->x_valid ? 8u : 0u) |
+            (staged->y_valid ? 16u : 0u);
+        observed.stage_frame = staged->frame;
+        observed.stage_epoch = staged->auth_epoch;
+        if (staged->x_valid) observed.stage_x = staged->logical_x;
+        if (staged->y_valid) observed.stage_y = staged->logical_y;
+    }
+    record_golden_sun_obj_boulder_ec_entry(observed);
+}
+
+gsr::ObjSourceCapture consume_golden_sun_obj_f0_source(
+    int slot, std::uint32_t target, std::uint32_t writer_pc,
+    std::uint64_t frame, std::uint32_t depth, std::uint32_t return_pc,
+    std::uint16_t attr0, std::uint16_t attr1, std::uint16_t attr2) {
+    gsr::ObjSourceCapture result;
+    if (!gsr::obj_recorder_enabled()) return result;
+    result.state = "missing-entry";
+    if (slot < 0 || static_cast<std::size_t>(slot) >=
+                        g_golden_sun_obj_f0_source_observations.size())
+        return result;
+    auto& pending = g_golden_sun_obj_f0_source_observations[
+        static_cast<std::size_t>(slot)];
+    if (pending.pc == 0u) return result;
+    result = pending;
+    pending = {};  // A source belongs to one commit, not later slot occupants.
+    if (result.target != target || result.frame != frame ||
+        result.epoch != g_golden_sun_field_auth_epoch ||
+        result.depth != depth || result.return_pc != return_pc ||
+        result.pc + (gsr::kFunc1dc8F0Offset - gsr::kFunc1dc8EcOffset) !=
+            writer_pc) {
+        result.state = "entry-context-mismatch";
+    } else if ((result.flags & 1u) == 0u) {
+        result.state = "entry-unreadable";
+    } else if (result.attr0 != attr0 || result.attr1 != attr1 ||
+               result.attr2 != attr2) {
+        result.state = "entry-attrs-mismatch";
+    } else {
+        result.state = "matched-entry";
+    }
+    return result;
+}
+
+void note_golden_sun_obj_camera_sample(const gsr::ObjLifetimeSample& d,
+                                       std::uint32_t writer_pc) {
+    if (!gsr::obj_recorder_enabled() || std::strcmp(d.event, "commit") != 0)
+        return;
+    const std::uint32_t source = d.entry.source;
+    const char* region = golden_sun_obj_source_region(source);
+    if (!region) return;
+    const gba::GbaBus* bus = gbarecomp::active_bus();
+    if (!bus) return;
+    const std::uint8_t* io = bus->io().raw();
+    const auto io16 = [io](std::uint32_t offset) {
+        return static_cast<std::uint16_t>(io[offset] |
+                                          (io[offset + 1u] << 8));
+    };
+
+    gsr::ObjCameraSample sample;
+    sample.reason = d.reason;
+    sample.source_state = d.entry.state;
+    sample.source_region = region;
+    sample.frame = d.frame;
+    sample.epoch = d.epoch;
+    sample.slot = d.slot;
+    sample.writer_pc = writer_pc;
+    sample.target = d.target;
+    sample.source = source;
+    sample.entry_frame = d.entry.frame;
+    sample.entry_epoch = d.entry.epoch;
+    sample.entry_pc = d.entry.pc;
+    sample.entry_depth = d.entry.depth;
+    sample.entry_return_pc = d.entry.return_pc;
+    sample.attr0 = d.attr0;
+    sample.attr1 = d.attr1;
+    sample.attr2 = d.attr2;
+    sample.dispcnt = io16(0x00u);
+    sample.bg0_hofs = io16(0x10u);
+    sample.bg0_vofs = io16(0x12u);
+    sample.bg1_hofs = io16(0x14u);
+    sample.bg1_vofs = io16(0x16u);
+    sample.bg2_hofs = io16(0x18u);
+    sample.bg2_vofs = io16(0x1Au);
+    sample.bg3_hofs = io16(0x1Cu);
+    sample.bg3_vofs = io16(0x1Eu);
+
+    // The writer census identified these two Region B field offsets. Read
+    // them only when both complete words remain inside the measured span;
+    // there is no inferred table extent beyond that span.
+    const std::uint32_t region_end = kGoldenSunObjSourceRegionBEnd;
+    const auto field_in_span = [source, region_end](std::uint32_t offset) {
+        return source <= region_end && offset <= region_end - source &&
+               4u <= region_end - source - offset + 1u;
+    };
+    if (std::strcmp(region, "region_b") == 0 &&
+        field_in_span(0x0Cu) && field_in_span(0x14u)) {
+        sample.field_a_offset = 0x0Cu;
+        sample.field_a_value = bus_read_u32(source + 0x0Cu);
+        sample.field_b_offset = 0x14u;
+        sample.field_b_value = bus_read_u32(source + 0x14u);
+        sample.candidate_fields_valid = true;
+    }
+    gsr::obj_recorder_note_camera_sample(sample);
+}
+
+void record_golden_sun_obj_boulder_ec_entry(
+    const gsr::ObjSourceCapture& observed) {
+    const char* region = golden_sun_obj_source_region(observed.source);
+    if (!gsr::obj_recorder_enabled() || !region ||
+        std::strcmp(region, "region_b") != 0)
+        return;
+    gsr::ObjBoulderTraceSample sample;
+    sample.event = "ec-entry";
+    sample.source_state = "entry";
+    sample.outcome = "not-committed";
+    sample.frame = observed.frame;
+    sample.epoch = observed.epoch;
+    sample.slot = gsr::widescreen::golden_sun_oam_shadow_slot_in_any_table(
+        observed.target, 0u);
+    sample.target = observed.target;
+    sample.writer_pc = observed.pc;
+    sample.return_pc = observed.return_pc;
+    sample.depth = observed.depth;
+    sample.entry_pc = observed.pc;
+    sample.entry_depth = observed.depth;
+    sample.entry_return_pc = observed.return_pc;
+    fill_golden_sun_obj_boulder_registers(&sample);
+    sample.attr0 = observed.attr0;
+    sample.attr1 = observed.attr1;
+    sample.attr2 = observed.attr2;
+    sample.raw_x = observed.attr1 & 0x1FFu;
+    sample.raw_y = observed.attr0 & 0x00FFu;
+    fill_golden_sun_obj_boulder_source_fields(&sample, observed.source, 0u,
+                                              0u);
+    gsr::obj_recorder_note_boulder_trace(sample);
+}
+
+void record_golden_sun_obj_boulder_commit(
+    const gsr::ObjSourceCapture& observed, const GoldenSunObjPlacement& placement,
+    std::uint32_t writer_pc, std::uint64_t frame, std::uint32_t depth,
+    std::uint32_t return_pc, int slot, std::uint32_t target,
+    std::uint16_t attr0, std::uint16_t attr1, std::uint16_t attr2) {
+    const char* region = golden_sun_obj_source_region(observed.source);
+    if (!gsr::obj_recorder_enabled() || !region ||
+        std::strcmp(region, "region_b") != 0)
+        return;
+    gsr::ObjBoulderTraceSample sample;
+    sample.event = "f0-commit";
+    sample.source_state = observed.state;
+    sample.outcome =
+        gsr::widescreen::golden_sun_obj_placement_outcome_name(
+            placement.outcome);
+    sample.frame = frame;
+    sample.epoch = g_golden_sun_field_auth_epoch;
+    sample.slot = slot;
+    sample.target = target;
+    sample.writer_pc = writer_pc;
+    sample.return_pc = return_pc;
+    sample.depth = depth;
+    sample.entry_pc = observed.pc;
+    sample.entry_depth = observed.depth;
+    sample.entry_return_pc = observed.return_pc;
+    fill_golden_sun_obj_boulder_registers(&sample);
+    sample.attr0 = attr0;
+    sample.attr1 = attr1;
+    sample.attr2 = attr2;
+    sample.raw_x = attr1 & 0x1FFu;
+    sample.raw_y = attr0 & 0x00FFu;
+    sample.resolved_x = placement.resolved_x;
+    sample.resolved_y = placement.resolved_y;
+    fill_golden_sun_obj_boulder_source_fields(&sample, observed.source, 0u,
+                                              0u);
+    gsr::obj_recorder_note_boulder_trace(sample);
+}
+
 void golden_sun_obj_f0_entry_capture(std::uint32_t entry_pc) {
     // EC is the exact generated entry immediately before the LDM that
     // destroys R6. The relocation-aware resolver authenticates its image and
@@ -1986,6 +2579,7 @@ void golden_sun_obj_f0_entry_capture(std::uint32_t entry_pc) {
     const std::uint32_t depth = runtime_call_stack_depth();
     const std::uint32_t return_pc = golden_sun_obj_call_return_pc(depth);
     const std::uint32_t staging = g_cpu.R[6];
+    observe_golden_sun_obj_f0_source(entry_pc, frame, depth, return_pc, staging);
     link_golden_sun_b328_parentless_ec(
         frame, staging, depth, return_pc, entry_pc);
     if (golden_sun_experimental_fixes_enabled() ||
@@ -1993,13 +2587,22 @@ void golden_sun_obj_f0_entry_capture(std::uint32_t entry_pc) {
         std::uint16_t attr0 = 0, attr1 = 0, attr2 = 0;
         std::uint32_t record_base = 0;
         bool shadow = false;
+        // Keep a readable but identity-rejected pointer in the same
+        // frame/depth/return context. This is an observational source-to-F0
+        // join; golden_sun_obj_resolve_placement still applies the identity
+        // predicate before returning any trusted placement.
         if (read_golden_sun_obj_staging_attrs(staging, &attr0, &attr1,
-                                              &attr2) &&
-            golden_sun_obj_record_identity(
-                staging, &record_base, &shadow)) {
-            remember_golden_sun_obj_f0_context(
-                frame, depth, return_pc, staging, record_base, shadow, attr0,
-                attr1, attr2);
+                                              &attr2)) {
+            const bool record_identity = golden_sun_obj_record_identity(
+                staging, &record_base, &shadow);
+            if (record_identity) {
+                remember_golden_sun_obj_f0_context(
+                    frame, depth, return_pc, staging, record_base, shadow,
+                    attr0, attr1, attr2);
+            } else if (gsr::obj_recorder_enabled()) {
+                remember_golden_sun_obj_f0_rejected_context(
+                    frame, depth, return_pc, staging, attr0, attr1, attr2);
+            }
         }
     }
     // WIDE-01 body/shadow identity: EC fires unconditionally on every
@@ -2077,23 +2680,70 @@ void golden_sun_obj_f0_entry_capture(std::uint32_t entry_pc) {
     }
 }
 
+void record_golden_sun_obj_d4_event(
+    const char* reason, int slot, std::uint32_t staging_address,
+    std::uint32_t destination,
+    const GoldenSunObjStagingProvenance* body_staging) {
+    if (!gsr::obj_recorder_enabled()) return;
+    gsr::ObjLifetimeSample d;
+    d.event = "d4";
+    d.reason = reason;
+    d.frame = runtime_current_frame();
+    d.epoch = g_golden_sun_field_auth_epoch;
+    d.dma = g_obj_lifetime_dma;
+    d.slot = slot;
+    d.source = staging_address;
+    d.staging = staging_address;
+    d.context_frame = d.frame;
+    d.body_frame = body_staging ? body_staging->frame : UINT64_MAX;
+    d.body_epoch = body_staging ? body_staging->auth_epoch : 0;
+    d.target = destination;
+    d.checks = body_staging && body_staging->valid ? 4u : 0u;
+    gsr::obj_recorder_note_lifetime(d);
+}
+
+bool golden_sun_oam_shadow_write_range(std::uint32_t address,
+                                       std::uint32_t size) {
+    if (size == 0u) return false;
+    const std::uint64_t write_last =
+        static_cast<std::uint64_t>(address) + size;
+    return
+        gsr::widescreen::golden_sun_oam_shadow_table_base(address) != 0u ||
+        (write_last <= UINT32_MAX &&
+         gsr::widescreen::golden_sun_oam_shadow_table_base(
+             static_cast<std::uint32_t>(write_last - 1u)) != 0u);
+}
+
 void golden_sun_oam_shadow_write_observer(std::uint32_t writer_pc,
                                           std::uint32_t address,
                                           std::uint32_t size) {
+    if (!golden_sun_oam_shadow_write_range(address, size)) return;
+    ++g_golden_sun_obj_oam_observer_calls;
+    // This probe intentionally runs before the authenticated F0 filter. The
+    // failing identity was present in a full upload without a matching F0
+    // commit, so the raw post-write seam records every affected table slot
+    // and can identify a fast/generated or otherwise unclassified CPU store.
+    record_golden_sun_shadow_cpu_writes(writer_pc, address, size);
     // F0's register identity is captured at the authenticated EC entry,
-    // before its LDM overwrites R6. The write observer only supplies committed
-    // slot/ATTR identity; correlation is completed against that snapshot.
+    // before its LDM overwrites R6. D4's STM is the second instruction after
+    // its entry; on a resumed call the entry hook is skipped, so use only a
+    // same-frame source pointer captured before that LDM. Both routes remain
+    // image- and identity-authenticated.
     // This function is also the WIDE-01 experimental off-screen cull safety
     // net's hook point (see below), so it must run when either diagnostics
-    // or the "Experimental Fixes" toggle is on -- not diagnostics alone. All
+    // or the "Enhanced Options" toggle is on -- not diagnostics alone. All
     // diagnostics-only work inside self-gates on
     // golden_sun_wide_diagnostics_enabled() independently.
+    const bool d4_store = size != 0u &&
+        golden_sun_func1dc8_d4_store_pc(writer_pc);
+    const bool f0_store = !d4_store &&
+        golden_sun_func1dc8_writer_pc(
+            writer_pc, gsr::Func1dc8WriterRoute::F0);
     if ((!golden_sun_wide_diagnostics_enabled() &&
          !golden_sun_experimental_fixes_enabled() &&
          !gsr::obj_recorder_enabled()) ||
         !golden_sun_expanded_obj_view_active() ||
-        !golden_sun_func1dc8_writer_pc(
-            writer_pc, gsr::Func1dc8WriterRoute::F0) || size == 0u) return;
+        (!d4_store && !f0_store) || size == 0u) return;
     // Either sprite table, not just the first: the game builds its list in
     // two places and uploads whichever is current, so watching one address
     // left 31% of frames unobserved (session_20260906_131954, 79 of 256
@@ -2106,8 +2756,57 @@ void golden_sun_oam_shadow_write_observer(std::uint32_t writer_pc,
     const std::uint32_t slot_address =
         table_base + static_cast<std::uint32_t>(slot) *
                          gsr::widescreen::kGoldenSunOamShadowSlotBytes;
+    if (d4_store && address == slot_address + 4u) {
+        // The D4 LDM has no writeback: post-LDM R6 is not a source pointer.
+        // Only the authenticated pre-LDM capture may complete this handoff;
+        // a resumed store without that token stays unclassified.
+        const int primary_slot =
+            gsr::widescreen::golden_sun_oam_shadow_slot(slot_address);
+        if (primary_slot >= 0 && static_cast<std::size_t>(primary_slot) <
+                                     g_golden_sun_obj_d4_source_captures.size()) {
+            auto& capture = g_golden_sun_obj_d4_source_captures[
+                static_cast<std::size_t>(primary_slot)];
+            const std::uint32_t entry_pc = writer_pc - 4u;
+            const bool token_present = capture.valid;
+            const bool token_matches =
+                token_present && capture.frame == runtime_current_frame() &&
+                capture.auth_epoch == g_golden_sun_field_auth_epoch &&
+                capture.entry_pc == entry_pc &&
+                capture.target_address == slot_address;
+            if (gsr::obj_recorder_enabled()) {
+                const std::uint32_t observed_staging = token_present
+                    ? capture.staging_address : 0u;
+                std::uint32_t record_base = 0;
+                bool shadow = false;
+                const auto* body_staging =
+                    observed_staging != 0u &&
+                            golden_sun_obj_record_identity(
+                                observed_staging, &record_base, &shadow)
+                        ? find_golden_sun_obj_staging(
+                              shadow ? record_base : observed_staging)
+                        : nullptr;
+                record_golden_sun_obj_d4_event(
+                    token_matches ? "store-token-found"
+                                  : token_present ? "store-token-mismatch"
+                                                  : "store-token-missing",
+                    primary_slot, observed_staging, slot_address,
+                    body_staging);
+            }
+            if (token_matches) {
+                // A token belongs to one store, not every later occupant of
+                // the same slot in this frame.
+                const auto staging_address = capture.staging_address;
+                capture.valid = false;
+                golden_sun_obj_staging_handoff(
+                    entry_pc, staging_address, slot_address);
+            }
+        }
+    }
+    // D4 has its own source token. Do not resolve it using F0 entry context.
+    if (d4_store) return;
+    ++g_golden_sun_obj_f0_commits;
     // WIDE-01 experimental off-screen cull safety net (launcher's
-    // "Experimental Fixes" toggle only -- normal play, including plain
+    // "Enhanced Options" toggle only -- normal play, including plain
     // widescreen diagnostics with the toggle off, is byte-for-byte
     // unaffected). Applies to every committed OAM entry this observer sees,
     // body and shadow alike, using the exact same rule and the exact same
@@ -2130,6 +2829,9 @@ void golden_sun_oam_shadow_write_observer(std::uint32_t writer_pc,
     const std::uint16_t committed_attr0 = bus_read_u16(slot_address);
     const std::uint16_t committed_attr1 = bus_read_u16(slot_address + 2u);
     const std::uint16_t committed_attr2 = bus_read_u16(slot_address + 4u);
+    const auto source_observation = consume_golden_sun_obj_f0_source(
+        slot, slot_address, writer_pc, writer_frame, writer_depth,
+        writer_return_pc, committed_attr0, committed_attr1, committed_attr2);
     if (golden_sun_wide_diagnostics_enabled()) {
         // Capture the committed ATTR payload before the optional experimental
         // culler can mark it hidden; diagnostics must describe the guest
@@ -2147,13 +2849,44 @@ void golden_sun_oam_shadow_write_observer(std::uint32_t writer_pc,
     // stays inside its own.
     if (gsr::obj_recorder_enabled() ||
         golden_sun_experimental_fixes_enabled()) {
+        ++g_golden_sun_obj_f0_placement_calls;
         const GoldenSunObjPlacement placement =
             golden_sun_obj_resolve_placement(
                 committed_attr0, committed_attr1, committed_attr2,
                 writer_frame, writer_depth, writer_return_pc);
+        record_golden_sun_obj_boulder_commit(
+            source_observation, placement, writer_pc, writer_frame,
+            writer_depth, writer_return_pc, slot, slot_address,
+            committed_attr0, committed_attr1, committed_attr2);
+        if (placement.record_identified) ++g_golden_sun_obj_f0_identified;
         // Disabled, empty and dormant entries are not sprites: neither the
         // culler nor the census counts them.
         if (placement.considered) {
+            // Coverage of the seam that matters on screen: how many
+            // committed sprites ended up with a trusted full-precision
+            // position rather than the 8-bit OAM byte. Payload-free, so a
+            // normal Enhanced run reports it without the recorder.
+            ++g_golden_sun_obj_f0_considered;
+            if (gsr::widescreen::golden_sun_obj_placement_is_exact(
+                    placement.outcome)) {
+                ++g_golden_sun_obj_f0_placed;
+                // How much of the coverage comes from a record staged in the
+                // previous frame, i.e. from the sprites committed before this
+                // frame's first staging entry.
+                if (placement.diagnostic.body_frame != writer_frame)
+                    ++g_golden_sun_obj_f0_placed_prev_frame;
+            }
+            if (gsr::obj_recorder_enabled()) {
+                auto d = placement.diagnostic;
+                d.frame = writer_frame; d.epoch = g_golden_sun_field_auth_epoch;
+                d.dma = g_obj_lifetime_dma; d.slot = slot; d.source = table_base;
+                d.attr0 = committed_attr0; d.attr1 = committed_attr1;
+                d.attr2 = committed_attr2;
+                d.entry = source_observation;
+                d.target = slot_address;
+                gsr::obj_recorder_note_lifetime(d);
+                note_golden_sun_obj_camera_sample(d, writer_pc);
+            }
             const std::uint32_t raw_x = committed_attr1 & 0x1FFu;
             const std::uint32_t raw_y = committed_attr0 & 0x00FFu;
             if (gsr::obj_recorder_enabled()) {
@@ -2184,19 +2917,13 @@ void golden_sun_oam_shadow_write_observer(std::uint32_t writer_pc,
                 sample.outcome = placement.outcome;
                 gsr::obj_recorder_note_placement(sample);
             }
-            // Publish the commit-time position into the table the PPU's
-            // object providers read.
-            //
-            // This is the fix the recorder measured, not a diagnostic. The
-            // table used to be filled only on writer route D4, and its
-            // dominant failure was staleness -- 1,337,880 stale-frame
-            // rejections in session_20260906_113648, one sampled record 41
-            // frames old and describing a different sprite. Writing it here
-            // means the record is created by the same write it describes, so
-            // it cannot be stale, and the committed ATTRs are its identity,
-            // so a recycled OAM slot cannot inherit it. Affine sprites are
-            // included: their position is exact even though their bounds
-            // are not.
+            // Keep the resolved commit pending until the complete shadow
+            // table is transferred to OAM. Publishing here exposes a
+            // half-built table: later writes can change another ATTR slot
+            // before the DMA, so the renderer can combine coordinates from
+            // different images and make a sprite jump at the cull edge.
+            // The provider may use this record as a same-frame fallback,
+            // but it must never replace the DMA-latched visible table.
             if (gsr::widescreen::golden_sun_obj_placement_is_exact(
                     placement.outcome) &&
                 slot >= 0 && static_cast<std::size_t>(slot) <
@@ -2220,22 +2947,6 @@ void golden_sun_oam_shadow_write_observer(std::uint32_t writer_pc,
                 pending.expected_attr1 = committed_attr1;
                 pending.expected_attr2 = committed_attr2;
                 pending.commit_resolved = true;
-                // Publish immediately rather than waiting for the
-                // shadow->OAM DMA. That handoff fires only for the table it
-                // recognises, so on every frame uploaded from the other one
-                // the renderer kept serving records several frames old --
-                // measured at 3 frames in session_20260906_131954, and a
-                // stale record fails its own consistency check, which marks
-                // the sprite untrusted. An untrusted sprite falls back to the
-                // wrapping byte AND is confined to the native window, which
-                // is exactly the "shadows jump and cull early" report.
-                //
-                // Safe to publish mid-build because a record carries its
-                // sprite's exact ATTR0/1/2 and is only ever applied to a
-                // sprite whose bytes match: a half-built table yields records
-                // that go unused, never records applied to the wrong sprite.
-                g_golden_sun_obj_visible_provenance[
-                    static_cast<std::size_t>(slot)] = pending;
             }
             if (golden_sun_experimental_fixes_enabled()) {
                 // Only a sprite with a full-precision position may be
@@ -2992,7 +3703,7 @@ bool golden_sun_wide_diagnostics_enabled() {
 }
 
 // WIDE-01 experimental off-screen cull safety net. GBARECOMP_EXPERIMENTAL_FIXES
-// is the launcher's "Experimental Fixes" checkbox (src/launcher_main.cpp),
+// is the launcher's "Enhanced Options" checkbox (src/launcher_main.cpp),
 // always sent explicitly (0 or 1), same discipline as the diagnostics kill
 // switch above. Default off; normal play is byte-for-byte unaffected. See
 // src/widescreen_policy.h (golden_sun_experimental_sprite_fully_offscreen)
@@ -3427,8 +4138,11 @@ void report_golden_sun_field_producers(const char* reason) {
 }
 
 // WIDE-01 entity-producer census: bounded IWRAM write census for the
-// observed 0x38-stride object staging array at 0x03002000..0x030022E0.
-// Diagnostics-only, deduped by (address, pc, size), capped per epoch, and
+// previously measured 0x38-stride object staging prefix at
+// 0x03002000..0x030022E0. The newly authenticated N=15 body is admitted by
+// the commit identity rule, but this write census stays at its old boundary
+// until its producer writes are measured directly. Diagnostics-only, deduped
+// by (address, pc, size), capped per epoch, and
 // reset with the same auth-epoch boundaries as the field producer trace
 // above. Produces nothing unless widescreen diagnostics are enabled; never
 // consulted by gameplay/render code.
@@ -3904,10 +4618,140 @@ bool golden_sun_dma_destination_bounds(std::uint32_t destination,
     return true;
 }
 
+void record_golden_sun_shadow_dma_slots(
+    std::uint32_t pc, std::uint32_t source, std::uint32_t destination,
+    std::uint32_t bytes, std::uint16_t control, int start_mode) {
+    if (!gsr::obj_recorder_enabled() || bytes == 0u) return;
+    const std::uint32_t unit = (control & 0x0400u) != 0u ? 4u : 2u;
+    if ((bytes % unit) != 0u) return;
+    const std::uint32_t source_mode = (control >> 7) & 3u;
+    const std::uint32_t destination_mode = (control >> 5) & 3u;
+    if (source_mode > 2u || destination_mode > 3u) return;
+    std::uint32_t range_first = 0;
+    std::uint32_t range_size = 0;
+    if (!golden_sun_dma_destination_bounds(
+            destination, bytes, control, &range_first, &range_size)) return;
+    const std::uint64_t range_last =
+        static_cast<std::uint64_t>(range_first) + range_size;
+    const std::uint32_t tables[] = {
+        gsr::widescreen::kGoldenSunOamShadowStart,
+        gsr::widescreen::kGoldenSunOamShadowAltStart};
+    const auto source_u16_for_destination = [&](std::uint32_t address,
+                                                std::uint16_t* out) {
+        if (!out) return false;
+        const std::uint64_t d = address;
+        const std::uint64_t start = destination;
+        std::uint64_t index = 0;
+        std::uint64_t intra = 0;
+        if (destination_mode == 0u || destination_mode == 3u) {
+            if (d < start) return false;
+            const std::uint64_t delta = d - start;
+            index = delta / unit;
+            intra = delta % unit;
+        } else if (destination_mode == 1u) {
+            // Units descend; bytes within each unit still ascend.
+            if (d >= start) {
+                intra = d - start;
+            } else {
+                const std::uint64_t delta = start - d;
+                index = (delta + unit - 1u) / unit;
+                intra = index * unit - delta;
+            }
+        } else {
+            if (d < start) return false;
+            // A fixed destination retains the final source unit.
+            index = bytes / unit - 1u;
+            intra = d - start;
+        }
+        if (index >= bytes / unit) return false;
+        const std::uint64_t source_delta = index * unit;
+        std::uint64_t source_address = source;
+        if (source_mode == 0u) {
+            source_address += source_delta;
+        } else if (source_mode == 1u) {
+            if (source_delta > source) return false;
+            source_address -= source_delta;
+        }
+        if (intra + 2u > unit ||
+            source_address > 0xFFFFFFFFull -
+                intra)
+            return false;
+        *out = bus_read_u16(static_cast<std::uint32_t>(source_address +
+                                                        intra));
+        return true;
+    };
+    for (const std::uint32_t table : tables) {
+        const std::uint64_t table_first = table;
+        const std::uint64_t table_last = table_first +
+            gsr::widescreen::kGoldenSunOamBytes;
+        if (range_first >= table_last || range_last <= table_first) continue;
+        const int first_slot = static_cast<int>(
+            (std::max<std::uint64_t>(range_first, table_first) -
+             table_first) / gsr::widescreen::kGoldenSunOamShadowSlotBytes);
+        const int last_slot = static_cast<int>(
+            (std::min<std::uint64_t>(range_last, table_last) - 1u -
+             table_first) / gsr::widescreen::kGoldenSunOamShadowSlotBytes);
+        for (int slot = first_slot; slot <= last_slot; ++slot) {
+            const std::uint32_t slot_address = table +
+                static_cast<std::uint32_t>(slot) *
+                    gsr::widescreen::kGoldenSunOamShadowSlotBytes;
+            std::uint8_t attr_mask = 0;
+            std::uint16_t attr0 = 0, attr1 = 0, attr2 = 0;
+            if (source_u16_for_destination(slot_address, &attr0))
+                attr_mask |= 1u;
+            if (source_u16_for_destination(slot_address + 2u, &attr1))
+                attr_mask |= 2u;
+            if (source_u16_for_destination(slot_address + 4u, &attr2))
+                attr_mask |= 4u;
+            gsr::ObjShadowWriteSample sample;
+            sample.event = "dma";
+            sample.frame = runtime_current_frame();
+            sample.epoch = g_golden_sun_field_auth_epoch;
+            sample.dma = g_obj_lifetime_dma;
+            sample.slot = slot;
+            sample.writer_pc = pc;
+            sample.size = bytes;
+            sample.source = source;
+            sample.destination = destination;
+            sample.control = control;
+            sample.start_mode = start_mode;
+            sample.attr_mask = attr_mask;
+            sample.attr0 = attr0;
+            sample.attr1 = attr1;
+            sample.attr2 = attr2;
+            gsr::obj_recorder_note_shadow_write(sample);
+        }
+    }
+}
+
+// Diagnostic-only snapshot shared by upload and render events.
+void note_obj_lifetime(const char* event, const char* reason, int slot,
+    std::uint32_t source, std::uint16_t a0, std::uint16_t a1, std::uint16_t a2,
+    const GoldenSunObjPlacementProvenance& p) {
+    gsr::ObjLifetimeSample d;
+    d.event = event; d.reason = reason;
+    d.frame = runtime_current_frame(); d.epoch = g_golden_sun_field_auth_epoch;
+    d.dma = g_obj_lifetime_dma; d.slot = slot; d.source = source;
+    d.attr0 = a0; d.attr1 = a1; d.attr2 = a2;
+    d.provenance_frame = p.frame; d.provenance_epoch = p.auth_epoch;
+    d.target = p.target_address;
+    d.expected0 = p.expected_attr0; d.expected1 = p.expected_attr1;
+    d.expected2 = p.expected_attr2;
+    d.checks = (p.valid ? 1u : 0u) | (p.x_valid ? 2u : 0u) |
+        (p.y_valid ? 4u : 0u) | (p.oam_identity_valid ? 8u : 0u) |
+        (p.commit_resolved ? 16u : 0u);
+    gsr::obj_recorder_note_lifetime(d);
+}
+
 void golden_sun_wide_dma_descriptor_observer(
     int channel, std::uint32_t pc, std::uint32_t source,
     std::uint32_t destination, std::uint32_t bytes, std::uint16_t control,
     int start_mode) {
+    // Read the source image before the transfer while the descriptor still
+    // identifies the guest producer. This closes the missing table-DMA side
+    // of the failing identity without retaining guest bytes.
+    record_golden_sun_shadow_dma_slots(
+        pc, source, destination, bytes, control, start_mode);
     // The descriptor observer runs immediately before the DMA transfer. At
     // this point the shadow is the complete image that is about to become
     // visible OAM, while later shadow writes must wait for the next handoff.
@@ -3917,6 +4761,30 @@ void golden_sun_wide_dma_descriptor_observer(
             source, destination, bytes, control)) {
         g_golden_sun_obj_visible_provenance =
             g_golden_sun_obj_pending_provenance;
+    }
+    if (gsr::obj_recorder_enabled() && destination == 0x07000000u &&
+        bytes == gsr::widescreen::kGoldenSunOamShadowSlotCount *
+            gsr::widescreen::kGoldenSunOamShadowSlotBytes) {
+        ++g_obj_lifetime_dma;
+        const bool published = gsr::widescreen::golden_sun_obj_provenance_dma_handoff(
+            source, destination, bytes, control);
+        for (std::size_t slot = 0; slot < g_golden_sun_obj_visible_provenance.size(); ++slot) {
+            // Decode the DMA source addressing mode; metadata only, never copy assets.
+            const auto source_mode = (control >> 7) & 3u;
+            const auto unit = (control & 0x0400u) ? 4u : 2u;
+            const auto read_attr = [&](std::uint32_t offset) {
+                const auto step = offset / unit * unit;
+                const auto address = source_mode == 0 ? source + step :
+                    source_mode == 1 ? source - step : source;
+                return bus_read_u16(address + offset % unit);
+            };
+            const auto offset = static_cast<std::uint32_t>(slot) *
+                gsr::widescreen::kGoldenSunOamShadowSlotBytes;
+            note_obj_lifetime("dma", published ? "published" : "not-published",
+                static_cast<int>(slot), source, read_attr(offset),
+                read_attr(offset + 2u), read_attr(offset + 4u),
+                g_golden_sun_obj_visible_provenance[slot]);
+        }
     }
     std::uint32_t first = 0;
     std::uint32_t span = 0;
@@ -4346,6 +5214,26 @@ void report_golden_sun_field_map_id_attribution(std::uint64_t frame,
 void write_golden_sun_wide_scroll_trace_csv();
 
 void report_golden_sun_wide_diagnostics_at_exit() {
+    if (golden_sun_experimental_fixes_enabled()) {
+        std::fprintf(stderr,
+            "[wide-obj-hooks] fast_iwram=%s oam_commit=%s "
+            "observer_calls=%llu f0_commits=%llu f0_placements=%llu "
+            "f0_identified=%llu f0_considered=%llu f0_placed=%llu "
+            "f0_placed_prev_frame=%llu\n",
+            g_runtime_fast_iwram_write_observer ? "armed" : "off",
+            "armed",
+            static_cast<unsigned long long>(
+                g_golden_sun_obj_oam_observer_calls),
+            static_cast<unsigned long long>(g_golden_sun_obj_f0_commits),
+            static_cast<unsigned long long>(
+                g_golden_sun_obj_f0_placement_calls),
+            static_cast<unsigned long long>(g_golden_sun_obj_f0_identified),
+            static_cast<unsigned long long>(g_golden_sun_obj_f0_considered),
+            static_cast<unsigned long long>(g_golden_sun_obj_f0_placed),
+            static_cast<unsigned long long>(
+                g_golden_sun_obj_f0_placed_prev_frame));
+        report_golden_sun_obj_context_near_misses();
+    }
     if (!golden_sun_wide_diagnostics_enabled()) return;
     std::fprintf(stderr,
         "[wide-obj-experimental-cull-summary] logs=%u dropped=%llu\n",
@@ -5139,7 +6027,10 @@ void clear_golden_sun_obj_y_provenance() {
     g_golden_sun_obj_pending_provenance.fill({});
     g_golden_sun_obj_visible_provenance.fill({});
     g_golden_sun_obj_staging_provenance.fill({});
+    g_golden_sun_obj_d4_source_captures.fill({});
     g_golden_sun_obj_f0_contexts.fill({});
+    g_golden_sun_obj_f0_rejected_contexts.fill({});
+    g_golden_sun_obj_f0_source_observations.fill({});
     g_golden_sun_obj_f0_context_frame = UINT64_MAX;
     g_golden_sun_obj_y_edge_alias_state.fill({});
     g_golden_sun_experimental_cull_last.fill({});
@@ -5238,15 +6129,68 @@ bool read_golden_sun_obj_staging_attrs(std::uint32_t address,
     return true;
 }
 
-void golden_sun_obj_staging_handoff(std::uint32_t entry_pc) {
+void capture_golden_sun_obj_d4_source(std::uint32_t entry_pc,
+                                      std::uint32_t staging_address,
+                                      std::uint32_t destination) {
+    const int slot = gsr::widescreen::golden_sun_oam_shadow_slot(destination);
+    if (slot < 0 || static_cast<std::size_t>(slot) >=
+                         g_golden_sun_obj_d4_source_captures.size()) return;
+    std::uint32_t record_base = 0;
+    bool shadow = false;
+    if (!golden_sun_obj_record_identity(staging_address, &record_base,
+                                        &shadow)) return;
+    (void)record_base;
+    (void)shadow;
+    auto& capture = g_golden_sun_obj_d4_source_captures[
+        static_cast<std::size_t>(slot)];
+    const std::uint64_t frame = runtime_current_frame();
+    const std::uint64_t epoch = g_golden_sun_field_auth_epoch;
+    if (capture.frame != frame || capture.auth_epoch != epoch) {
+        capture = {};
+        capture.frame = frame;
+        capture.auth_epoch = epoch;
+    }
+    if (capture.blocked) return;
+    if (!capture.valid) {
+        capture.valid = true;
+        capture.entry_pc = entry_pc;
+        capture.staging_address = staging_address;
+        capture.target_address = destination;
+        return;
+    }
+    if (capture.entry_pc == entry_pc &&
+        capture.staging_address == staging_address &&
+        capture.target_address == destination) return;
+    // Two authenticated D4 entries claimed the same slot in this frame with
+    // different source identity. Do not let a later one win by accident.
+    capture.valid = false;
+    capture.blocked = true;
+}
+
+void golden_sun_obj_staging_handoff(
+    std::uint32_t entry_pc, std::uint32_t staging_address_override = 0u,
+    std::uint32_t destination_override = 0u) {
     // D4 loads {R6,R7,R8} from the staging record in R6, then its following
     // store writes R7/R8 to the OAM-shadow destination in R0.
     if (!golden_sun_func1dc8_writer_pc(
             entry_pc, gsr::Func1dc8WriterRoute::D4) ||
         !golden_sun_expanded_obj_view_active())
         return;
-    const std::uint32_t staging_address = g_cpu.R[6];
-    const int slot = gsr::widescreen::golden_sun_oam_shadow_slot(g_cpu.R[0]);
+    const std::uint32_t staging_address = staging_address_override != 0u
+        ? staging_address_override : g_cpu.R[6];
+    const std::uint32_t destination = destination_override != 0u
+        ? destination_override : g_cpu.R[0];
+    const int slot = gsr::widescreen::golden_sun_oam_shadow_slot(destination);
+    std::uint32_t record_base = 0;
+    bool shadow = false;
+    const bool record_identity_valid = golden_sun_obj_record_identity(
+        staging_address, &record_base, &shadow);
+    // This call is the pre-LDM seam: R6 is still the guest's actual source
+    // pointer. Preserve it for a same-frame D8 resume before any provenance
+    // lookup can reject the record. The override form is used only by that
+    // resumed-store handoff and must never capture post-LDM R6.
+    if (staging_address_override == 0u && destination_override == 0u)
+        capture_golden_sun_obj_d4_source(entry_pc, g_cpu.R[6], destination);
     std::uint16_t observed_attr0 = 0;
     std::uint16_t observed_attr1 = 0;
     std::uint16_t observed_attr2 = 0;
@@ -5257,22 +6201,84 @@ void golden_sun_obj_staging_handoff(std::uint32_t entry_pc) {
         observed_attr0, observed_attr1, observed_attr2,
         runtime_current_frame(), runtime_call_stack_depth(),
         golden_sun_obj_call_return_pc(runtime_call_stack_depth()), 0u);
-    auto* staging = find_golden_sun_obj_staging(staging_address);
+    auto* body_staging = record_identity_valid
+        ? find_golden_sun_obj_staging(shadow ? record_base : staging_address)
+        : nullptr;
+    if (staging_address_override == 0u && destination_override == 0u &&
+        record_identity_valid && shadow &&
+        gsr::obj_recorder_enabled()) {
+        bool token_found = false;
+        if (slot >= 0 && static_cast<std::size_t>(slot) <
+                             g_golden_sun_obj_d4_source_captures.size()) {
+            const auto& capture = g_golden_sun_obj_d4_source_captures[
+                static_cast<std::size_t>(slot)];
+            token_found = capture.valid &&
+                capture.frame == runtime_current_frame() &&
+                capture.auth_epoch == g_golden_sun_field_auth_epoch &&
+                capture.entry_pc == entry_pc &&
+                capture.staging_address == staging_address &&
+                capture.target_address == destination;
+        }
+        record_golden_sun_obj_d4_event(
+            token_found ? "entry-token-found" : "entry-token-missing",
+            slot, staging_address, destination, body_staging);
+    }
+    // The shadow record has no coordinates of its own.  D4 receives the
+    // shadow record at body+0x0C, while the staging table is keyed by the
+    // body record that B324/B328 updated.  Reuse that paired-body lookup here
+    // as golden_sun_obj_resolve_placement does at the commit seam.
+    if (!record_identity_valid) return;
+    auto* staging = body_staging;
     if (!staging || !staging->valid || staging->auth_epoch !=
         g_golden_sun_field_auth_epoch ||
-        staging->frame != runtime_current_frame()) return;
+        staging->frame != runtime_current_frame()) {
+        if (staging_address_override == 0u && destination_override == 0u &&
+            shadow && gsr::obj_recorder_enabled()) {
+            record_golden_sun_obj_d4_event(
+                staging ? "handoff-body-stale" : "handoff-body-missing",
+                slot, staging_address, destination, body_staging);
+        }
+        return;
+    }
     if (slot < 0 || static_cast<std::size_t>(slot) >=
                          g_golden_sun_obj_pending_provenance.size()) return;
+    int resolved_x = staging->logical_x;
+    int resolved_y = staging->logical_y;
+    if (shadow) {
+        // Authenticate the paired body's current fields before recovering
+        // the shadow's own offset, as the F0 placement resolver does.
+        std::uint16_t body_attr0 = 0, body_attr1 = 0, body_attr2 = 0;
+        int width = 0, height = 0, checked_x = 0, checked_y = 0;
+        const bool body_matches = observed_attrs_valid &&
+            staging->x_valid && staging->y_valid &&
+            read_golden_sun_obj_staging_attrs(
+                record_base, &body_attr0, &body_attr1, &body_attr2) &&
+            gsr::widescreen::golden_sun_obj_dimensions(
+                (body_attr0 >> 14) & 3u, (body_attr1 >> 14) & 3u,
+                &width, &height) &&
+            gsr::widescreen::golden_sun_obj_resolve_oam_x(
+                body_attr1 & 0x1FFu, true, staging->logical_x, &checked_x) &&
+            gsr::widescreen::golden_sun_obj_resolve_oam_y(
+                body_attr0 & 0xFFu, true, staging->logical_y, &checked_y);
+        if (!body_matches) {
+            record_golden_sun_obj_d4_event("handoff-body-checks", slot,
+                staging_address, destination, staging);
+            return;
+        }
+        resolved_x = gsr::widescreen::golden_sun_obj_paired_coordinate(
+            staging->logical_x, observed_attr1 & 0x1FFu, 9u);
+        resolved_y = gsr::widescreen::golden_sun_obj_paired_coordinate(
+            staging->logical_y, observed_attr0 & 0xFFu, 8u);
+    }
     auto& output = g_golden_sun_obj_pending_provenance[
         static_cast<std::size_t>(slot)];
     if (output.commit_resolved && output.frame == staging->frame) return;
 
-    // The authenticated D4 entry executes `ldmia r6!, {r6,r7,r8}` before its
-    // following store
-    // R7/R8 as the two OAM words. Read that exact 12-byte IWRAM record at the
-    // entry seam, with bounds/alignment checks, so the provenance cannot be
-    // reused for a later slot occupant. Word 0 is the record's working value;
-    // words 1/2 are ATTR0|ATTR1 and ATTR2|padding respectively.
+    // The authenticated D4 entry executes `ldmia r6, {r6,r7,r8}` before its
+    // following store of R7/R8 as the two OAM words. Read that exact 12-byte
+    // IWRAM record at the entry seam, with bounds/alignment checks, so the
+    // provenance cannot be reused for a later slot occupant. Word 0 is the
+    // record's working value; words 1/2 are ATTR0|ATTR1 and ATTR2|padding.
     std::uint16_t expected_attr0 = observed_attr0;
     std::uint16_t expected_attr1 = observed_attr1;
     std::uint16_t expected_attr2 = observed_attr2;
@@ -5280,12 +6286,12 @@ void golden_sun_obj_staging_handoff(std::uint32_t entry_pc) {
     output.valid = staging->x_valid || staging->y_valid;
     output.x_valid = staging->x_valid;
     output.y_valid = staging->y_valid;
-    output.logical_x = staging->logical_x;
-    output.logical_y = staging->logical_y;
+    output.logical_x = static_cast<std::int16_t>(resolved_x);
+    output.logical_y = static_cast<std::int16_t>(resolved_y);
     output.frame = staging->frame;
     output.auth_epoch = staging->auth_epoch;
     output.writer_branch_pc = staging->y_writer_branch_pc;
-    output.target_address = g_cpu.R[0];
+    output.target_address = destination;
     output.writer_generation = 0;
     output.oam_identity_valid = oam_identity_valid;
     output.expected_attr0 = expected_attr0;
@@ -5296,7 +6302,7 @@ void golden_sun_obj_staging_handoff(std::uint32_t entry_pc) {
     note_golden_sun_obj_commit_order(
         GoldenSunObjCommitOrderRoute::D4, staging_address, slot,
         expected_attr0, expected_attr1, expected_attr2, staging->x_valid,
-        staging->logical_x, staging->y_valid, staging->logical_y);
+        output.logical_x, staging->y_valid, output.logical_y);
     if (oam_identity_valid) {
         trace_golden_sun_obj_y_correlation(
             staging->y_correlation, staging_address, slot, expected_attr0,
@@ -5312,12 +6318,21 @@ void golden_sun_obj_staging_handoff(std::uint32_t entry_pc) {
                      "x_valid=%u logical_x=%d y_valid=%u logical_y=%d\n",
                      static_cast<unsigned long long>(runtime_current_frame()),
                      static_cast<unsigned long long>(g_golden_sun_field_auth_epoch),
-                     staging_address, g_cpu.R[0], slot,
+                     staging_address, destination, slot,
                      staging->x_valid ? 1u : 0u,
-                     static_cast<int>(staging->logical_x),
+                     static_cast<int>(output.logical_x),
                      staging->y_valid ? 1u : 0u,
-                     static_cast<int>(staging->logical_y));
+                     static_cast<int>(output.logical_y));
     }
+}
+
+// D4's post-LDM store is four bytes after the authenticated entry. A resumed
+// D4 call can enter at that instruction without running the function-entry
+// hook, so authenticate the preceding entry rather than accepting the store
+// PC as a free-standing RAM address.
+bool golden_sun_func1dc8_d4_store_pc(std::uint32_t pc) {
+    return pc >= 4u && golden_sun_func1dc8_writer_pc(
+        pc - 4u, gsr::Func1dc8WriterRoute::D4);
 }
 
 void trace_golden_sun_obj_y_attempt(std::uint32_t instruction_pc,
@@ -5356,9 +6371,37 @@ void record_golden_sun_obj_y_transition(
     GoldenSunObjYTransitionReason reason,
     const GoldenSunObjPlacementProvenance& provenance,
     std::uint16_t attr0, std::uint16_t attr1, std::uint16_t attr2) {
-    if (!golden_sun_wide_diagnostics_enabled() || raw_y < 159 ||
-        raw_y > 199 || slot < 0 || static_cast<std::size_t>(slot) >=
+    if (slot < 0 || static_cast<std::size_t>(slot) >=
             gsr::widescreen::kGoldenSunOamShadowSlotCount) return;
+    const bool in_transition_band = raw_y >= 159 && raw_y <= 199;
+    // Recorder-only out-of-band calls carry a real rejection reason. Keep
+    // accepted samples and the existing in-band samples available to the
+    // recorder, while leaving the aggregate WIDE diagnostic gate below
+    // unchanged.
+    const bool record_lifetime = gsr::obj_recorder_enabled() &&
+        (reason != GoldenSunObjYTransitionReason::Accepted ||
+         (golden_sun_wide_diagnostics_enabled() && in_transition_band));
+    if (record_lifetime) {
+        // One sample per slot/frame/epoch/upload. No global first-N cap.
+        struct Last {
+            bool valid = false;
+            std::uint64_t frame = 0, epoch = 0, dma = 0;
+            GoldenSunObjYTransitionReason reason{};
+            std::uint16_t a0 = 0, a1 = 0, a2 = 0;
+        };
+        static std::array<Last, gsr::widescreen::kGoldenSunOamShadowSlotCount> last{};
+        auto& l = last[static_cast<std::size_t>(slot)];
+        const auto frame = runtime_current_frame();
+        if (!l.valid || l.frame != frame || l.epoch != g_golden_sun_field_auth_epoch ||
+            l.dma != g_obj_lifetime_dma || l.reason != reason ||
+            l.a0 != attr0 || l.a1 != attr1 || l.a2 != attr2) {
+            l = {true, frame, g_golden_sun_field_auth_epoch, g_obj_lifetime_dma,
+                reason, attr0, attr1, attr2};
+            note_obj_lifetime("render", golden_sun_obj_y_transition_reason_name(reason),
+                slot, 0x07000000u, attr0, attr1, attr2, provenance);
+        }
+    }
+    if (!golden_sun_wide_diagnostics_enabled() || !in_transition_band) return;
     const auto region = golden_sun_obj_y_transition_region(output_y);
     auto& count = g_golden_sun_obj_y_transition_counts[
         static_cast<std::size_t>(reason)][static_cast<std::size_t>(region)]
@@ -5493,26 +6536,63 @@ bool golden_sun_expanded_obj_view_active() {
         g_golden_sun_wide_extra_top, g_golden_sun_wide_extra_bottom);
 }
 
+// Select the provenance for the OAM image currently being rendered. The DMA
+// latched record always wins. A commit can race the next render before its
+// table is uploaded, so allow the pending record only for this frame and only
+// when its source slot, complete ATTR identity, both axes, and hardware
+// truncation all agree. In particular, matching ATTRs alone is insufficient:
+// full precision coordinates separated by an OAM wrap can share them. Select
+// the pair once so X cannot come from one image while Y comes from another.
+const GoldenSunObjPlacementProvenance*
+golden_sun_obj_provider_provenance(int oam_index, std::uint16_t attr0,
+                                   std::uint16_t attr1, std::uint16_t attr2,
+                                   int raw_x, int raw_y) {
+    if (oam_index < 0 || static_cast<std::size_t>(oam_index) >=
+                            g_golden_sun_obj_visible_provenance.size())
+        return nullptr;
+    const std::uint32_t slot_offset =
+        static_cast<std::uint32_t>(oam_index) *
+        gsr::widescreen::kGoldenSunOamShadowSlotBytes;
+    const std::uint32_t main_target =
+        gsr::widescreen::kGoldenSunOamShadowStart + slot_offset;
+    const auto usable = [&](const GoldenSunObjPlacementProvenance& candidate,
+                            bool pending) {
+        if (!candidate.valid || !candidate.x_valid || !candidate.y_valid ||
+            candidate.auth_epoch != g_golden_sun_field_auth_epoch ||
+            (pending && candidate.frame != runtime_current_frame()) ||
+            !candidate.oam_identity_valid ||
+            candidate.target_address != main_target ||
+            !gsr::widescreen::golden_sun_obj_provenance_attrs_match(
+                candidate.oam_identity_valid, candidate.expected_attr0,
+                candidate.expected_attr1, candidate.expected_attr2, attr0,
+                attr1, attr2))
+            return false;
+        return golden_sun_obj_oam_truncated(candidate.logical_x, 9) == raw_x &&
+               golden_sun_obj_oam_truncated(candidate.logical_y, 8) == raw_y;
+    };
+    const auto& visible = g_golden_sun_obj_visible_provenance[
+        static_cast<std::size_t>(oam_index)];
+    if (usable(visible, false)) return &visible;
+    const auto& pending = g_golden_sun_obj_pending_provenance[
+        static_cast<std::size_t>(oam_index)];
+    if (usable(pending, true)) return &pending;
+    return nullptr;
+}
+
 int golden_sun_wide_obj_attr_x_provider(int oam_index,
                                         std::uint16_t attr0,
                                         std::uint16_t attr1,
                                         std::uint16_t attr2,
                                         int* out_x) {
-    (void)attr0;
     if (!golden_sun_expanded_obj_view_active() || !out_x || oam_index < 0 ||
         static_cast<std::size_t>(oam_index) >=
             g_golden_sun_obj_visible_provenance.size()) return 0;
-    const auto& provenance = g_golden_sun_obj_visible_provenance[
-        static_cast<std::size_t>(oam_index)];
     const int raw_x = static_cast<int>(attr1 & 0x01FFu);
-    if (!provenance.valid || !provenance.x_valid ||
-        provenance.auth_epoch != g_golden_sun_field_auth_epoch ||
-        !gsr::widescreen::golden_sun_obj_provenance_attrs_match(
-            provenance.oam_identity_valid, provenance.expected_attr0,
-            provenance.expected_attr1, provenance.expected_attr2,
-            attr0, attr1, attr2) ||
-        golden_sun_obj_oam_truncated(provenance.logical_x, 9) != raw_x) return 0;
-    *out_x = provenance.logical_x;
+    const int raw_y = static_cast<int>(attr0 & 0x00FFu);
+    const auto* provenance = golden_sun_obj_provider_provenance(
+        oam_index, attr0, attr1, attr2, raw_x, raw_y);
+    if (!provenance) return 0;
+    *out_x = provenance->logical_x;
     return 1;
 }
 
@@ -5544,8 +6624,15 @@ int golden_sun_wide_obj_attr_y_provider(int oam_index,
                                        attr0 & 0x00FFu, 0u, false, oam_index);
         return 0;
     }
-    auto& provenance = g_golden_sun_obj_visible_provenance[
+    auto& visible_provenance = g_golden_sun_obj_visible_provenance[
         static_cast<std::size_t>(oam_index)];
+    const int raw_x = static_cast<int>(attr1 & 0x01FFu);
+    const auto* selected_provenance = golden_sun_obj_provider_provenance(
+        oam_index, attr0, attr1, attr2, raw_x, raw_y);
+    // Keep the visible record as the diagnostic baseline when no candidate
+    // is usable; acceptance below is controlled by selected_provenance.
+    const auto& provenance = selected_provenance ? *selected_provenance
+                                                 : visible_provenance;
     const bool alias_candidate =
         gsr::widescreen::golden_sun_obj_y_alias_candidate(
             raw_y, provenance.logical_y);
@@ -5553,7 +6640,11 @@ int golden_sun_wide_obj_attr_y_provider(int oam_index,
         gba::vram_trace::OamAttr0Provenance attr_provenance{};
         if (gba::vram_trace::get_oam_attr0_provenance(
             static_cast<std::size_t>(oam_index), &attr_provenance)) {
-            provenance.writer_generation = attr_provenance.generation;
+            // Generation is diagnostic state attached to the DMA-latched
+            // record. Do not mutate a pending candidate while rendering it.
+            if (selected_provenance == &visible_provenance)
+                visible_provenance.writer_generation =
+                    attr_provenance.generation;
         }
     }
     const bool provenance_epoch_matches =
@@ -5565,9 +6656,7 @@ int golden_sun_wide_obj_attr_y_provider(int oam_index,
             provenance.oam_identity_valid, provenance.expected_attr0,
             provenance.expected_attr1, provenance.expected_attr2,
             attr0, attr1, attr2);
-    const bool signed_provenance_matches =
-        provenance.valid && provenance.y_valid && provenance_epoch_matches &&
-        provenance_raw_matches && provenance_identity_matches;
+    const bool signed_provenance_matches = selected_provenance != nullptr;
     const std::uint32_t expected_target =
         gsr::widescreen::kGoldenSunOamShadowStart +
         static_cast<std::uint32_t>(oam_index) *
@@ -5597,22 +6686,35 @@ int golden_sun_wide_obj_attr_y_provider(int oam_index,
             return 1;
         }
     }
-    if (golden_sun_wide_diagnostics_enabled() && raw_y >= 159 &&
-        raw_y <= 199) {
-        const int canonical_y = raw_y >= 160 ? raw_y - 256 : raw_y;
-        const auto resolution = signed_provenance_matches
-            ? GoldenSunObjYTransitionResolution::Signed
-            : GoldenSunObjYTransitionResolution::Canonical;
-        const auto reason = classify_golden_sun_obj_y_transition(
+    const bool in_transition_band = raw_y >= 159 && raw_y <= 199;
+    const bool diagnostic_transition =
+        golden_sun_wide_diagnostics_enabled() && in_transition_band;
+    const bool recorder_render_check =
+        gsr::obj_recorder_enabled() && !in_transition_band;
+    if (diagnostic_transition || recorder_render_check) {
+        const bool renderer_provenance_rejected = selected_provenance == nullptr;
+        const auto classified_reason = classify_golden_sun_obj_y_transition(
             provenance, runtime_current_frame(), g_golden_sun_field_auth_epoch,
-            gsr::widescreen::kGoldenSunOamShadowStart +
-                static_cast<std::uint32_t>(oam_index) *
-                    gsr::widescreen::kGoldenSunOamShadowSlotBytes,
-            raw_y, attr0, attr1, attr2);
-        record_golden_sun_obj_y_transition(
-            oam_index, raw_y, canonical_y,
-            signed_provenance_matches ? provenance.logical_y : canonical_y,
-            resolution, reason, provenance, attr0, attr1, attr2);
+            expected_target, raw_y, attr0, attr1, attr2);
+        // The classifier is Y-focused; a null selected candidate can also
+        // mean the provider rejected X. Never label that rejection accepted.
+        const auto transition_reason = renderer_provenance_rejected &&
+                classified_reason == GoldenSunObjYTransitionReason::Accepted
+            ? GoldenSunObjYTransitionReason::NoProvenance : classified_reason;
+        const bool recorder_out_of_band_rejection = recorder_render_check &&
+            !(sprite_disabled || sprite_empty || sprite_dormant) &&
+            renderer_provenance_rejected &&
+            transition_reason != GoldenSunObjYTransitionReason::Accepted;
+        if (diagnostic_transition || recorder_out_of_band_rejection) {
+            const int canonical_y = raw_y >= 160 ? raw_y - 256 : raw_y;
+            const auto resolution = signed_provenance_matches
+                ? GoldenSunObjYTransitionResolution::Signed
+                : GoldenSunObjYTransitionResolution::Canonical;
+            record_golden_sun_obj_y_transition(
+                oam_index, raw_y, canonical_y,
+                signed_provenance_matches ? provenance.logical_y : canonical_y,
+                resolution, transition_reason, provenance, attr0, attr1, attr2);
+        }
     }
     switch (gsr::widescreen::golden_sun_obj_y_resolution(
         signed_provenance_matches)) {
@@ -5977,11 +7079,143 @@ int golden_sun_wide_conditional_branch(std::uint32_t instruction_pc,
     return 1;
 }
 
+void record_golden_sun_obj_ewram_write(std::uint32_t address,
+                                       std::uint32_t size) {
+    if (!gsr::obj_recorder_enabled() || size == 0u) return;
+    const std::uint64_t write_end = static_cast<std::uint64_t>(address) + size;
+    const auto record = [&](std::uint32_t start, std::uint32_t end,
+                            const char* region) {
+        // `end` is an inclusive measured address. A store may extend past it,
+        // but only its overlap with the measured interval is in scope.
+        if (write_end <= start || address > end) return false;
+        gsr::ObjEwramWriteSample sample;
+        sample.frame = runtime_current_frame();
+        sample.epoch = g_golden_sun_field_auth_epoch;
+        sample.region = region;
+        sample.writer_pc = runtime_current_pc();
+        sample.address = address;
+        sample.offset = address - start;
+        sample.size = size;
+        gsr::obj_recorder_note_ewram_write(sample);
+        return true;
+    };
+    if (record(kGoldenSunObjSourceRegionAStart,
+               kGoldenSunObjSourceRegionAEnd, "region_a")) return;
+    record(kGoldenSunObjSourceRegionBStart, kGoldenSunObjSourceRegionBEnd,
+           "region_b");
+}
+
+bool golden_sun_obj_boulder_field_in_span(std::uint32_t source,
+                                          std::uint32_t offset) {
+    return source >= kGoldenSunObjSourceRegionBStart &&
+        source <= kGoldenSunObjSourceRegionBEnd &&
+        offset <= kGoldenSunObjSourceRegionBEnd - source &&
+        4u <= kGoldenSunObjSourceRegionBEnd - source - offset + 1u;
+}
+
+void fill_golden_sun_obj_boulder_registers(
+    gsr::ObjBoulderTraceSample* sample) {
+    if (!sample) return;
+    sample->r0 = g_cpu.R[0];
+    sample->r1 = g_cpu.R[1];
+    sample->r2 = g_cpu.R[2];
+    sample->r3 = g_cpu.R[3];
+    sample->r5 = g_cpu.R[5];
+    sample->r6 = g_cpu.R[6];
+    sample->r7 = g_cpu.R[7];
+    sample->r9 = g_cpu.R[9];
+    sample->r10 = g_cpu.R[10];
+    sample->r11 = g_cpu.R[11];
+}
+
+void fill_golden_sun_obj_boulder_source_fields(
+    gsr::ObjBoulderTraceSample* sample, std::uint32_t source,
+    std::uint32_t pending_offset = 0u, std::uint32_t pending_value = 0u) {
+    if (!sample) return;
+    if (source >= kGoldenSunObjSourceRegionBStart &&
+        source <= kGoldenSunObjSourceRegionBEnd) {
+        sample->source = source;
+        sample->source_offset = source - kGoldenSunObjSourceRegionBStart;
+    }
+    if (!golden_sun_obj_boulder_field_in_span(source, 0x0Cu) ||
+        !golden_sun_obj_boulder_field_in_span(source, 0x14u)) return;
+    sample->field_a_value = bus_read_u32(source + 0x0Cu);
+    sample->field_b_value = bus_read_u32(source + 0x14u);
+    if (pending_offset == 0x0Cu) sample->field_a_value = pending_value;
+    if (pending_offset == 0x14u) sample->field_b_value = pending_value;
+    sample->candidate_fields_valid = true;
+}
+
+// The writer census measured these exact instructions as the Region B
+// candidate-field stores. The generated code shows 0x0809496E stores R1 and
+// 0x08094970 stores R0, then the post-call result is stored at 0x08094980.
+// Capture each exact source operand before the fast-path store, together with
+// the rest of the calculation registers.
+void record_golden_sun_obj_boulder_field_write(std::uint32_t address,
+                                               std::uint32_t size) {
+    if (!gsr::obj_recorder_enabled() || size != 4u) return;
+    const std::uint32_t pc = runtime_current_pc();
+    const std::uint32_t field_offset = pc == 0x0809496Eu ? 0x0Cu :
+        pc == 0x08094970u ? 0x14u :
+        pc == 0x08094980u ? 0x10u : 0u;
+    if (field_offset == 0u || address < kGoldenSunObjSourceRegionBStart ||
+        address > kGoldenSunObjSourceRegionBEnd) return;
+    const std::uint32_t relative = address - kGoldenSunObjSourceRegionBStart;
+    if (relative < field_offset ||
+        (relative - field_offset) % 0x20u != 0u) return;
+    const std::uint32_t source = address - field_offset;
+    if (!golden_sun_obj_boulder_field_in_span(source, 0x0Cu) ||
+        !golden_sun_obj_boulder_field_in_span(source, 0x14u)) return;
+    // At 0x08094980 the generated code stores the result of the preceding
+    // 0x0809497C call through the same R7 source base. Keep this boundary
+    // tied to that measured base rather than accepting an address-shaped
+    // match from an unrelated store.
+    if (pc == 0x08094980u && g_cpu.R[7] != source) return;
+
+    gsr::ObjBoulderTraceSample sample;
+    sample.event = pc == 0x08094980u ? "calc-result-write" : "field-write";
+    sample.source_state = "writer-store";
+    sample.outcome = "not-committed";
+    sample.frame = runtime_current_frame();
+    sample.epoch = g_golden_sun_field_auth_epoch;
+    sample.writer_pc = pc;
+    fill_golden_sun_obj_boulder_registers(&sample);
+    // The source operands are fixed by the measured generated instructions
+    // above, not inferred from the stored value.
+    sample.store_value = pc == 0x0809496Eu ? g_cpu.R[1] : g_cpu.R[0];
+    fill_golden_sun_obj_boulder_source_fields(
+        &sample, source, field_offset, sample.store_value);
+    gsr::obj_recorder_note_boulder_trace(sample);
+}
+
+// This is the measured Region B producer's function entry. Its R7 base is
+// the source table that the two field writers walk; recording the entry state
+// gives the next capture a calculation boundary before either candidate field
+// is written.
+void record_golden_sun_obj_boulder_calc_entry(std::uint32_t entry_pc) {
+    if (!gsr::obj_recorder_enabled() || entry_pc != 0x08094928u) return;
+    const std::uint32_t source = g_cpu.R[7];
+    if (!golden_sun_obj_boulder_field_in_span(source, 0x0Cu) ||
+        !golden_sun_obj_boulder_field_in_span(source, 0x14u)) return;
+    gsr::ObjBoulderTraceSample sample;
+    sample.event = "calc-entry";
+    sample.source_state = "producer-entry";
+    sample.outcome = "not-committed";
+    sample.frame = runtime_current_frame();
+    sample.epoch = g_golden_sun_field_auth_epoch;
+    sample.writer_pc = entry_pc;
+    fill_golden_sun_obj_boulder_registers(&sample);
+    fill_golden_sun_obj_boulder_source_fields(&sample, source);
+    gsr::obj_recorder_note_boulder_trace(sample);
+}
+
 void golden_sun_wide_ewram_write_observer(std::uint32_t address,
                                           std::uint32_t size) {
     // DMA has descriptor-level provenance and must not be misreported as a
     // CPU store or establish authored-cell identity one copied unit at a time.
     if (gba::vram_trace::dma_active()) return;
+    record_golden_sun_obj_ewram_write(address, size);
+    record_golden_sun_obj_boulder_field_write(address, size);
     invalidate_golden_sun_palace_table_if_overlapping(address, size);
     // A loaded savestate can contain a populated table before any post-load
     // CPU store repopulates the bitmap; the provider stays fail-closed until
@@ -6115,14 +7349,24 @@ void install_golden_sun_widescreen(std::uint32_t extra_left,
     // diagnostics only controls logging, not the ownership contract.
     gba::g_ws_ewram_write_observer = golden_sun_wide_ewram_write_observer;
     g_runtime_fast_ewram_write_observer = golden_sun_wide_ewram_write_observer;
-    g_runtime_fast_iwram_write_observer = golden_sun_wide_diagnostics_enabled()
-        ? golden_sun_fast_iwram_write_observer : nullptr;
+    // Enhanced Options uses the same committed F0 seam as the diagnostics.
+    // Arm the generated fast-IWRAM path for every mode that consumes the
+    // authenticated object placement, otherwise F0 stores bypass the runner
+    // observer entirely.
+    const bool oam_shadow_observer_enabled =
+        golden_sun_wide_diagnostics_enabled() ||
+        golden_sun_experimental_fixes_enabled() ||
+        gsr::obj_recorder_enabled();
+    g_runtime_fast_iwram_write_observer =
+        oam_shadow_observer_enabled
+            ? golden_sun_fast_iwram_write_observer : nullptr;
     gba::vram_trace::set_dma_descriptor_observer(
         golden_sun_wide_dma_descriptor_observer);
+    gba::vram_trace::set_oam_shadow_write_range_predicate(
+        oam_shadow_observer_enabled ? golden_sun_oam_shadow_write_range
+                                    : nullptr);
     gba::vram_trace::set_oam_shadow_write_observer(
-        (golden_sun_wide_diagnostics_enabled() ||
-         golden_sun_experimental_fixes_enabled() ||
-         gsr::obj_recorder_enabled())
+        oam_shadow_observer_enabled
             ? golden_sun_oam_shadow_write_observer : nullptr);
     gba::g_ws_bg_x_provider_layers = 0xFu; // BG0 + Mode0 field layers.
     g_runtime_thumb_alu_imm_override = nullptr;
@@ -7596,6 +8840,7 @@ void blitter_function_entry(std::uint32_t entry_pc) {
 void golden_sun_function_entry_observer(std::uint32_t entry_pc) {
     golden_sun_obj_f0_entry_capture(entry_pc);
     golden_sun_obj_staging_handoff(entry_pc);
+    record_golden_sun_obj_boulder_calc_entry(entry_pc);
     blitter_function_entry(entry_pc);
     // Each of these costs one predictable branch when its own toggle is
     // disabled, and neither depends on the other being enabled -- see

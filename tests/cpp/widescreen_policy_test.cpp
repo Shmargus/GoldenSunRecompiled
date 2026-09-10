@@ -139,6 +139,29 @@ int main() {
             return true;
         };
     auto parentless = b328_parent;
+    // The earlier +0x0C component may be offscreen while the independently
+    // positioned body still occupies the bottom margin. Retain execution
+    // identity checks but do not make body visibility depend on that component.
+    auto parent_culled = b328_parent;
+    parent_culled.final_decision = 1u;
+    parent_culled.overridden = false;
+    for (std::int32_t body_y : {196, 197, 198, 199}) {
+        std::uint32_t decision = 1u;
+        if (!golden_sun_b328_parent_override(
+                true, 1u, body_y, 0x03002070u, 100u, 3u, 0x08001234u,
+                parent_culled, &decision) || decision != 0u) {
+            std::puts("widescreen_policy_test: visible body inherited parent cull");
+            return 1;
+        }
+    }
+    if (!expect_b328_parent_reject(
+            true, 1u, 200, 0x03002070u, 100u, 3u, 0x08001234u,
+            parent_culled, "widescreen_policy_test: offscreen body admitted") ||
+        !expect_b328_parent_reject(
+            true, 1u, 199, 0x03002070u, 101u, 3u, 0x08001234u,
+            parent_culled, "widescreen_policy_test: stale culled parent admitted")) {
+        return 1;
+    }
     parentless.valid = false;
     auto parent_already_accepted = b328_parent;
     parent_already_accepted.original_decision = 0u;
@@ -1444,7 +1467,7 @@ int main() {
         return 1;
     }
 
-    // WIDE-01 experimental off-screen cull safety net (Experimental Fixes
+    // WIDE-01 experimental off-screen cull safety net (Enhanced Options
     // toggle). See docs/issues/WIDE-01_NPC_IDENTITY.md, "The off-screen
     // rule", for the evidence this is built from.
 

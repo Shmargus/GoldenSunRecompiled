@@ -1,14 +1,16 @@
 // function_tracer.h — GBARECOMP_FN_TRACER function-call tracer.
 //
 // Counts every distinct guest function entry into "windows", auto-detects
-// window boundaries from hardware state (fades, overlay bank swaps, text
-// box open/close -- see function_tracer.cpp), auto-names each window from
+// boundaries from measured hardware state (fades, overlay bank swaps and
+// window-register changes -- the latter is not proven to mean dialogue), and
+// auto-names each window from
 // what triggered it, and saves a screenshot when the closing window's
 // function set doesn't already match a known fingerprint. Also offers a
 // floating ImGui window (its own OS window via multi-viewport, see
 // host_config_ui.h) with a manual "Mark window" free-text label for
-// actions hardware can't detect (e.g. bracketing a spell cast). The user
-// plays uninterrupted; labelling happens afterwards from the saved images.
+// actions hardware can't detect. GSR_TEXT_RECORD is a launcher alias that
+// enables this tracer, its text-capture guidance, and the session's
+// payload-free BG0 write metadata CSV.
 //
 // Golden Sun-specific tooling: lives entirely in src/, drawn through the
 // one generic extension point host_config_ui.cpp exposes

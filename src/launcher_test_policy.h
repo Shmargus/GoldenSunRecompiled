@@ -21,9 +21,11 @@ struct LauncherTestDefaults {
     bool map_record = false;
     bool obj_record = false;
     bool function_tracer = false;
+    bool text_record = false;
     bool vram_map_trace = false;
     bool room_buffer = false;
-    bool room_buffer_render = false;
+    bool swi_log = false;
+    bool bios_pc_log = false;
 };
 
 constexpr LauncherTestDefaults launcher_test_defaults() {

@@ -70,22 +70,19 @@ just to avoid asking. Keep the question short and in plain language.
 
 ## Who does what
 
-**Opus decides and delegates. Sonnet workers implement.**
+**You are the orchestrator and brains. Luna Max workers are your hands.**
 
-Opus works directly on:
+Decide scope, direct workers, and review their results. Use `gpt-5.6-luna`
+with `max` reasoning for implementation and investigation. Do execution work
+yourself only when Luna is not doing a good job on that task.
 
-- Small things, where delegating costs more than doing it
-- Anything needing full conversation context or judgement — architecture,
-  scope, direction, reading evidence, writing documentation
-- Reviewing what workers produce
+Only the orchestrator delegates. Workers never delegate. Give each worker a
+bounded task and require it to report back when finished or unable to finish.
+Worker reports are for the orchestrator, not the user. Keep them brief.
 
-Sonnet workers handle everything else: implementation, bug fixing, code
-inspection, build changes, focused investigations, mechanical refactors.
-
-Only Opus spawns workers. Workers never delegate. One worker per task, never a
-chain. If a worker cannot finish, it reports back and Opus decides.
-
-Worker reports are for Opus, not the user. Keep them to a few lines.
+Never check whether a subagent is done unless the user asks. Require workers
+to report back when finished. While a worker is working, wait without doing
+other work; resume only when its report arrives.
 
 ## Working principles
 
@@ -118,6 +115,9 @@ knows what they want the project to do, and who does not read code.
 Short. Normally say only what was wrong, what changed, and what to test. No
 long technical explanations unless asked, no narrating each step, no dumping
 logs.
+
+Always keep feedback concise and limited to necessary, relevant information.
+Speak to the user as little as possible.
 
 Say findings in terms of the game and what it means for the project, not in
 terms of the machine:

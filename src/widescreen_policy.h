@@ -292,8 +292,11 @@ inline constexpr bool golden_sun_expanded_viewport_branch_override(
     return false;
 }
 
-// B328's alternate writer may be widened only when the same current staging
-// record was admitted by B27E's widened route. Keep this predicate pure: the
+// B328 computes the body's own top-left after B27E's separate +0x0C path.
+// A rejected B27E does not reject that body: its computed Y may still be in
+// the expanded view (session 20260906_162111: 225 -> 199, down to 222 -> 196).
+// Require the same current execution identity, not acceptance of the parent.
+// Keep this predicate pure: the
 // runner supplies the current execution identity and the exact parent record,
 // while diagnostics remain observational and are not required for behavior.
 struct GoldenSunObjB328ParentMatch {
@@ -320,8 +323,9 @@ inline constexpr bool golden_sun_b328_parent_override(
         !parent.valid || parent.staging_address != staging_address ||
         parent.frame != frame || parent.call_depth != call_depth ||
         parent.call_return_pc != call_return_pc ||
-        parent.original_decision != 1u || parent.final_decision != 0u ||
-        !parent.overridden) {
+        parent.original_decision != 1u ||
+        !((parent.final_decision == 0u && parent.overridden) ||
+          (parent.final_decision == 1u && !parent.overridden))) {
         return false;
     }
     *out_decision = 0u;
@@ -391,13 +395,15 @@ inline constexpr int golden_sun_oam_shadow_slot_in_any_table(
 }
 
 // This is the only transfer that makes the shadow provenance visible to the
-// renderer. Keep the descriptor contract exact so another DMA cannot publish
-// a partially updated or unrelated OAM image.
+// renderer. The alternate table is observed in uploads but has no
+// authenticated writer route, so copying the primary pending array for that
+// transfer would attach coordinates to the wrong OAM image. Keep the
+// descriptor contract exact so another DMA cannot publish a partially
+// updated or unrelated image.
 inline constexpr bool golden_sun_obj_provenance_dma_handoff(
     std::uint32_t source, std::uint32_t destination, std::uint32_t bytes,
     std::uint16_t control) {
-    return (source == kGoldenSunOamShadowStart ||
-            source == kGoldenSunOamShadowAltStart) &&
+    return source == kGoldenSunOamShadowStart &&
            destination == kGoldenSunOamStart && bytes == kGoldenSunOamBytes &&
            (control & 0x0060u) == 0u;
 }
@@ -1607,7 +1613,7 @@ private:
 };
 
 // WIDE-01 experimental off-screen cull safety net. Gated entirely by the
-// launcher's "Experimental Fixes" toggle (see kNativeMp2kButton-style wiring
+// launcher's "Enhanced Options" toggle (see launcher_main.cpp wiring
 // in src/launcher_main.cpp and golden_sun_experimental_fixes_enabled() in
 // src/runner_main.cpp) -- normal play never calls any of this. Pure
 // functions, no I/O, no game state. See docs/issues/WIDE-01_NPC_IDENTITY.md,
