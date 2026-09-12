@@ -18,7 +18,7 @@ The application should request a user-owned, legally obtained ROM and BIOS and v
 
 At the time this starter was prepared:
 
-- `mstan/gbarecomp` uses the PolyForm Noncommercial License 1.0.0. That restricts commercial use. Pin and preserve the upstream license/attribution.
+- `mstan/gbarecomp` uses the PolyForm Noncommercial License 1.0.0. That restricts commercial use. An edited copy of it is committed in `gbarecomp/`, which that licence permits for noncommercial use as long as the licence text travels with the copy: keep `gbarecomp/LICENSE` and `gbarecomp/THIRD_PARTY_ATTRIBUTION.md` in place, and keep this project noncommercial.
 - `gsret/goldensun` does not visibly provide a repository license in its root. Absence of a license is not permission to copy or redistribute its source.
 
 Therefore:

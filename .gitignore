@@ -124,3 +124,10 @@ logs/mmio_map_*.csv
 # Kept on disk, out of the repo -- the live documentation is README.md,
 # AGENTS.md, ARCHITECTURE.md, ROADMAP.md, FACTS.md and docs/.
 docs/OLD/
+
+# The engine lives in this repo (see README). Its own .gitignore keeps its
+# build output and generated code out; these are the parts of the upstream
+# checkout that are nothing to do with the engine's working.
+gbarecomp/.claude/
+gbarecomp/.github/
+gbarecomp/oracle/

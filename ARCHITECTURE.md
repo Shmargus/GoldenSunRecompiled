@@ -164,7 +164,7 @@ Status: accepted. Commit and license pinned 2026-07-18 (see the upstream section
 
 Reason: it already provides the ARMv4T and GBA runtime layers. Rebuilding those from scratch would multiply scope.
 
-Caveat: the local checkout carries generic fixes not yet upstreamed, so the public pin must not be advanced and gates depending on those fixes are not yet reproducible from the pin alone. Still open as of 2026-09-04; the `gbarecomp` submodule carries uncommitted work from several sessions.
+Caveat: the engine copy in `gbarecomp/` carries generic fixes not yet sent upstream, so gates depending on them are not reproducible from upstream alone. Resolved as of 2026-09-12 for the repository's own consistency: the engine is committed here as ordinary files rather than a submodule pin, so a checkout of this repository always describes a buildable engine. Sending those fixes upstream is still open.
 
 ### D-004 — `gsret/goldensun` is consumed through local metadata import
 
