@@ -37,6 +37,8 @@ the routing below, and load the specific file rather than its whole directory.
 | Repository layout, where things live | `docs/WORKSPACE_LAYOUT.md` |
 | Audio — shelved, do not start unprompted | `docs/features/MP2K.md` |
 | ROM, BIOS, asset or licensing boundaries | `docs/LEGAL.md` |
+| Who owns which part of this repository | `ATTRIBUTION.md` |
+| What our engine copy changed vs upstream | `gbarecomp/MODIFICATIONS.md` |
 
 ### Never load these into context
 

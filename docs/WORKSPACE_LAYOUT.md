@@ -19,6 +19,9 @@ Golden Sun Recompiled/
   docs/                 routed reference notes
     docs/features/      MP2K, timing, cheats
     docs/LEGAL.md       ROM/BIOS/asset boundaries
+    ATTRIBUTION.md      who owns which part of the repository
+    gbarecomp/          the engine: an edited copy of mstan/gbarecomp
+                        (PolyForm Noncommercial; see MODIFICATIONS.md)
     docs/TESTING.md     oracle and regression strategy
     docs/OLD/           superseded; never current guidance
   build/                ignored build output

@@ -6,27 +6,30 @@ A native x86-64 static recompilation of **Golden Sun (GBA)** built on
 You supply your own legally obtained ROM and BIOS; both are hash-verified
 locally. No ROM, BIOS, save or extracted asset is in this repository.
 
-## The engine
+## What is here, and who owns what
 
-The emulation and recompilation engine is
-[`gbarecomp`](https://github.com/mstan/gbarecomp) by mstan. This project
-carries an **edited** copy of it, in `gbarecomp/` -- ordinary files in this
-repository, not a submodule. The PPU, VRAM trace and ARM runtime have changes
-Golden Sun depends on, so building against upstream `gbarecomp` will not
-reproduce this build, and there is no upstream commit that describes it.
-Golden Sun specifics stay outside `gbarecomp/`; general ARMv4T or GBA hardware
-fixes are made inside it and are candidates to send upstream.
+`ATTRIBUTION.md` answers this in full, and is the file to keep current. In
+short:
 
-Upstream is licensed **PolyForm Noncommercial 1.0.0** (`gbarecomp/LICENSE`,
-copyright Matthew Stan), which permits noncommercial use, modification and
-redistribution provided the licence travels with the copy. That licence file is
-kept in place, and it governs this whole project's use of the engine: **this
-project is noncommercial.** Excluded from the copy, as nothing to do with the
-engine's working: its `.github/`, `.claude/` and the optional mGBA-backed
-`oracle/` (off by default, and it needs a libmgba this repository does not
-carry).
-
-Anything the upstream README describes is still in `gbarecomp/README.md`.
+- **The game is not here.** No ROM, BIOS, save, or extracted asset, ever. You
+  supply your own legally obtained ROM and BIOS; both are hash-verified
+  locally, and what the build generates from them stays out of this repository.
+  `docs/LEGAL.md` is the rule.
+- **The engine is not ours.** `gbarecomp/` is an edited copy of
+  [`gbarecomp`](https://github.com/mstan/gbarecomp) by mstan, licensed
+  **PolyForm Noncommercial 1.0.0** (`gbarecomp/LICENSE`, kept in place). That
+  licence permits exactly this -- use, modify, redistribute -- for
+  noncommercial purposes, so **this project is noncommercial.** It is ordinary
+  files here, not a submodule, because the engine carries changes Golden Sun
+  depends on and no upstream commit describes them;
+  `gbarecomp/MODIFICATIONS.md` says what they are. A fix about ARMv4T, GBA
+  hardware or the recompiler belongs inside `gbarecomp/` and is a candidate to
+  send upstream; anything about Golden Sun stays outside it.
+- **The rest is ours** -- `src/`, `tools/`, `tests/`, `config/`, `scripts/` and
+  the docs -- and `LICENSE` has not yet chosen terms for it, so all rights are
+  reserved for now.
+- **Two libraries are fetched at build time**, not stored here: Dear ImGui and
+  toml++, both MIT, each pinned to an exact version.
 
 **Read `AGENTS.md` first.** It holds the working rules, the build commands, and
 a routing table saying which further file to read for a given task. Then
