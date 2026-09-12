@@ -16,6 +16,9 @@
 #include "function_tracer.h"
 #include "map_recorder.h"
 #include "obj_recorder.h"
+#include "object_buffer.h"
+#include "object_probe.h"
+#include "battle_view.h"
 #include "room_buffer.h"
 #include "gba_bus.h"
 #include "gba_ppu.h"
@@ -24,6 +27,7 @@
 #include "relocatable_identity.h"
 #include "relocatable_writer_policy.h"
 #include "player_speed_cheat.h"
+#include "text_speed_cheat.h"
 #include "runtime.h"
 #include "runtime_bus_bridge.h"
 #include "runtime_arm.h"
@@ -220,6 +224,38 @@ std::uint32_t g_golden_sun_wide_extra_left = 0;
 std::uint32_t g_golden_sun_wide_extra_right = 0;
 std::uint32_t g_golden_sun_wide_extra_top = 0;
 std::uint32_t g_golden_sun_wide_extra_bottom = 0;
+// Battle backdrop presentation state, refreshed per rendered row by the
+// margin policy below and read per pixel by the sample provider.
+// One regular BG's addressing, decoded once per frame so a per-pixel or
+// per-row opacity question needs nothing but VRAM.
+struct GoldenSunBgGeometry {
+    std::uint32_t char_base = 0;
+    std::uint32_t screen_base = 0;
+    std::uint32_t width_px = 256;
+    std::uint32_t height_px = 256;
+    std::uint32_t block_cols = 1;
+    std::uint32_t hofs = 0;
+    std::uint32_t vofs = 0;
+    bool color256 = false;
+};
+// Where each row of the expanded canvas takes its menu pixels from: the
+// authentic row, or -1 for "draw nothing here". Built once per frame from the
+// panels the menu layer actually drew (see golden_sun_build_battle_menu_map).
+constexpr int kGoldenSunBattleMenuMapRows = 512;
+struct GoldenSunBattleBackdrop {
+    bool active = false;
+    int arena_centre = 0;        // middle of the band the arena is drawn in
+    int band_bottom = 0;         // WIN0V bottom edge: end of the scene band
+    bool icons_visible = false;  // no window is hiding the command strip
+    bool menus = false;          // the menu layer is on and moves to the edges
+    bool affine_arena = false;   // that layer is on and takes our zoom too
+    gsr::battle::Zoom affine_zoom{};  // the remainder of the game's own zoom
+    GoldenSunBgGeometry backdrop;     // the arena/icon layer
+    GoldenSunBgGeometry menu;         // the panel layer
+    std::int16_t menu_map[kGoldenSunBattleMenuMapRows] = {};
+    bool menu_map_valid = false;
+};
+GoldenSunBattleBackdrop g_golden_sun_battle_backdrop_state;
 bool g_golden_sun_mode0_field = false;
 bool g_golden_sun_mode0_split_scroll = false;
 gsr::widescreen::GoldenSunFieldAuthoredMap g_golden_sun_field_authored;
@@ -370,6 +406,17 @@ std::array<GoldenSunObjPlacementProvenance,
 std::array<GoldenSunObjPlacementProvenance,
            gsr::widescreen::kGoldenSunOamShadowSlotCount>
     g_golden_sun_obj_visible_provenance{};
+
+// Bumped on every change to either provenance store. The identity search in
+// golden_sun_obj_provider_provenance memoises its result per OAM entry for a
+// frame, and that memo is only exact while the stores hold still. The visible
+// store is replaced wholesale at the shadow->OAM handoff, but the PENDING
+// store is written per slot by the commit path DURING a frame -- so "once per
+// frame" is not a safe memo key on its own, and a record committed after the
+// first scanline would otherwise go unseen until the next frame. Pairing the
+// frame with this counter makes the memo exact instead of merely usually
+// right.
+std::uint64_t g_golden_sun_obj_provenance_generation = 0;
 
 // B324/B328 operate on the guest's transient 12-byte sprite records in
 // IWRAM, not on the OAM shadow.  Keep the logical coordinates keyed by that
@@ -2930,6 +2977,7 @@ void golden_sun_oam_shadow_write_observer(std::uint32_t writer_pc,
                     g_golden_sun_obj_pending_provenance.size()) {
                 auto& pending = g_golden_sun_obj_pending_provenance[
                     static_cast<std::size_t>(slot)];
+                ++g_golden_sun_obj_provenance_generation;
                 pending.valid = true;
                 pending.x_valid = true;
                 pending.y_valid = true;
@@ -4724,6 +4772,19 @@ void record_golden_sun_shadow_dma_slots(
     }
 }
 
+// Per-OAM-upload tally of which sprite table an upload's source address
+// belongs to: 0 primary (kGoldenSunOamShadowStart), 1 alt
+// (kGoldenSunOamShadowAltStart), 2 the unrecognised-geometry 0x03002000
+// address, 3 anything else. An "upload" is any DMA with destination
+// kGoldenSunOamStart and bytes == kGoldenSunOamBytes, regardless of whether
+// golden_sun_obj_provenance_dma_handoff() publishes it -- this only counts,
+// it never changes what gets published. Measurement for FACTS.md 2026-09-06
+// / 2026-09-11: which table is live during the Move Psynergy collapse.
+// Accumulated monotonically, never reset here; the tracer reads the
+// per-frame delta. Same plain-array, C-linkage pattern as
+// g_ws_obj_reject_totals below.
+extern "C" unsigned long long g_ws_oam_src_totals[4] = {0, 0, 0, 0};
+
 // Diagnostic-only snapshot shared by upload and render events.
 void note_obj_lifetime(const char* event, const char* reason, int slot,
     std::uint32_t source, std::uint16_t a0, std::uint16_t a1, std::uint16_t a2,
@@ -4761,6 +4822,18 @@ void golden_sun_wide_dma_descriptor_observer(
             source, destination, bytes, control)) {
         g_golden_sun_obj_visible_provenance =
             g_golden_sun_obj_pending_provenance;
+        ++g_golden_sun_obj_provenance_generation;
+    }
+    // Count every OAM upload by source table, independent of diagnostics
+    // flags and of whether this exact transfer gets published above -- see
+    // g_ws_oam_src_totals.
+    if (destination == gsr::widescreen::kGoldenSunOamStart &&
+        bytes == gsr::widescreen::kGoldenSunOamBytes) {
+        const std::size_t bucket =
+            source == gsr::widescreen::kGoldenSunOamShadowStart ? 0u :
+            source == gsr::widescreen::kGoldenSunOamShadowAltStart ? 1u :
+            source == 0x03002000u ? 2u : 3u;
+        ++g_ws_oam_src_totals[bucket];
     }
     if (gsr::obj_recorder_enabled() && destination == 0x07000000u &&
         bytes == gsr::widescreen::kGoldenSunOamShadowSlotCount *
@@ -5744,12 +5817,314 @@ void maybe_report_golden_sun_cull_trace();
 
 // With the room buffer supplying margin content, no raster line needs
 // pillarboxing: the buffer blanks per sample exactly where it has no answer.
-unsigned golden_sun_room_buffer_margin_policy(std::uint16_t, const std::uint8_t*) {
+// The expanded view leaves a battle in a 240x160 island because the backdrop
+// is a flat layer the hardware cannot scale and the game letterboxes it to a
+// band (see src/battle_view.h). Decide once per rendered row whether this is
+// such a frame and where its band starts; the per-pixel provider below does
+// nothing else but apply it. Arming the layer mask here also keeps the hook
+// out of the field path entirely, so field frames pay no per-pixel call.
+void golden_sun_build_battle_menu_map(GoldenSunBattleBackdrop& st);
+
+void golden_sun_update_battle_backdrop(std::uint16_t dispcnt,
+                                       const std::uint8_t* io) {
+    GoldenSunBattleBackdrop next;
+    if (g_ws_active && io != nullptr &&
+        gsr::battle::is_battle_frame(dispcnt)) {
+        const std::uint16_t win0v =
+            static_cast<std::uint16_t>(io[0x44] | (io[0x45] << 8));
+        int band_bottom_row = 0;
+        if (gsr::battle::band_bottom(
+                win0v, static_cast<int>(gsr::widescreen::kNativeHeight),
+                &band_bottom_row)) {
+            const int view_height =
+                static_cast<int>(gsr::widescreen::kNativeHeight) +
+                static_cast<int>(g_golden_sun_wide_extra_top) +
+                static_cast<int>(g_golden_sun_wide_extra_bottom);
+            const int arena_centre =
+                gsr::battle::band_centre(band_bottom_row);
+            (void)view_height;
+            if (arena_centre >= 0) {
+                const auto decode_bg = [&](unsigned layer) {
+                    GoldenSunBgGeometry g;
+                    const std::uint32_t cnt = 0x08u + 2u * layer;
+                    const std::uint32_t scroll = 0x10u + 4u * layer;
+                    const std::uint16_t bgcnt = static_cast<std::uint16_t>(
+                        io[cnt] | (io[cnt + 1] << 8));
+                    const std::uint32_t size_code = (bgcnt >> 14) & 0x3u;
+                    g.char_base = ((bgcnt >> 2) & 0x3u) * 0x4000u;
+                    g.screen_base = ((bgcnt >> 8) & 0x1Fu) * 0x800u;
+                    g.color256 = (bgcnt & 0x0080u) != 0u;
+                    g.width_px = ((size_code & 1u) ? 64u : 32u) * 8u;
+                    g.height_px = ((size_code & 2u) ? 64u : 32u) * 8u;
+                    g.block_cols = (g.width_px / 8u) / 32u;
+                    g.hofs = static_cast<std::uint32_t>(
+                        io[scroll] | (io[scroll + 1] << 8)) & 0x01FFu;
+                    g.vofs = static_cast<std::uint32_t>(
+                        io[scroll + 2] | (io[scroll + 3] << 8)) & 0x01FFu;
+                    return g;
+                };
+                next.active = true;
+                next.arena_centre = arena_centre;
+                next.band_bottom = band_bottom_row;
+                // The game magnifies the affine layer itself while its camera
+                // pushes in, so ours there is only the remainder; the flat
+                // layer, which the game never scales, takes the full factor.
+                if ((dispcnt & (0x0100u << gsr::battle::kArenaAffineLayer)) !=
+                        0u) {
+                    constexpr std::uint32_t kPa = 0x20u;  // BG2PA
+                    const std::int16_t pa = static_cast<std::int16_t>(
+                        io[kPa] | (io[kPa + 1] << 8));
+                    next.affine_zoom = gsr::battle::affine_zoom(pa);
+                    next.affine_arena = true;
+                }
+                next.menus =
+                    (dispcnt & (0x0100u << gsr::battle::kMenuLayer)) != 0u;
+                next.icons_visible = (dispcnt & 0x6000u) == 0u;
+                next.backdrop = decode_bg(gsr::battle::kBackdropLayer);
+                next.menu = decode_bg(gsr::battle::kMenuLayer);
+                // The panel scan reads VRAM for every authentic row, and
+                // this rule runs once per RENDERED row, so build the map on
+                // the frame's first call and hand out copies after that.
+                if (next.menus) {
+                    static std::uint64_t map_frame = ~std::uint64_t{0};
+                    static std::int16_t map[kGoldenSunBattleMenuMapRows] = {};
+                    static bool map_valid = false;
+                    const std::uint64_t frame = runtime_current_frame();
+                    if (frame != map_frame) {
+                        map_frame = frame;
+                        golden_sun_build_battle_menu_map(next);
+                        std::memcpy(map, next.menu_map, sizeof(map));
+                        map_valid = next.menu_map_valid;
+                    } else {
+                        std::memcpy(next.menu_map, map, sizeof(map));
+                        next.menu_map_valid = map_valid;
+                    }
+                }
+            }
+        }
+    }
+    g_golden_sun_battle_backdrop_state = next;
+    unsigned layers = 0u;
+    if (next.active) {
+        layers |= 1u << gsr::battle::kBackdropLayer;
+        if (next.affine_arena) layers |= 1u << gsr::battle::kArenaAffineLayer;
+        if (next.menus) layers |= 1u << gsr::battle::kMenuLayer;
+    }
+    gba::g_ws_bg_sample_provider_layers = layers;
+    // The arena layers answer for the whole canvas now, so the band the game
+    // letterboxes them with must not also clip them: our own mapping is what
+    // decides where the arena appears. The menu layer keeps its windows --
+    // they are how the game masks its own panels.
+    gba::g_ws_bg_sample_provider_ignore_window_layers =
+        layers & ~(1u << gsr::battle::kMenuLayer);
+    // A battle frame is assembled at VBlank from the latched per-row state
+    // instead of streaming: the menu strips and the command icons are shown on
+    // rows other than their own, which a streaming row cannot reach. Field
+    // frames keep the streaming path untouched.
+    gba::g_ws_defer_native_rows = next.active ? 1 : 0;
+
+    // Alongside the renderer's own row dump (armed by the same launcher
+    // toggle): what this rule decided, once per frame. Without it a capture
+    // shows what the game did but not what we did about it.
+    if (gba::g_ws_row_state_dump_mode >= 0) {
+        static std::uint64_t last_frame = ~std::uint64_t{0};
+        static unsigned long long lines = 0;
+        const std::uint64_t frame = runtime_current_frame();
+        if (frame != last_frame && lines < 20000ull) {
+            last_frame = frame;
+            if (FILE* f = std::fopen("logs/battle_rule.csv", "a")) {
+                if (lines == 0) {
+                    std::fprintf(f,
+                        "frame,dispcnt,active,band_bottom,arena_centre,"
+                        "menus,icons_visible,layers\n");
+                }
+                ++lines;
+                std::fprintf(f, "%llu,%u,%d,%d,%d,%d,%d,%u\n",
+                             static_cast<unsigned long long>(frame),
+                             static_cast<unsigned>(dispcnt),
+                             next.active ? 1 : 0, next.band_bottom,
+                             next.arena_centre,
+                             next.menus ? 1 : 0, next.icons_visible ? 1 : 0,
+                             layers);
+                std::fclose(f);
+            }
+        }
+    }
+}
+
+// Is this layer's own pixel at this native position opaque? Asked about the
+// command-icon strip below the scene band, and once per frame about the menu
+// layer's rows -- see battle_view.h.
+bool golden_sun_battle_bg_opaque(const GoldenSunBgGeometry& g, int hx, int y) {
+    const gba::GbaBus* bus = gbarecomp::active_bus();
+    if (bus == nullptr) return false;
+    const std::uint8_t* vram = bus->vram_ptr();
+    if (vram == nullptr) return false;
+    const std::uint32_t tex_x =
+        static_cast<std::uint32_t>(hx + static_cast<int>(g.hofs)) &
+        (g.width_px - 1u);
+    const std::uint32_t tex_y =
+        static_cast<std::uint32_t>(y + static_cast<int>(g.vofs)) &
+        (g.height_px - 1u);
+    const std::uint32_t tile_x = tex_x >> 3, tile_y = tex_y >> 3;
+    const std::uint32_t block = (tile_x >> 5) + (tile_y >> 5) * g.block_cols;
+    const std::uint32_t map_off = g.screen_base + block * 0x800u +
+        ((tile_y & 31u) * 32u + (tile_x & 31u)) * 2u;
+    if (map_off + 1u >= 96u * 1024u) return false;
+    const std::uint16_t entry = static_cast<std::uint16_t>(
+        vram[map_off] | (vram[map_off + 1] << 8));
+    const std::uint32_t tile_num = entry & 0x03FFu;
+    std::uint32_t px = tex_x & 7u, py = tex_y & 7u;
+    if (entry & 0x0400u) px = 7u - px;
+    if (entry & 0x0800u) py = 7u - py;
+    if (g.color256) {
+        const std::uint32_t addr =
+            g.char_base + tile_num * 64u + py * 8u + px;
+        if (addr >= 96u * 1024u) return false;
+        return vram[addr] != 0u;
+    }
+    const std::uint32_t addr =
+        g.char_base + tile_num * 32u + py * 4u + (px >> 1);
+    if (addr >= 96u * 1024u) return false;
+    const std::uint8_t packed = vram[addr];
+    const std::uint8_t nibble = (px & 1u) ? static_cast<std::uint8_t>(packed >> 4)
+                                          : static_cast<std::uint8_t>(packed & 0x0Fu);
+    return nibble != 0u;
+}
+
+bool golden_sun_battle_backdrop_opaque(int hx, int y) {
+    return golden_sun_battle_bg_opaque(
+        g_golden_sun_battle_backdrop_state.backdrop, hx, y);
+}
+
+// Which authentic row each canvas row shows of the menu layer. Built from the
+// panels the game actually drew rather than from a fixed split of the screen:
+// a run of rows the menu layer has drawn on is one panel, a panel that fits
+// inside the top or bottom strip travels whole into that margin, and anything
+// taller stays where it is (battle_view.h, menu_block_shift). Splitting at a
+// row instead tore the Psynergy list in half in play on 2026-09-12.
+void golden_sun_build_battle_menu_map(GoldenSunBattleBackdrop& st) {
+    const int native_h = static_cast<int>(gsr::widescreen::kNativeHeight);
+    const int native_w = static_cast<int>(gsr::widescreen::kNativeWidth);
+    const int extra_top = static_cast<int>(g_golden_sun_wide_extra_top);
+    const int extra_bottom = static_cast<int>(g_golden_sun_wide_extra_bottom);
+    const int canvas_rows = native_h + extra_top + extra_bottom;
+    if (canvas_rows > kGoldenSunBattleMenuMapRows) {
+        st.menu_map_valid = false;
+        return;
+    }
+    // Start from "every row where the game drew it": a canvas row outside the
+    // authentic screen shows nothing unless a panel moves there.
+    for (int c = 0; c < canvas_rows; ++c) {
+        const int row = c - extra_top;
+        st.menu_map[c] = (row >= 0 && row < native_h)
+            ? static_cast<std::int16_t>(row) : static_cast<std::int16_t>(-1);
+    }
+    // Sampling every fourth column is enough to find a panel: the narrowest
+    // one the game draws is a window frame tens of pixels wide, and a couple
+    // of stray pixels must not make a row count as drawn-on.
+    bool drawn[256] = {};
+    for (int y = 0; y < native_h; ++y) {
+        int hits = 0;
+        for (int x = 0; x < native_w; x += 4) {
+            if (golden_sun_battle_bg_opaque(st.menu, x, y) && ++hits >= 2) break;
+        }
+        drawn[y] = hits >= 2;
+    }
+    for (int y = 0; y < native_h; ) {
+        if (!drawn[y]) { ++y; continue; }
+        int end = y;
+        while (end + 1 < native_h && drawn[end + 1]) ++end;
+        const int shift = gsr::battle::menu_block_shift(
+            y, end, native_h, extra_top, extra_bottom);
+        if (shift != 0) {
+            for (int row = y; row <= end; ++row) {
+                const int from = row + extra_top;
+                const int to = row + shift + extra_top;
+                if (from >= 0 && from < canvas_rows) st.menu_map[from] = -1;
+                if (to >= 0 && to < canvas_rows) {
+                    st.menu_map[to] = static_cast<std::int16_t>(row);
+                }
+            }
+        }
+        y = end + 1;
+    }
+    st.menu_map_valid = true;
+}
+
+// Where the backdrop and the menus appear on the expanded canvas. Nothing is
+// scaled: the arena keeps its authentic size and reaches the side margins by
+// its own wrap, the menu strips keep their size and move to the canvas edges,
+// and every sprite is untouched.
+int golden_sun_battle_bg_sample_provider(int bg, int output_x, int screen_y,
+                                         int* out_hw_x, int* out_hw_y) {
+    const GoldenSunBattleBackdrop& st = g_golden_sun_battle_backdrop_state;
+    if (!st.active || out_hw_x == nullptr || out_hw_y == nullptr) return 0;
+    const int native_w = static_cast<int>(gsr::widescreen::kNativeWidth);
+    const int native_h = static_cast<int>(gsr::widescreen::kNativeHeight);
+    const int extra_top = static_cast<int>(g_golden_sun_wide_extra_top);
+    const int extra_bottom = static_cast<int>(g_golden_sun_wide_extra_bottom);
+    const int out_x =
+        output_x - static_cast<int>(g_golden_sun_wide_extra_left);
+
+    // The menu panels keep their size and move to the canvas edges. Which row
+    // a canvas row shows was decided once this frame, from the panels the game
+    // drew. The layer has no answer of its own beyond the authentic 240
+    // columns -- the map wraps there, onto the scratch tiles the game leaves
+    // off-screen -- so a panel stops at the authentic width, as the existing
+    // BG0 margin rule already does for the rest of the game.
+    if (st.menus && bg == static_cast<int>(gsr::battle::kMenuLayer)) {
+        if (out_x < 0 || out_x >= native_w) return -1;
+        if (!st.menu_map_valid) return 0;
+        const int canvas_row = screen_y + extra_top;
+        if (canvas_row < 0 || canvas_row >= kGoldenSunBattleMenuMapRows) {
+            return -1;
+        }
+        const int row = st.menu_map[canvas_row];
+        if (row < 0) return -1;         // the panel that was here moved away
+        if (row == screen_y) return 0;  // stays put: leave the pixel alone
+        *out_hw_x = out_x;
+        *out_hw_y = row;
+        return 1;
+    }
+
+    const bool backdrop = bg == static_cast<int>(gsr::battle::kBackdropLayer);
+    const bool affine_arena = st.affine_arena &&
+        bg == static_cast<int>(gsr::battle::kArenaAffineLayer);
+    if (!backdrop && !affine_arena) return 0;
+
+    // The command icons ride on the arena layer but belong to the bottom menu
+    // strip, so they travel with it, at their authentic size, rather than
+    // being magnified with the scenery.
+    if (backdrop) {
+        const int icon_y = screen_y - extra_bottom;
+        if (gsr::battle::icon_strip_row(out_x, icon_y, native_w, native_h,
+                                        st.band_bottom, !st.icons_visible) &&
+            golden_sun_battle_backdrop_opaque(out_x, icon_y)) {
+            *out_hw_x = out_x;
+            *out_hw_y = icon_y;
+            return 1;
+        }
+    }
+    const gsr::battle::Zoom zoom =
+        backdrop ? gsr::battle::kArenaZoom : st.affine_zoom;
+    if (!gsr::battle::arena_sample(out_x, screen_y, native_w, native_h,
+                                   extra_bottom, st.band_bottom, zoom,
+                                   out_hw_x, out_hw_y)) {
+        return -1;  // below the canvas: nothing to show
+    }
+    return 1;
+}
+
+unsigned golden_sun_room_buffer_margin_policy(std::uint16_t dispcnt,
+                                              const std::uint8_t* io) {
+    golden_sun_update_battle_backdrop(dispcnt, io);
     return 0u;
 }
 
 unsigned golden_sun_wide_margin_policy_callback(
     std::uint16_t dispcnt, const std::uint8_t* io) {
+    golden_sun_update_battle_backdrop(dispcnt, io);
     maybe_report_golden_sun_cull_trace();
     const GoldenSunWidePolicyReason reason =
         gsr::widescreen::golden_sun_wide_margin_policy_reason(dispcnt, io);
@@ -6068,6 +6443,216 @@ GoldenSunObjStagingProvenance* allocate_golden_sun_obj_staging(
     return oldest;
 }
 
+// Diagnostic only: does the guest's own actor record already hold the
+// full-precision position B324/B328 just handed us, somewhere in its own
+// bytes? This never changes what is drawn; it only tallies, per captured
+// sample, whether the record's bytes equal the captured value under a
+// handful of plausible encodings, so FACTS.md can say where (if anywhere)
+// the true position lives in memory instead of only in flight.
+//
+// Window: the measured actor-record stride is 0x38 bytes
+// (golden_sun_obj_record_identity, FACTS.md "Sprites, NPCs and shadows"),
+// with the body's coordinates at +0x00 and the paired shadow's at +0x0C.
+// Scanning exactly that stride -- not more -- means a hit can never be an
+// alias into the next actor's record, and not less, because +0x0C is
+// already known to matter and a narrower window would exclude it a priori.
+//
+// Encodings: unsigned/signed 16-bit, unsigned/signed 32-bit, and 16.16
+// fixed point (the camera at 0x02030DB0 is 16.16, so it is a live
+// candidate for other guest position fields too).
+//
+// Candidate kinds: the captured value (B324/B328) is a screen coordinate --
+// it is what gets truncated into the OAM entry -- while a guest actor record
+// would normally hold a world coordinate. Comparing the record's bytes only
+// against the raw screen value asks whether the record stores screen space
+// verbatim; it says nothing about world space. So each record byte pattern
+// is also compared against the captured value with the room camera's
+// current integer pixel position added and subtracted, covering both
+// world-to-screen sign conventions. The camera itself (0x02030DB0, x then
+// y, 16.16 fixed point) is read once per sample, exactly as room_buffer.cpp
+// decodes it: the integer part is the high 16 bits of each 32-bit field,
+// read unsigned via bus_read_u16.
+constexpr std::uint32_t kGoldenSunObjPositionProbeWindowBytes = 0x38u;
+enum GoldenSunObjPositionProbeEncoding {
+    kGoldenSunObjPositionProbeU16 = 0,
+    kGoldenSunObjPositionProbeI16,
+    kGoldenSunObjPositionProbeU32,
+    kGoldenSunObjPositionProbeI32,
+    kGoldenSunObjPositionProbeFixed1616,
+    kGoldenSunObjPositionProbeEncodingCount,
+};
+constexpr const char* kGoldenSunObjPositionProbeEncodingNames[
+    kGoldenSunObjPositionProbeEncodingCount] = {
+    "u16", "i16", "u32", "i32", "fixed16.16",
+};
+enum GoldenSunObjPositionProbeCandidateKind {
+    kGoldenSunObjPositionProbeAsIs = 0,
+    kGoldenSunObjPositionProbePlusCamera,
+    kGoldenSunObjPositionProbeMinusCamera,
+    kGoldenSunObjPositionProbeCandidateKindCount,
+};
+constexpr const char* kGoldenSunObjPositionProbeCandidateKindNames[
+    kGoldenSunObjPositionProbeCandidateKindCount] = {
+    "as-is", "+camera", "-camera",
+};
+constexpr std::uint32_t kGoldenSunObjPositionProbeCameraBase = 0x02030DB0u;
+struct GoldenSunObjPositionProbeTally {
+    std::uint64_t hits[kGoldenSunObjPositionProbeCandidateKindCount]
+                       [kGoldenSunObjPositionProbeEncodingCount]
+                       [kGoldenSunObjPositionProbeWindowBytes] = {};
+};
+// [0] = x axis, [1] = y axis.
+GoldenSunObjPositionProbeTally g_golden_sun_obj_position_probe_hits[2];
+std::uint64_t g_golden_sun_obj_position_probe_samples[2] = {0, 0};
+
+void report_golden_sun_obj_position_probe() {
+    static const char* const kAxisNames[2] = {"x", "y"};
+    struct Candidate {
+        int kind;
+        int encoding;
+        std::uint32_t offset;
+        std::uint64_t hits;
+    };
+    for (int axis = 0; axis < 2; ++axis) {
+        const std::uint64_t samples = g_golden_sun_obj_position_probe_samples[axis];
+        std::fprintf(stderr,
+                     "[obj-position-probe] axis=%s samples=%llu (record "
+                     "window 0x00..0x%02x, keyed by the same record the "
+                     "sprite recorder already trusts; candidate kinds: "
+                     "as-is / +camera / -camera)\n",
+                     kAxisNames[axis],
+                     static_cast<unsigned long long>(samples),
+                     kGoldenSunObjPositionProbeWindowBytes);
+        if (samples == 0) continue;
+        std::vector<Candidate> candidates;
+        for (int kind = 0; kind < kGoldenSunObjPositionProbeCandidateKindCount;
+             ++kind) {
+            for (int enc = 0; enc < kGoldenSunObjPositionProbeEncodingCount;
+                 ++enc) {
+                for (std::uint32_t off = 0;
+                     off < kGoldenSunObjPositionProbeWindowBytes; ++off) {
+                    const std::uint64_t hits =
+                        g_golden_sun_obj_position_probe_hits[axis]
+                            .hits[kind][enc][off];
+                    if (hits > 0) candidates.push_back({kind, enc, off, hits});
+                }
+            }
+        }
+        std::sort(candidates.begin(), candidates.end(),
+                  [](const Candidate& a, const Candidate& b) {
+                      return a.hits > b.hits;
+                  });
+        if (candidates.empty()) {
+            std::fprintf(stderr,
+                         "[obj-position-probe]   no offset/encoding/kind "
+                         "matched any sample -- the true position is not "
+                         "stored verbatim in this record; a different "
+                         "approach is needed\n");
+            continue;
+        }
+        const std::size_t top_n = std::min<std::size_t>(candidates.size(), 8);
+        for (std::size_t i = 0; i < top_n; ++i) {
+            const Candidate& c = candidates[i];
+            std::fprintf(
+                stderr,
+                "[obj-position-probe]   kind=%-8s offset=+0x%02x "
+                "encoding=%-10s hits=%llu/%llu (%.1f%%)\n",
+                kGoldenSunObjPositionProbeCandidateKindNames[c.kind],
+                c.offset, kGoldenSunObjPositionProbeEncodingNames[c.encoding],
+                static_cast<unsigned long long>(c.hits),
+                static_cast<unsigned long long>(samples),
+                100.0 * static_cast<double>(c.hits) /
+                    static_cast<double>(samples));
+        }
+        if (candidates.front().hits * 2 < samples) {
+            std::fprintf(
+                stderr,
+                "[obj-position-probe]   best candidate covers only %.1f%% "
+                "of samples -- this reads as a scatter of coincidental "
+                "matches, not a real position field; do not treat it as an "
+                "answer\n",
+                100.0 * static_cast<double>(candidates.front().hits) /
+                    static_cast<double>(samples));
+        } else {
+            const Candidate& c = candidates.front();
+            std::fprintf(
+                stderr,
+                "[obj-position-probe]   kind=%s offset=+0x%02x "
+                "encoding=%s matches nearly every sample (%.1f%%) -- this "
+                "is the position field\n",
+                kGoldenSunObjPositionProbeCandidateKindNames[c.kind],
+                c.offset, kGoldenSunObjPositionProbeEncodingNames[c.encoding],
+                100.0 * static_cast<double>(c.hits) /
+                    static_cast<double>(samples));
+        }
+    }
+}
+
+// Called once per captured sample (never per pixel/scanline) from
+// record_golden_sun_obj_staging, using exactly the staging key (R7) that
+// function already keys its capture by. Read-only with respect to guest
+// memory; the tally table above is the only state this adds.
+void golden_sun_obj_position_probe_sample(std::uint32_t staging_address,
+                                          bool x_axis,
+                                          int logical_coordinate) {
+    if (!gsr::obj_recorder_enabled()) return;
+    std::uint32_t record_base = 0;
+    bool shadow = false;
+    if (!golden_sun_obj_record_identity(staging_address, &record_base,
+                                        &shadow))
+        return;
+    static bool atexit_armed = false;
+    if (!atexit_armed) {
+        atexit_armed = true;
+        std::atexit(report_golden_sun_obj_position_probe);
+    }
+    const int axis = x_axis ? 0 : 1;
+    ++g_golden_sun_obj_position_probe_samples[axis];
+    auto& tally = g_golden_sun_obj_position_probe_hits[axis];
+
+    // Camera, read once per sample -- integer pixel part only, decoded
+    // exactly as room_buffer.cpp reads it: the high 16 bits of each 32-bit
+    // 16.16 field, unsigned, x then y.
+    const std::int64_t camera_pixel = x_axis
+        ? static_cast<std::int64_t>(bus_read_u16(
+              kGoldenSunObjPositionProbeCameraBase + 2u))
+        : static_cast<std::int64_t>(bus_read_u16(
+              kGoldenSunObjPositionProbeCameraBase + 6u));
+
+    const std::int64_t want_by_kind[kGoldenSunObjPositionProbeCandidateKindCount] = {
+        static_cast<std::int64_t>(logical_coordinate),
+        static_cast<std::int64_t>(logical_coordinate) + camera_pixel,
+        static_cast<std::int64_t>(logical_coordinate) - camera_pixel,
+    };
+    for (int kind = 0; kind < kGoldenSunObjPositionProbeCandidateKindCount;
+         ++kind) {
+        const std::int64_t want = want_by_kind[kind];
+        for (std::uint32_t offset = 0;
+             offset + 2u <= kGoldenSunObjPositionProbeWindowBytes; ++offset) {
+            const std::uint16_t raw16 = bus_read_u16(record_base + offset);
+            if (static_cast<std::int64_t>(raw16) == want)
+                ++tally.hits[kind][kGoldenSunObjPositionProbeU16][offset];
+            if (static_cast<std::int64_t>(static_cast<std::int16_t>(raw16)) ==
+                want)
+                ++tally.hits[kind][kGoldenSunObjPositionProbeI16][offset];
+        }
+        for (std::uint32_t offset = 0;
+             offset + 4u <= kGoldenSunObjPositionProbeWindowBytes; ++offset) {
+            const std::uint32_t raw32 = bus_read_u32(record_base + offset);
+            if (static_cast<std::int64_t>(raw32) == want)
+                ++tally.hits[kind][kGoldenSunObjPositionProbeU32][offset];
+            const std::int32_t signed32 = static_cast<std::int32_t>(raw32);
+            if (static_cast<std::int64_t>(signed32) == want)
+                ++tally.hits[kind][kGoldenSunObjPositionProbeI32][offset];
+            // 16.16 fixed point, integer part only: arithmetic right shift
+            // keeps the sign, matching how the 16.16 camera field is read
+            // elsewhere in this file.
+            if (static_cast<std::int64_t>(signed32 >> 16) == want)
+                ++tally.hits[kind][kGoldenSunObjPositionProbeFixed1616][offset];
+        }
+    }
+}
+
 void record_golden_sun_obj_staging(std::uint32_t instruction_pc,
                                    bool x_axis, int logical_coordinate) {
     if (!golden_sun_expanded_obj_view_active()) return;
@@ -6080,10 +6665,14 @@ void record_golden_sun_obj_staging(std::uint32_t instruction_pc,
         staging->x_valid = true;
         staging->logical_x = static_cast<std::int16_t>(logical_coordinate);
         staging->x_writer_branch_pc = instruction_pc;
+        golden_sun_obj_position_probe_sample(g_cpu.R[7], true,
+                                             staging->logical_x);
     } else {
         staging->y_valid = true;
         staging->logical_y = static_cast<std::int16_t>(logical_coordinate);
         staging->y_writer_branch_pc = instruction_pc;
+        golden_sun_obj_position_probe_sample(g_cpu.R[7], false,
+                                             staging->logical_y);
         if (instruction_pc == 0x0800B328u && logical_coordinate >= 160 &&
             logical_coordinate <= 199) {
             staging->y_correlation = capture_golden_sun_obj_y_correlation(
@@ -6273,6 +6862,7 @@ void golden_sun_obj_staging_handoff(
     auto& output = g_golden_sun_obj_pending_provenance[
         static_cast<std::size_t>(slot)];
     if (output.commit_resolved && output.frame == staging->frame) return;
+    ++g_golden_sun_obj_provenance_generation;
 
     // The authenticated D4 entry executes `ldmia r6, {r6,r7,r8}` before its
     // following store of R7/R8 as the two OAM words. Read that exact 12-byte
@@ -6536,17 +7126,110 @@ bool golden_sun_expanded_obj_view_active() {
         g_golden_sun_wide_extra_top, g_golden_sun_wide_extra_bottom);
 }
 
-// Select the provenance for the OAM image currently being rendered. The DMA
-// latched record always wins. A commit can race the next render before its
-// table is uploaded, so allow the pending record only for this frame and only
-// when its source slot, complete ATTR identity, both axes, and hardware
-// truncation all agree. In particular, matching ATTRs alone is insufficient:
-// full precision coordinates separated by an OAM wrap can share them. Select
-// the pair once so X cannot come from one image while Y comes from another.
+// First-failing-clause bucket for golden_sun_obj_provider_provenance's
+// usable() predicate below. Measurement only: this labels which conjunct of
+// the existing check rejected the candidate; it does not change which
+// candidate is selected.
+enum GoldenSunObjRejectReason : int {
+    kGoldenSunObjRejectNoRecord = 0,
+    kGoldenSunObjRejectWrongEpoch = 1,
+    kGoldenSunObjRejectPendingFrame = 2,
+    kGoldenSunObjRejectIdentity = 3,
+    kGoldenSunObjRejectAttrsMoved = 4,
+    kGoldenSunObjRejectTruncation = 5,
+    kGoldenSunObjRejectOk = 6,
+};
+
+// Sub-buckets breaking down kGoldenSunObjRejectAttrsMoved, tallied only when
+// that outcome is the one attributed to the object (see below). 7/8 are
+// mutually exclusive and together equal bucket 4. 9/10/11 may overlap -- an
+// object with two differing attributes increments two of them -- and at
+// least one of the three fires whenever bucket 4 does and the candidate's
+// identity was otherwise valid. Measurement only: these do not change which
+// candidate is selected or the attrs_match rule itself.
+constexpr std::size_t kGoldenSunObjRejectAttrsThisFrame = 7;
+constexpr std::size_t kGoldenSunObjRejectAttrsOldFrame = 8;
+constexpr std::size_t kGoldenSunObjRejectAttr0Differs = 9;
+constexpr std::size_t kGoldenSunObjRejectAttr1Differs = 10;
+constexpr std::size_t kGoldenSunObjRejectAttr2Differs = 11;
+
+// Per-object-per-frame reject-reason tally for golden_sun_obj_provider_
+// provenance, indexed by GoldenSunObjRejectReason (0..6) plus the
+// attrs_moved breakdown sub-buckets above (7..11). Gated on
+// gba::g_ws_obj_census_line (set by render_scanline_wide only while it
+// renders logical_y == 0) so this is a once-per-frame count comparable to
+// gba::g_ws_obj_trusted_total / g_ws_obj_untrusted_total, which use the same
+// gate. Accumulated monotonically, never reset here; the tracer reads the
+// per-frame delta. Follows the same plain-array, C-linkage pattern as
+// gba::g_ws_expanded_diag.
+extern "C" unsigned long long g_ws_obj_reject_totals[12] = {
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+
+// Per-object-per-frame tally of sprites resolved via the persistent position
+// table (golden_sun_obj_track_lookup, defined below) rather than the record
+// path above it or the raw-coordinate fallback beneath it. Same running-
+// total-since-session-start shape as g_ws_obj_reject_totals, and likewise
+// only incremented by the X provider so each object is counted once (the Y
+// provider queries the same memoised table lookup but does not tally).
+extern "C" unsigned long long g_ws_obj_from_track_total = 0;
+
+// Forward declaration: golden_sun_obj_provider_provenance below calls this to
+// populate the persistent position table (defined further down this file,
+// alongside golden_sun_obj_track_lookup) the moment it authenticates a
+// sprite. Declared here so that single call site can exist inside
+// provenance's own once-per-object-per-frame memo recompute, which is above
+// the table's definition in file order.
+void golden_sun_obj_track_confirm(int x, int y, std::uint16_t attr0,
+                                  std::uint16_t attr1, std::uint16_t attr2,
+                                  std::uint64_t frame);
+
+// Select the provenance for the OAM image currently being rendered. Slot
+// recycling is live and frequent (FACTS.md 2026-09-06/09-11): the game
+// reshuffles which character occupies which hardware OAM slot, so a record
+// keyed by slot index cannot survive it -- the slot at oam_index this frame
+// may hold a different sprite than the one that produced the record. Records
+// are therefore found by IDENTITY instead: a candidate is eligible when its
+// epoch, freshness (pending-frame rule), full ATTR0/1/2 identity and
+// hardware-truncated coordinates all agree with what is being rendered,
+// regardless of which slot it was filed under. The DMA-latched (visible)
+// store is searched first and wins outright over the pending store.
+//
+// Matching ATTRs alone is insufficient: full precision coordinates separated
+// by an OAM wrap can share them. The old slot key incidentally guarded
+// against this; identity does not, so an eligible match must additionally be
+// UNIQUE within its store. Two or more equally-eligible records means the
+// object cannot be told apart from another -- refuse rather than guess.
+//
+// tally_rejection: attribute this object's outcome to g_ws_obj_reject_totals.
+// Both the X and Y wide providers call this for the same object on the same
+// frame; only the X provider passes true, so each object is counted once
+// (Y deliberately does not tally). The bucket recorded is the VISIBLE
+// slot's own reason (kept as a diagnostic baseline, unchanged from before
+// this identity search existed), unless: the identity search actually found
+// a usable record, in which case the bucket is "ok"; or the identity search
+// found two-or-more equally-eligible records in either store, in which case
+// the outcome is attributed to the existing "identity" bucket (ambiguous
+// identity is a kind of identity failure, and this keeps signals.csv's
+// column meanings unchanged rather than adding a new one).
+//
+// Called once per object PER SCANLINE by both providers (up to 160 times a
+// frame per on-screen object), so the identity search is memoised per OAM
+// entry. The memo is keyed by frame AND by
+// g_golden_sun_obj_provenance_generation, not by frame alone: the visible
+// store is replaced wholesale at the shadow->OAM handoff, but the PENDING
+// store is written per slot by the commit path DURING a frame, so a
+// frame-only key would hide a record committed after the first scanline until
+// the next frame. With both in the key the memo is exact rather than usually
+// right. Cost note: a frame that commits heavily while the PPU is drawing
+// will invalidate and re-scan; that has not been measured as a problem, and
+// correctness came first here -- if it ever shows up, measure before
+// reshaping it.
 const GoldenSunObjPlacementProvenance*
 golden_sun_obj_provider_provenance(int oam_index, std::uint16_t attr0,
                                    std::uint16_t attr1, std::uint16_t attr2,
-                                   int raw_x, int raw_y) {
+                                   int raw_x, int raw_y,
+                                   bool tally_rejection,
+                                   bool allow_track_confirm) {
     if (oam_index < 0 || static_cast<std::size_t>(oam_index) >=
                             g_golden_sun_obj_visible_provenance.size())
         return nullptr;
@@ -6555,28 +7238,510 @@ golden_sun_obj_provider_provenance(int oam_index, std::uint16_t attr0,
         gsr::widescreen::kGoldenSunOamShadowSlotBytes;
     const std::uint32_t main_target =
         gsr::widescreen::kGoldenSunOamShadowStart + slot_offset;
+    // Same conjunction, same order, same short-circuiting as before this
+    // instrumentation: each branch below still bails at the first failing
+    // clause of the original expression, just labelled with which clause it
+    // was instead of collapsing straight to false. check_slot selects
+    // between the old by-slot identity check (kept only for the diagnostic
+    // baseline below) and the new by-identity search, which every other
+    // clause is shared with unchanged.
     const auto usable = [&](const GoldenSunObjPlacementProvenance& candidate,
-                            bool pending) {
-        if (!candidate.valid || !candidate.x_valid || !candidate.y_valid ||
-            candidate.auth_epoch != g_golden_sun_field_auth_epoch ||
-            (pending && candidate.frame != runtime_current_frame()) ||
-            !candidate.oam_identity_valid ||
-            candidate.target_address != main_target ||
-            !gsr::widescreen::golden_sun_obj_provenance_attrs_match(
+                            bool pending,
+                            bool check_slot) -> GoldenSunObjRejectReason {
+        if (!candidate.valid || !candidate.x_valid || !candidate.y_valid)
+            return kGoldenSunObjRejectNoRecord;
+        if (candidate.auth_epoch != g_golden_sun_field_auth_epoch)
+            return kGoldenSunObjRejectWrongEpoch;
+        if (pending && candidate.frame != runtime_current_frame())
+            return kGoldenSunObjRejectPendingFrame;
+        if (!candidate.oam_identity_valid ||
+            (check_slot && candidate.target_address != main_target))
+            return kGoldenSunObjRejectIdentity;
+        if (!gsr::widescreen::golden_sun_obj_provenance_attrs_match(
                 candidate.oam_identity_valid, candidate.expected_attr0,
                 candidate.expected_attr1, candidate.expected_attr2, attr0,
                 attr1, attr2))
-            return false;
-        return golden_sun_obj_oam_truncated(candidate.logical_x, 9) == raw_x &&
-               golden_sun_obj_oam_truncated(candidate.logical_y, 8) == raw_y;
+            return kGoldenSunObjRejectAttrsMoved;
+        if (golden_sun_obj_oam_truncated(candidate.logical_x, 9) != raw_x ||
+            golden_sun_obj_oam_truncated(candidate.logical_y, 8) != raw_y)
+            return kGoldenSunObjRejectTruncation;
+        return kGoldenSunObjRejectOk;
     };
+    // Scan `store` for identity-eligible records (every usable() clause
+    // except the slot key). Stops counting past 2: callers only need to
+    // distinguish "none", "exactly one" and "ambiguous".
+    const auto find_by_identity = [&](
+        const std::array<GoldenSunObjPlacementProvenance,
+                          gsr::widescreen::kGoldenSunOamShadowSlotCount>&
+            store,
+        bool pending) {
+        struct Match {
+            const GoldenSunObjPlacementProvenance* record = nullptr;
+            int count = 0;
+        } match;
+        for (const auto& candidate : store) {
+            if (usable(candidate, pending, /*check_slot=*/false) !=
+                kGoldenSunObjRejectOk) continue;
+            if (match.record == nullptr) {
+                match.record = &candidate;
+                match.count = 1;
+                continue;
+            }
+            // Two eligible records that AGREE are not an ambiguity -- they
+            // are the same character described twice, which is exactly what
+            // a slot reshuffle leaves behind: the record filed under the old
+            // slot and the one filed under the new slot both still describe
+            // this sprite. Counting that as ambiguous would refuse precisely
+            // the case this identity search exists to rescue. Only a genuine
+            // disagreement about where the sprite is means we cannot tell
+            // two sprites apart.
+            if (candidate.logical_x != match.record->logical_x ||
+                candidate.logical_y != match.record->logical_y) {
+                match.count = 2;
+                break;
+            }
+        }
+        return match;
+    };
+    // Memo: identity resolution is exact for the whole frame (see the
+    // function comment), so cache it per OAM entry and reuse it for every
+    // scanline this frame instead of re-scanning up to 256 records per call.
+    struct Memo {
+        std::uint64_t frame = UINT64_MAX;
+        std::uint64_t generation = UINT64_MAX;
+        const GoldenSunObjPlacementProvenance* result = nullptr;
+        GoldenSunObjRejectReason reason = kGoldenSunObjRejectNoRecord;
+    };
+    static std::array<Memo, gsr::widescreen::kGoldenSunOamShadowSlotCount>
+        memo{};
+    Memo& slot_memo = memo[static_cast<std::size_t>(oam_index)];
+    const std::uint64_t frame_now = runtime_current_frame();
+    const std::uint64_t generation_now = g_golden_sun_obj_provenance_generation;
     const auto& visible = g_golden_sun_obj_visible_provenance[
         static_cast<std::size_t>(oam_index)];
-    if (usable(visible, false)) return &visible;
-    const auto& pending = g_golden_sun_obj_pending_provenance[
-        static_cast<std::size_t>(oam_index)];
-    if (usable(pending, true)) return &pending;
-    return nullptr;
+    if (slot_memo.frame != frame_now ||
+        slot_memo.generation != generation_now) {
+        const GoldenSunObjRejectReason visible_slot_reason =
+            usable(visible, false, /*check_slot=*/true);
+        const auto visible_match =
+            find_by_identity(g_golden_sun_obj_visible_provenance, false);
+        const GoldenSunObjPlacementProvenance* result = nullptr;
+        bool ambiguous = false;
+        if (visible_match.count == 1) {
+            result = visible_match.record;
+        } else if (visible_match.count >= 2) {
+            ambiguous = true;
+        } else {
+            const auto pending_match =
+                find_by_identity(g_golden_sun_obj_pending_provenance, true);
+            if (pending_match.count == 1) {
+                result = pending_match.record;
+            } else if (pending_match.count >= 2) {
+                ambiguous = true;
+            }
+        }
+        slot_memo.frame = frame_now;
+        slot_memo.generation = generation_now;
+        slot_memo.result = result;
+        slot_memo.reason = result   ? kGoldenSunObjRejectOk
+                          : ambiguous ? kGoldenSunObjRejectIdentity
+                                      : visible_slot_reason;
+        // Feed the persistent position table (step 1 of the task spec):
+        // this fires exactly once per object per frame, gated by the memo
+        // recompute above, whenever the record path just authenticated a
+        // position. Gated on the expanded view being active since that is
+        // the table's only consumer (golden_sun_obj_track_lookup below).
+        // allow_track_confirm is false for the diagnostic accessor below: it
+        // reads live OAM at a different point in the frame than the renderer
+        // does, and a measurement tool must never change what is drawn.
+        if (result && allow_track_confirm &&
+            golden_sun_expanded_obj_view_active()) {
+            golden_sun_obj_track_confirm(result->logical_x, result->logical_y,
+                                         attr0, attr1, attr2, frame_now);
+        }
+    }
+    const GoldenSunObjPlacementProvenance* result = slot_memo.result;
+    if (tally_rejection && gba::g_ws_obj_census_line) {
+        const GoldenSunObjRejectReason bucket = slot_memo.reason;
+        ++g_ws_obj_reject_totals[static_cast<std::size_t>(bucket)];
+        // Breakdown below attributes only to the VISIBLE slot's own
+        // frame/attrs fields, matching the fact that bucket ==
+        // kGoldenSunObjRejectAttrsMoved here can only arise from the by-slot
+        // diagnostic baseline (see slot_memo.reason above): neither the
+        // identity search's pending fallback nor an ambiguous outcome
+        // surfaces its own reason into `bucket`.
+        if (bucket == kGoldenSunObjRejectAttrsMoved) {
+            if (visible.frame == runtime_current_frame())
+                ++g_ws_obj_reject_totals[kGoldenSunObjRejectAttrsThisFrame];
+            else
+                ++g_ws_obj_reject_totals[kGoldenSunObjRejectAttrsOldFrame];
+            if (visible.oam_identity_valid) {
+                if (visible.expected_attr0 != attr0)
+                    ++g_ws_obj_reject_totals[kGoldenSunObjRejectAttr0Differs];
+                if (visible.expected_attr1 != attr1)
+                    ++g_ws_obj_reject_totals[kGoldenSunObjRejectAttr1Differs];
+                if (visible.expected_attr2 != attr2)
+                    ++g_ws_obj_reject_totals[kGoldenSunObjRejectAttr2Differs];
+            }
+        }
+    }
+    return result;
+}
+
+// Sentinel raw OAM coordinates for a parked/hidden sprite:
+// (attr1 & 0x1FF) == 192 and (attr0 & 0xFF) == 192. Measured 2026-09-11
+// (FACTS.md): ~85% of the 128 OAM entries sit here every frame (~107/frame).
+// They are hidden by design and must never be given a trusted expanded-view
+// position. Re-measure this constant (via signals.csv) before touching it if
+// sprites start disappearing.
+constexpr int kGoldenSunObjParkSentinelRawX = 192;
+constexpr int kGoldenSunObjParkSentinelRawY = 192;
+
+// Slack, in pixels, allowed beyond the expanded viewport edges when
+// resolving the raw X wrap, so a sprite only partly off the side still
+// resolves. X only; Y is decided by the band rule below.
+constexpr int kGoldenSunObjFallbackSlackX = 64;
+
+// Why the wrap cannot be resolved by asking "which reading is in view".
+//
+// That rule was tried on 2026-09-11 and reverted the same day with two
+// user-reported artefacts: an NPC standing north of the camera drawn at the
+// bottom of the screen during a Move cast, and shadows appearing detached at
+// the top edge. The flaw is not in the arithmetic. A character who is
+// genuinely out of sight is a legitimate answer, and in that case the only
+// reading that LOOKS visible is the wrong one -- so "exactly one candidate is
+// visible" happily selects it. Testing the sprite's full extent rather than
+// its origin does not help; it widens the window in which a false reading
+// looks plausible.
+//
+// The two Y candidates are 256px apart while the expanded view is 240px
+// tall, so the bottom stripe and the region just above the view alias onto
+// the same byte and no local test can separate them. Y is therefore resolved
+// only where the byte can mean one thing:
+//   0..159    the native screen rows; the other reading is far above the view
+//   208..255  the top margin; the other reading is below the view
+//   160..207  ALIASED -- refused, leaving the sprite in the native rectangle
+//             exactly as it was before this fallback existed
+//
+// The known cost is the bottom stripe during an effect: a character genuinely
+// standing there is not drawn there. That is deliberate. Drawing NPCs where
+// they are not is worse, and it is what every attempt to be cleverer here has
+// produced. The real fix is to stop reading the hardware's 8-bit shorthand at
+// all -- see the sprite-table work in ROADMAP.md.
+constexpr int kGoldenSunObjFallbackAliasFirstRawY = 160;
+constexpr int kGoldenSunObjFallbackAliasLastRawY = 207;
+
+// Fallback used by both wide OBJ attribute providers when
+// golden_sun_obj_provider_provenance has no usable record for this object
+// (the record path already declined -- this never runs ahead of it) and the
+// expanded view is active.
+//
+// Both wide providers call this one helper with the same inputs so X and Y
+// always agree on whether a sprite gets a fallback position: the renderer
+// only trusts an object once both axes are trusted, and routing the decision
+// through a single shared function guarantees that.
+bool golden_sun_wide_obj_fallback_position(std::uint16_t attr0,
+                                           std::uint16_t attr1,
+                                           int* out_x, int* out_y) {
+    if (!golden_sun_expanded_obj_view_active() || !out_x || !out_y)
+        return false;
+    const int raw_x = static_cast<int>(attr1 & 0x01FFu);
+    const int raw_y = static_cast<int>(attr0 & 0x00FFu);
+    if (raw_x == kGoldenSunObjParkSentinelRawX &&
+        raw_y == kGoldenSunObjParkSentinelRawY) {
+        return false;
+    }
+    const int min_x = -static_cast<int>(g_golden_sun_wide_extra_left) -
+                       kGoldenSunObjFallbackSlackX;
+    const int max_x = gsr::widescreen::kExpandedWidth -
+                       static_cast<int>(g_golden_sun_wide_extra_left) +
+                       kGoldenSunObjFallbackSlackX;
+    // X: exactly one candidate must land inside the viewport. Zero means the
+    // sprite is nowhere near the view; two means the coordinate does not say
+    // where it is. Both are a refusal.
+    const bool near_x = raw_x >= min_x && raw_x <= max_x;
+    const bool wrapped_x = (raw_x - 512) >= min_x && (raw_x - 512) <= max_x;
+    if (near_x == wrapped_x) return false;
+    const int resolved_x = near_x ? raw_x : raw_x - 512;
+    // Y: only the two unambiguous bands resolve; the aliased band refuses.
+    if (raw_y >= kGoldenSunObjFallbackAliasFirstRawY &&
+        raw_y <= kGoldenSunObjFallbackAliasLastRawY) return false;
+    const int resolved_y = raw_y > kGoldenSunObjFallbackAliasLastRawY
+        ? raw_y - 256 : raw_y;
+    *out_x = resolved_x;
+    *out_y = resolved_y;
+    return true;
+}
+
+// ---- Persistent per-character position table ------------------------------
+//
+// FACTS.md 2026-09-11 ("The sprite-to-character gap ... positions are built
+// per draw rather than stored"): a character's position exists only at the
+// instant the game computes it -- the draw routine is handed a temporary
+// block of coordinates, and five separate memory searches found no
+// persistent per-character table anywhere in guest RAM. During an effect
+// (Move/Lift/Carry) the game stops recalculating a held character's
+// position, so nothing moves: the last position we saw IS the current one.
+// This table is OUR OWN record of "the last place we saw this character",
+// built only from positions the existing record path
+// (golden_sun_obj_provider_provenance) already authenticated. It never
+// invents a position; it only remembers one we already trusted.
+// How many consecutive frames an entry may be carried by the lookup alone,
+// with no confirmation from the record path. 300 frames (~5s) matches the
+// expiry window: long enough to cross the ambiguous stripe during an effect,
+// short enough that a tracker following the wrong sprite cannot persist.
+// TODO-EVIDENCE: reasoned from the measured Move cast length (>=120 frames,
+// FACTS.md 2026-09-11), not measured directly.
+constexpr std::uint32_t kGoldenSunObjTrackOnlyRunLimit = 300;
+
+struct GoldenSunObjTrackEntry {
+    bool used = false;
+    int screen_x = 0;
+    int screen_y = 0;
+    std::uint64_t confirmed_frame = 0;
+    // Last-seen ATTR0/1/2, kept because the design calls for it (a future
+    // refinement could require these to still roughly match before trusting
+    // an entry); not consulted by the lookup below today.
+    std::uint16_t attr0 = 0;
+    std::uint16_t attr1 = 0;
+    std::uint16_t attr2 = 0;
+    // Consecutive frames this entry has been carried by the lookup alone,
+    // with no confirmation from the record path. Bounded so an entry can
+    // never follow a sprite indefinitely on its own evidence: a long
+    // unconfirmed run is drift, and drift is how a tracker locks onto the
+    // wrong character. Reset to zero by every real confirmation.
+    std::uint32_t track_only_run = 0;
+};
+
+// Fixed, allocated once, never grows: at most 64 characters are tracked at a
+// time, which comfortably covers Golden Sun's OAM budget (128 hardware
+// slots, of which FACTS.md 2026-09-11 measured ~85% permanently parked at a
+// single off-screen sentinel, leaving 17-35 real sprites on screen even
+// during an effect).
+constexpr std::size_t kGoldenSunObjTrackSlots = 64;
+std::array<GoldenSunObjTrackEntry, kGoldenSunObjTrackSlots>
+    g_golden_sun_obj_track_table{};
+
+// Match radius, expanded-view pixels, used two ways below: to decide whether
+// a freshly authenticated position belongs to an already-tracked character
+// (rather than a new one), and to decide whether a raw-coordinate candidate
+// during an effect belongs to a tracked character.
+// TODO-EVIDENCE: chosen by reasoning, not measured in this repo. An ordinarily
+// walking character moves on the order of a couple of pixels per frame, and a
+// table entry can be a few frames old by the time an effect freezes the
+// sprite, so a handful of pixels of slack covers that drift. The value must
+// also stay far below half the smallest gap between the two OAM-wrap
+// candidate readings used below and in golden_sun_wide_obj_fallback_position
+// (256px on Y, 512px on X) so the two aliases of the SAME raw byte can never
+// both fall within radius of a real entry at once -- 8px is more than an
+// order of magnitude under that 128px ceiling, so this cannot itself
+// reintroduce the Y-axis ambiguity that sank the three earlier local rules
+// (FACTS.md 2026-09-11).
+constexpr int kGoldenSunObjTrackRadius = 8;
+constexpr long kGoldenSunObjTrackRadiusSq =
+    static_cast<long>(kGoldenSunObjTrackRadius) * kGoldenSunObjTrackRadius;
+
+// Frames an entry stays usable after its last confirmation, and thus how long
+// a table slot survives an effect with no new confirmation before it is freed
+// for reuse.
+// TODO-EVIDENCE: chosen by reasoning from one measured data point. FACTS.md
+// 2026-09-11 measured one Move cast still running at frame 120 of a
+// before/during comparison (shadow_writes.csv, 180 frames before vs. 120
+// during, the capture's own window rather than the cast's true length); the
+// true distribution of Move/Lift/Carry cast lengths is not measured. 300
+// frames (~5s at the GBA's ~59.7Hz, the same window flush_signal_log already
+// treats as "a session tick" via kSignalFlushRows) is comfortably above the
+// one measured floor while still short enough that a slot abandoned mid-play
+// (character despawned, scrolled far off, etc.) frees up within a few
+// seconds instead of squatting all session.
+constexpr std::uint64_t kGoldenSunObjTrackExpiryFrames = 300;
+
+// Record an authenticated position. Called from exactly one place --
+// golden_sun_obj_provider_provenance's once-per-object-per-frame memo
+// recompute, below -- so this never runs more than once per object per
+// frame even though both wide providers query that memo every scanline.
+//
+// Finds the tracked entry whose last position is nearest (x, y); if one is
+// within the match radius, that is the same character seen again and its
+// entry is refreshed in place. Otherwise the position belongs to a character
+// not currently tracked (or previously tracked in a now-expired/reused slot),
+// so a free slot is claimed instead. Expired entries (unclaimed for longer
+// than kGoldenSunObjTrackExpiryFrames) are freed opportunistically while
+// scanning, which is how "unclaimed" slots actually get reused -- this scan
+// runs on every authenticated object, and ordinary field play authenticates
+// most of them (FACTS.md 2026-09-11), so an expired entry does not linger
+// past the next few confirmed sprites.
+void golden_sun_obj_track_confirm(int x, int y, std::uint16_t attr0,
+                                  std::uint16_t attr1, std::uint16_t attr2,
+                                  std::uint64_t frame) {
+    GoldenSunObjTrackEntry* best = nullptr;
+    long best_dist2 = 0;
+    GoldenSunObjTrackEntry* free_slot = nullptr;
+    for (auto& entry : g_golden_sun_obj_track_table) {
+        if (entry.used &&
+            frame - entry.confirmed_frame > kGoldenSunObjTrackExpiryFrames) {
+            entry.used = false;  // stale: free the slot for reuse.
+        }
+        if (!entry.used) {
+            if (!free_slot) free_slot = &entry;
+            continue;
+        }
+        const long dx = static_cast<long>(entry.screen_x) - x;
+        const long dy = static_cast<long>(entry.screen_y) - y;
+        const long dist2 = dx * dx + dy * dy;
+        if (dist2 <= kGoldenSunObjTrackRadiusSq &&
+            (best == nullptr || dist2 < best_dist2)) {
+            best = &entry;
+            best_dist2 = dist2;
+        }
+    }
+    GoldenSunObjTrackEntry* target = best ? best : free_slot;
+    if (!target) return;  // Table full and nothing nearby: drop silently.
+    target->used = true;
+    target->screen_x = x;
+    target->screen_y = y;
+    target->confirmed_frame = frame;
+    target->attr0 = attr0;
+    target->attr1 = attr1;
+    target->attr2 = attr2;
+    target->track_only_run = 0;
+}
+
+// Table-based recovery for a sprite the record path just declined. The raw
+// OAM byte admits two ambiguous readings per axis (raw and raw-512 for X,
+// raw and raw-256 for Y -- the same aliasing golden_sun_wide_obj_fallback_
+// position resolves by viewport/band heuristics). Here the tie-break is
+// evidence rather than a heuristic: if exactly one of the four raw/wrapped
+// (x, y) combinations lands within the match radius of exactly one tracked,
+// still-fresh entry, that entry's own remembered position is the answer --
+// during an effect nothing has moved, so the last confirmed position IS the
+// current one. Two qualifying entries (or candidates), or none, decline:
+// "do not pick a nearest" (task spec) -- an untracked or ambiguous sprite is
+// left to the raw-coordinate fallback below instead of a guess.
+//
+// Both wide providers call this ONE function (see golden_sun_wide_obj_attr_x_
+// provider and golden_sun_wide_obj_attr_y_provider) so X and Y always agree
+// on whether, and where, a sprite gets a tracked position -- the same
+// reason golden_sun_wide_obj_fallback_position is itself shared. Memoised per
+// OAM entry per frame so the (up to 64-entry, up to four-candidate) scan runs
+// at most once per object per frame despite being called once per scanline.
+// The memo key is frame-only, unlike golden_sun_obj_provider_provenance's
+// frame+generation key: a mid-frame table update (from some other object's
+// confirmation, later in the same frame) could in principle let a later
+// scanline of this same object succeed where an earlier one declined, but a
+// stale memo can only cause an extra decline, never a wrong placement, which
+// is the conservative side of this trade-off.
+bool golden_sun_obj_track_lookup(int oam_index, std::uint16_t attr0,
+                                 std::uint16_t attr1, int* out_x, int* out_y) {
+    if (!golden_sun_expanded_obj_view_active() || !out_x || !out_y ||
+        oam_index < 0 ||
+        static_cast<std::size_t>(oam_index) >=
+            gsr::widescreen::kGoldenSunOamShadowSlotCount)
+        return false;
+    struct Memo {
+        std::uint64_t frame = UINT64_MAX;
+        bool has_result = false;
+        int x = 0;
+        int y = 0;
+    };
+    static std::array<Memo, gsr::widescreen::kGoldenSunOamShadowSlotCount>
+        memo{};
+    Memo& slot = memo[static_cast<std::size_t>(oam_index)];
+    const std::uint64_t frame_now = runtime_current_frame();
+    if (slot.frame == frame_now) {
+        if (!slot.has_result) return false;
+        *out_x = slot.x;
+        *out_y = slot.y;
+        return true;
+    }
+    slot.frame = frame_now;
+    slot.has_result = false;
+
+    const int raw_x = static_cast<int>(attr1 & 0x01FFu);
+    const int raw_y = static_cast<int>(attr0 & 0x00FFu);
+    const int x_candidates[2] = {raw_x, raw_x - 512};
+    const int y_candidates[2] = {raw_y, raw_y - 256};
+
+    // The remembered position decides WHICH reading is meant; the reading
+    // itself is the answer.
+    //
+    // Returning the remembered position instead made moving NPCs jitter
+    // (user-reported 2026-09-11): a character who is actually walking gets a
+    // position that is one or two frames stale, so they snap backwards and
+    // then catch up, every time the record path happens to decline. The raw
+    // coordinate is not stale and not wrong -- it is only ambiguous. So memory
+    // is used purely to rule out the wrong reading, and the surviving
+    // candidate, which is this frame's true position with the wrap resolved,
+    // is what we return. A frozen character gets the same answer either way;
+    // a moving one now gets the correct one.
+    //
+    // Candidates are 512px (X) and 256px (Y) apart while the match radius is a
+    // few pixels, so at most one candidate combination can fall near any one
+    // entry -- two matches therefore always mean two different characters,
+    // which is the ambiguity worth declining on.
+    int match_x = 0;
+    int match_y = 0;
+    int match_count = 0;
+    GoldenSunObjTrackEntry* matched = nullptr;
+    for (int xi = 0; xi < 2 && match_count < 2; ++xi) {
+        for (int yi = 0; yi < 2 && match_count < 2; ++yi) {
+            const int cx = x_candidates[xi];
+            const int cy = y_candidates[yi];
+            for (auto& entry : g_golden_sun_obj_track_table) {
+                if (!entry.used) continue;
+                if (frame_now - entry.confirmed_frame >
+                    kGoldenSunObjTrackExpiryFrames) continue;  // not recent
+                if (entry.track_only_run >= kGoldenSunObjTrackOnlyRunLimit)
+                    continue;  // carried too long without confirmation
+                // The tracked character must at least be the same SHAPE of
+                // sprite. Position alone is not identity: a shadow down in
+                // the bottom stripe has a second reading up at the top of
+                // the view, and if anyone happens to be standing there the
+                // match is unique and confidently wrong -- that is the
+                // detached shadow drawn over a woman at the top edge, seen
+                // in the user's screenshots while Move was being cast,
+                // 2026-09-11. Shape and size come from the OAM bits that do
+                // NOT change as a character animates (unlike the tile index
+                // in ATTR2, which changes every animation frame and would
+                // make this test far too strict), so a shadow can never be
+                // mistaken for a person.
+                if (((entry.attr0 ^ attr0) & 0xC000u) != 0u ||
+                    ((entry.attr1 ^ attr1) & 0xC000u) != 0u)
+                    continue;
+                const long dx = static_cast<long>(entry.screen_x) - cx;
+                const long dy = static_cast<long>(entry.screen_y) - cy;
+                if (dx * dx + dy * dy <= kGoldenSunObjTrackRadiusSq) {
+                    match_x = cx;
+                    match_y = cy;
+                    matched = &entry;
+                    if (++match_count >= 2) break;
+                }
+            }
+        }
+    }
+    if (match_count != 1) return false;  // none, or ambiguous: decline.
+    // Follow the character. Without this the entry stays pinned to wherever
+    // the record path last spoke, so a character who keeps walking drifts
+    // out of the match radius and is dropped a few pixels later -- which is
+    // exactly the reported symptom: a child running circles in Vault stays
+    // visible until it moves a little way into the bottom stripe, then
+    // clips (user-reported with video, 2026-09-11). A tracker has to update
+    // or it is only an anchor. The run counter above bounds how long a
+    // character may be carried on this evidence alone.
+    if (matched) {
+        matched->screen_x = match_x;
+        matched->screen_y = match_y;
+        matched->confirmed_frame = frame_now;
+        matched->attr0 = attr0;
+        matched->attr1 = attr1;
+        ++matched->track_only_run;
+    }
+    slot.has_result = true;
+    slot.x = match_x;
+    slot.y = match_y;
+    *out_x = slot.x;
+    *out_y = slot.y;
+    return true;
 }
 
 int golden_sun_wide_obj_attr_x_provider(int oam_index,
@@ -6590,8 +7755,33 @@ int golden_sun_wide_obj_attr_x_provider(int oam_index,
     const int raw_x = static_cast<int>(attr1 & 0x01FFu);
     const int raw_y = static_cast<int>(attr0 & 0x00FFu);
     const auto* provenance = golden_sun_obj_provider_provenance(
-        oam_index, attr0, attr1, attr2, raw_x, raw_y);
-    if (!provenance) return 0;
+        oam_index, attr0, attr1, attr2, raw_x, raw_y,
+        /*tally_rejection=*/true, /*allow_track_confirm=*/true);
+    if (!provenance) {
+        // Record path declined (already tallied above). Step 2: consult our
+        // own position table (see golden_sun_obj_track_lookup) before
+        // falling back to raw-coordinate reconstruction.
+        int track_x = 0, track_y = 0;
+        if (golden_sun_obj_track_lookup(oam_index, attr0, attr1, &track_x,
+                                        &track_y)) {
+            // Gated like the other obj_* counters: the providers run once
+            // per object per scanline, so an ungated increment counts ~160x
+            // per object per frame (measured 2,732 "per frame" in session
+            // 20260911_191138, against 128 sprites).
+            if (gba::g_ws_obj_census_line) ++g_ws_obj_from_track_total;
+            *out_x = track_x;
+            return 1;
+        }
+        // Step 3: try to reconstruct a position from the raw attributes
+        // before giving up.
+        int fallback_x = 0, fallback_y = 0;
+        if (golden_sun_wide_obj_fallback_position(attr0, attr1, &fallback_x,
+                                                  &fallback_y)) {
+            *out_x = fallback_x;
+            return 1;
+        }
+        return 0;
+    }
     *out_x = provenance->logical_x;
     return 1;
 }
@@ -6627,8 +7817,12 @@ int golden_sun_wide_obj_attr_y_provider(int oam_index,
     auto& visible_provenance = g_golden_sun_obj_visible_provenance[
         static_cast<std::size_t>(oam_index)];
     const int raw_x = static_cast<int>(attr1 & 0x01FFu);
+    // tally_rejection=false: the X provider above already attributes this
+    // object's reject reason for this frame; Y deliberately does not tally
+    // so the same object isn't counted twice.
     const auto* selected_provenance = golden_sun_obj_provider_provenance(
-        oam_index, attr0, attr1, attr2, raw_x, raw_y);
+        oam_index, attr0, attr1, attr2, raw_x, raw_y,
+        /*tally_rejection=*/false, /*allow_track_confirm=*/true);
     // Keep the visible record as the diagnostic baseline when no candidate
     // is usable; acceptance below is controlled by selected_provenance.
     const auto& provenance = selected_provenance ? *selected_provenance
@@ -6642,9 +7836,22 @@ int golden_sun_wide_obj_attr_y_provider(int oam_index,
             static_cast<std::size_t>(oam_index), &attr_provenance)) {
             // Generation is diagnostic state attached to the DMA-latched
             // record. Do not mutate a pending candidate while rendering it.
-            if (selected_provenance == &visible_provenance)
-                visible_provenance.writer_generation =
-                    attr_provenance.generation;
+            // selected_provenance is now found by identity rather than by
+            // slot (see golden_sun_obj_provider_provenance), so it may
+            // point at a different OAM slot's visible record than
+            // oam_index; check array membership instead of comparing
+            // against this slot's own record.
+            const auto* visible_begin =
+                g_golden_sun_obj_visible_provenance.data();
+            const auto* visible_end =
+                visible_begin + g_golden_sun_obj_visible_provenance.size();
+            if (selected_provenance >= visible_begin &&
+                selected_provenance < visible_end) {
+                const std::size_t visible_idx = static_cast<std::size_t>(
+                    selected_provenance - visible_begin);
+                g_golden_sun_obj_visible_provenance[visible_idx]
+                    .writer_generation = attr_provenance.generation;
+            }
         }
     }
     const bool provenance_epoch_matches =
@@ -6746,11 +7953,95 @@ int golden_sun_wide_obj_attr_y_provider(int oam_index,
                 reason, oam_index, raw_y, provenance.logical_y, provenance,
                 attr0, attr1, attr2, true);
         }
+        // Record path declined (selected_provenance is null here). Step 2:
+        // consult our own position table (mirrors the X provider above --
+        // same shared golden_sun_obj_track_lookup, so X and Y always agree
+        // on the outcome; not tallied here, matching how the X provider
+        // alone tallies obj_reject_totals).
+        {
+            int track_x = 0, track_y = 0;
+            if (golden_sun_obj_track_lookup(oam_index, attr0, attr1,
+                                            &track_x, &track_y)) {
+                *out_y = track_y;
+                return 1;
+            }
+        }
+        // Step 3: try to reconstruct a position from the raw attributes
+        // before giving up.
+        {
+            int fallback_x = 0, fallback_y = 0;
+            if (golden_sun_wide_obj_fallback_position(
+                    attr0, attr1, &fallback_x, &fallback_y)) {
+                *out_y = fallback_y;
+                return 1;
+            }
+        }
         return 0;
     }
     // Keep compilers that do not treat enum switches as exhaustive happy.
     record_obj(GoldenSunObjYOutcome::ProvenanceMissing);
     return 0;
+}
+
+// Exposed for src/object_probe.cpp only -- the one narrow accessor the
+// object-position memory search needs. It hands back this frame's
+// authenticated sprite SCREEN positions (screen_x/screen_y, in the same
+// space raw OAM x/y occupy) so the probe can add the camera and search for
+// where the game keeps that value itself, without re-deriving placement or
+// touching the record path, the providers above, or the fallback helper.
+//
+// Calls golden_sun_obj_provider_provenance the same way the Y provider above
+// already does (tally_rejection=false), so this does not perturb the
+// reject-reason diagnostics or which candidate the renderer selects. It
+// reads the live hardware OAM table directly rather than the wide view's
+// per-slot table, so it answers on every frame regardless of whether the
+// expanded view is active. The disabled-sprite test mirrors
+// gba_ppu.cpp's render loop exactly (a hidden sprite has nothing to
+// authenticate). Returns the number of positions written to the parallel
+// out_screen_x/out_screen_y arrays, capped at max_count.
+extern "C" std::size_t gsr_golden_sun_obj_authenticated_positions(
+    std::int32_t* out_screen_x, std::int32_t* out_screen_y,
+    std::size_t max_count, std::size_t* out_oam_index = nullptr,
+    std::int32_t* out_oam_raw_x = nullptr,
+    std::int32_t* out_oam_raw_y = nullptr) {
+    if (!out_screen_x || !out_screen_y || max_count == 0) return 0;
+    const gba::GbaBus* bus = gbarecomp::active_bus();
+    if (!bus) return 0;
+    const std::uint8_t* oam = bus->oam_ptr();
+    if (!oam) return 0;
+    std::size_t count = 0;
+    for (std::size_t idx = 0;
+         idx < gsr::widescreen::kGoldenSunOamShadowSlotCount &&
+         count < max_count;
+         ++idx) {
+        const std::uint8_t* entry = oam + idx * 8u;
+        const std::uint16_t attr0 = static_cast<std::uint16_t>(
+            entry[0] | (entry[1] << 8));
+        const std::uint16_t attr1 = static_cast<std::uint16_t>(
+            entry[2] | (entry[3] << 8));
+        const std::uint16_t attr2 = static_cast<std::uint16_t>(
+            entry[4] | (entry[5] << 8));
+        const bool rot_scale = (attr0 & 0x0100u) != 0u;
+        const bool disable_or_double = (attr0 & 0x0200u) != 0u;
+        if (!rot_scale && disable_or_double) continue;  // hidden sprite
+        const int raw_x = static_cast<int>(attr1 & 0x01FFu);
+        const int raw_y = static_cast<int>(attr0 & 0x00FFu);
+        const auto* provenance = golden_sun_obj_provider_provenance(
+            static_cast<int>(idx), attr0, attr1, attr2, raw_x, raw_y,
+            /*tally_rejection=*/false, /*allow_track_confirm=*/false);
+        if (!provenance) continue;
+        out_screen_x[count] = provenance->logical_x;
+        out_screen_y[count] = provenance->logical_y;
+        // Optional out-parameters (nullable): the raw sample dump in
+        // object_buffer.cpp is the only caller that passes these. They do
+        // not change which sprite is selected or how it is authenticated
+        // above -- purely additional readout of what was already computed.
+        if (out_oam_index) out_oam_index[count] = idx;
+        if (out_oam_raw_x) out_oam_raw_x[count] = raw_x;
+        if (out_oam_raw_y) out_oam_raw_y[count] = raw_y;
+        ++count;
+    }
+    return count;
 }
 
 struct GoldenSunCullTrace {
@@ -7338,6 +8629,10 @@ void install_golden_sun_widescreen(std::uint32_t extra_left,
         ? golden_sun_wide_margin_diagnostics_callback : nullptr;
     gba::g_ws_tilemap_provider = golden_sun_wide_tilemap_provider;
     gba::g_ws_bg_x_provider = golden_sun_wide_bg_x_provider;
+    // Armed per row by golden_sun_update_battle_backdrop; the mask it sets is
+    // what keeps this hook off the field path.
+    gba::g_ws_bg_sample_provider = golden_sun_battle_bg_sample_provider;
+    gba::g_ws_bg_sample_provider_layers = 0u;
     // The rich hooks consume signed logical coordinates captured before the
     // guest truncates them into OAM. Missing or stale visible provenance
     // always leaves canonical GBA wrapping in control.
@@ -7434,9 +8729,99 @@ void record_player_speed_window(int window, int stage, std::uint32_t addr,
     stats.last_applied = applied;
 }
 
-int player_speed_write_override(std::uint32_t pc, std::uint32_t addr,
-                                std::uint32_t requested, std::uint32_t width,
-                                std::uint32_t* out_value) {
+// ---- Message-speed delay observer (GSR_TEXT_RECORD) ----------------------
+//
+// The single store that decides how fast dialogue appears. From the generated
+// image, 0x08016E5C is `strh r3,[r6,#0x22]`. The literal at 0x08016E4C is
+// 0x02000240, but 0x08016E50..0x08016E54 add 0x83 << 2 (0x20C) before the
+// ldrb at 0x08016E58. The actual source index byte is therefore
+// 0x0200044C; that byte indexes the table at 0x08073808, and r6 is the text
+// context.
+//
+// Everything else about this is measured except the value itself: the probe
+// in function_tracer.cpp samples the context at function entry, by which
+// point the delay has already been spent and reads the same under every
+// setting (518 samples each, two sessions, no difference). Catching the store
+// is the only way to see what each setting actually writes. Logged, never
+// altered -- what to do with the value is a separate decision that needs this
+// number first.
+constexpr std::uint32_t kTextDelayStorePc = 0x08016E5Cu;
+constexpr std::uint32_t kTextBudgetBasePc = 0x08016920u;
+constexpr std::uint32_t kTextBudgetOverridePc = 0x08016942u;
+constexpr std::uint32_t kTextBudgetDecrementPc = 0x08016F00u;
+constexpr std::uint32_t kMessageSpeedIndexBaseAddress = 0x02000240u;
+constexpr std::uint32_t kMessageSpeedIndexOffset = 0x0000020Cu;
+constexpr std::uint32_t kMessageSpeedIndexAddress =
+    kMessageSpeedIndexBaseAddress + kMessageSpeedIndexOffset;
+
+bool text_delay_logging_enabled() {
+    static const bool enabled = [] {
+        const char* e = std::getenv("GSR_TEXT_RECORD");
+        return e != nullptr && e[0] != '\0' && e[0] != '0';
+    }();
+    return enabled;
+}
+
+void note_text_delay_store(std::uint32_t addr, std::uint32_t value) {
+    std::uint32_t table_index = 0xFFFFu;
+    std::uint32_t base_byte = 0xFFFFu;
+    if (const gba::GbaBus* bus = gbarecomp::active_bus()) {
+        if (const std::uint8_t* ewram = bus->ewram_ptr()) {
+            table_index = ewram[(kMessageSpeedIndexAddress -
+                                 0x02000000u) & 0x0003FFFFu];
+            base_byte = ewram[(kMessageSpeedIndexBaseAddress -
+                                 0x02000000u) & 0x0003FFFFu];
+        }
+    }
+    gsr::text_trace_delay_store(table_index, base_byte,
+                                value & 0xFFFFu, addr);
+}
+
+void observe_text_delay_store(std::uint32_t pc, std::uint32_t addr,
+                              std::uint32_t value, std::uint32_t width) {
+    if (pc == kTextDelayStorePc && width == 2u)
+        note_text_delay_store(addr, value);
+    if (width == 4u &&
+        (pc == kTextBudgetBasePc || pc == kTextBudgetOverridePc ||
+         pc == kTextBudgetDecrementPc)) {
+        gsr::text_trace_budget_store(pc, addr, value, g_cpu.R[6]);
+    }
+}
+
+// Instant text (GSR_INSTANT_TEXT, a launcher checkbox). Off by default and
+// never part of the faithful run.
+bool instant_text_enabled() {
+    static const bool enabled = [] {
+        const char* e = std::getenv("GSR_INSTANT_TEXT");
+        return e != nullptr && e[0] != '\0' && e[0] != '0';
+    }();
+    return enabled;
+}
+
+// True only while the player has Message speed on Fast, so the in-game option
+// still chooses between Slow, Normal and this.
+bool message_speed_is_fast() {
+    if (const gba::GbaBus* bus = gbarecomp::active_bus()) {
+        if (const std::uint8_t* ewram = bus->ewram_ptr()) {
+            return ewram[(gsr::text_speed_cheat::kMessageSpeedAddress -
+                          0x02000000u) & 0x0003FFFFu] ==
+                   gsr::text_speed_cheat::kMessageSpeedFast;
+        }
+    }
+    return false;
+}
+
+// One callback serves every measured Golden Sun write policy; each policy
+// gates itself, and the runtime only records a transform when the value
+// actually changes.
+int golden_sun_write_override(std::uint32_t pc, std::uint32_t addr,
+                              std::uint32_t requested, std::uint32_t width,
+                              std::uint32_t* out_value) {
+    if (out_value && gsr::text_speed_cheat::matches(pc, width) &&
+        instant_text_enabled() && message_speed_is_fast()) {
+        *out_value = gsr::text_speed_cheat::kInstantBudget;
+        return 1;
+    }
     using namespace gsr::player_speed_cheat;
     const int replay_window = player_speed_replay_window(g_runtime_vblank_starts);
     if (g_player_speed_diagnostic) {
@@ -8852,6 +10237,8 @@ void golden_sun_function_entry_observer(std::uint32_t entry_pc) {
     gsr::room_buffer_on_function_args(entry_pc, g_cpu.R[0], g_cpu.R[1],
                                       g_cpu.R[2]);
     gsr::room_buffer_on_entry(entry_pc);
+    gsr::object_probe_on_entry(entry_pc);
+    gsr::object_buffer_on_entry(entry_pc);
 }
 
 void blitter_shadow_dispatch(std::uint32_t pc, int thumb) {
@@ -10048,6 +11435,12 @@ int main(int argc, char** argv) {
     // After the recorder, for the same extra-draw chaining reason: each of
     // these captures whatever the previous one installed.
     gsr::room_buffer_init();
+    // Independent of the room buffer: its own env flag, no shared state, no
+    // extra-draw window. See object_probe.h.
+    gsr::object_probe_init();
+    // Independent of both: its own env flag, no shared state, no extra-draw
+    // window. See object_buffer.h.
+    gsr::object_buffer_init();
     options.max_view_width = 360;
     options.max_view_height = 240;
     options.frame_interpolation_available = true;
@@ -10070,7 +11463,9 @@ int main(int argc, char** argv) {
     g_runtime_ram_identity_confirmed_hook = verified_ram_identity_confirmed;
     g_runtime_call_return_hook = verified_ram_dispatch_return_hook;
     g_runtime_guest_step_boundary_hook = verified_ram_dispatch_outer_boundary;
-    g_runtime_mem_write_override = player_speed_write_override;
+    g_runtime_mem_write_observer = text_delay_logging_enabled()
+        ? observe_text_delay_store : nullptr;
+    g_runtime_mem_write_override = golden_sun_write_override;
     init_ram_code_page_masks();
     g_verified_ram_cache.clear();
     g_verified_identity_cache = {};

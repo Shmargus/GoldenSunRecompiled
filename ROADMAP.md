@@ -1,6 +1,352 @@
 # Roadmap
 
-## Resume here -- inspect the in-game options and dialogue renderers, 2026-09-10
+## Resume here -- confirm the battle build, 2026-09-12
+
+Next in play: the battle build described under "The battle fills the canvas,
+magnified 2x -- 2026-09-12" below. It is written and compile-checked, not yet
+seen running. That section lists exactly what to look at. Everything else in
+this file below it is either finished or still a lead.
+
+The three defects of the 2026-09-11 list that are not the battle -- menus
+garbling the map, objects during map effects, and the shelved shadow defect --
+are unchanged and still waiting for their captures.
+
+Shipped and awaiting confirmation from the build in progress: the margin-fade
+guard (FACTS.md, 2026-09-11). Confirm it first; it is cheap and it changes what
+the captures look like.
+
+The automatic overclock controller was removed on 2026-09-11 after its third
+shape failed in play. "Guest CPU Overclock" is now a plain Off/On, with On
+pinned at 10x. A pinned factor is already a ceiling -- a guest that finishes
+its frame early HALTs, and halted time is never scaled, so it cannot spend the
+surplus. Do not reintroduce a controller that moves the factor during play:
+pinned rates are confirmed clean and every switching shape tried has not been.
+
+### Battle fills the expanded view -- 2026-09-11 (SUPERSEDED)
+
+Kept for the reasoning and the measurements; the shape it settles on -- 3/2 on
+every arena layer, anchored mid-canvas -- was replaced on 2026-09-12 (see "The
+battle fills the canvas, magnified 2x"). Asked for by the user: in battle the expanded view showed the fight in a
+240x160 island with black all round it. Measured first (FACTS.md, "The battle
+screen, measured for the expanded view"): the backdrop is a flat layer the
+hardware cannot scale, it holds 144 rows of art and nothing above or below, and
+the game letterboxes it to a band ending at row 136. So the sides could be
+filled by the backdrop's own wrap, but the top and bottom only by zoom.
+
+Decided with the user from mock-ups built off a real battle capture: **zoom the
+backdrop 2x, leave everything else alone.** The party, the monsters and every
+effect keep their authentic size and position; only the backdrop's sampling
+changes, mapping the band the game already draws onto the whole 360x240 canvas.
+The command icons, which live on the backdrop layer below the band, are held
+back at their authentic size and place so the command row still works.
+
+How: a new generic engine hook (`g_ws_bg_sample_provider` in gbarecomp) lets a
+game remap which hardware pixel a regular-BG output pixel reads, with the
+window registers then asked about the SOURCE pixel. The Golden Sun policy is
+`src/battle_view.h`, armed per rendered row in `runner_main.cpp` so the field
+path never pays for the hook.
+
+Confirmed in play at the first build (user screenshots, 20:31): the command
+screen fills the canvas, the fighters keep their size, the icons and their bar
+are intact.
+
+The same screenshots showed the attack/message screen still letterboxed, which
+turned out to be a second arena layer: while a turn plays out the game switches
+the arena to the affine layer and disables the flat one (FACTS.md, "The battle
+arena is drawn on two different layers"). The affine layer now takes the same
+treatment through the same hook, with one difference -- the game is already
+zooming it, so our factor is only the remainder (BG2PA/128, clamped to [1, 2]),
+which pins the arena's apparent scale across the whole battle instead of
+following the push-in. That is the user's own suggestion: "make it fit our new
+resolution instead of this camera zoom and make it static".
+
+Then the user looked at the first build and read it correctly: the background
+was soft where everything beside it was sharp, and a third of one screen had no
+background at all. Both came from magnifying one layer alone. The settled shape,
+decided with the user on 2026-09-11:
+
+- **The arena is magnified 3/2** -- the canvas's own ratio, so its full 240
+  columns land across the 360 and the scenery stays close in sharpness to the
+  sprites beside it. *(2026-09-12: 3/2 leaves 60 canvas rows for the menus to
+  fill; 2/1 is the factor that maps the band onto the canvas exactly.)*
+- **Every arena layer takes that same factor**, flat and affine alike, so the
+  parts of the arena they each carry keep lining up. *(2026-09-12: what has to
+  match is the apparent size and the anchor, not the factor -- the game is
+  already magnifying the affine layer, so it takes the remainder.)*
+- **The menus keep their size and move out to the canvas edges**: the game's
+  top strip into the top margin, its bottom strip into the bottom one, the
+  command icons travelling with the strip they belong to. This is what fills
+  the 60 rows the 3/2 arena does not cover, and it is the "menu elements to the
+  edges" the user asked for.
+- Sprites, effects and anything the game draws over the arena itself are
+  untouched.
+
+Seen in play at the second build (user screenshots, 21:13): the composition is
+right -- HP window at the top edge, command row and icons at the bottom edge,
+arena across the full width -- but the affine layer was torn into horizontally
+offset bands, because it latches a fresh transform every scanline and a
+magnified layer draws each output row from a different source row (FACTS.md,
+"The battle's affine arena latches a fresh transform every scanline"). The
+renderer now hands every row's latched reference to the remap, so a remapped
+sample uses the source row's own transform.
+
+### The striping had a structural cause -- 2026-09-11 (half right)
+
+The deferral below is right and stands. The premise it was built on -- that the
+battle animates registers per scanline -- is not: the 2026-09-12 capture shows
+every row of every battle frame carrying identical registers (FACTS.md,
+"Nothing in a battle frame is animated per scanline"). Deferral is still needed,
+because a magnified layer reads rows the emulator has not reached yet.
+
+
+The first traced battle (session_20260911_222940) answered it by what it did
+NOT contain: `logs/battle_rule.csv` was written, so the rule ran and decided
+correctly all 881 battle frames (band 136 throughout; the affine layer given
+zoom in 403 frames and left alone in 478, as intended). But the renderer's own
+row dump never appeared -- because the expanded view does not render frames the
+way the code I instrumented does. It composites each authentic row the moment
+that scanline is emulated (FACTS.md, "The expanded view draws the authentic
+rows as the emulator produces them").
+
+A magnified layer cannot work that way: output row N shows some other source
+row, whose registers belong to a scanline the emulator has not reached. That is
+why two correct register fixes changed nothing on screen. Battle frames are now
+assembled at VBlank from the latched per-row state, where every row can see
+every other row's registers; field frames keep streaming exactly as before.
+
+### Battle capture, armed with the Function tracer -- 2026-09-11
+
+The expanded-view battle work needed something no existing capture provides:
+what the game changes WITHIN a frame. The Function tracer toggle now also
+writes, for Mode 1 (battle) frames only:
+
+- `logs/battle_frames.csv` -- one line per battle frame for the whole session:
+  the display registers, plus how many of the 160 rows differ from row 0 in
+  BG1's scroll, BG2's scale and BG2's reference. A nonzero "rows_vary" column
+  is the proof that a register is animated per scanline.
+- `logs/battle_rows.csv` -- all 160 rows, written once per distinct screen (a
+  new combination of mode, layer controls, camera scale and window band), up to
+  16 blocks. Each battle screen therefore appears exactly once.
+- `logs/battle_rule.csv` -- what the battle rule itself decided that frame:
+  active, band, the zoom given to each layer, which layers were hooked.
+
+Together they say what the game did and what we did about it, for the same
+frame. Diagnostic only; nothing is read back into rendering.
+
+That fix alone changed nothing in play, which located the fault rather than
+missing it: the striped layer is the FLAT one, and it scrolls per scanline for
+the same shimmer effect. Both layers now take the source row's own registers --
+affine reference and parameters, and regular scroll.
+
+**Not yet seen in play.** What to check: the band of offset stripes across the
+top of the arena is gone; the "monster appeared" screen fills the same rows as
+the command screen instead of stopping short; nothing is torn where the menu
+strips were cut. If stripes survive this, the next step is not another guess:
+dump one battle frame's per-row scroll and affine registers and read them.
+
+**Next, asked for by the user:** move the battle menu elements (party status
+window, command bar) out to the edges of the expanded view. Not started. It
+needs each UI panel identified on the UI layer rather than a row split -- the
+status window overlaps the scene band, so "top strip / bottom strip" does not
+separate them -- and a decision about what a 240-wide bar should do across a
+360-wide screen.
+
+### The battle fills the canvas, magnified 2x -- 2026-09-12
+
+Three builds in one day settled this. The 3/2 zoom was dropped first, on the
+user's "the goal was to only expand the background to the new margins"; the
+unmagnified build then showed why that cannot work, and `battle_layers.csv`
+(the trace added for the stripe) measured it exactly: canvas rows 176..200 held
+the party over bare backdrop and 201..215 were empty. **Below the arena's
+bottom edge the game has no scenery at all** -- that strip is what its own
+command menu covers on a GBA, and moving the menu to the canvas edge exposed
+it. Offered the choice, the user picked magnification.
+
+The shape, all of it derived rather than tuned:
+
+- **The arena is magnified 2x.** The band is kBandRows = 120 tall and the
+  canvas is 240, so 2x maps the whole band onto the whole canvas exactly, and
+  covers the 360 columns with room to spare.
+- **The mapping hangs from the band's bottom edge**, not its middle. The last
+  row of arena art is the ground under the party's feet, so pinning it to the
+  bottom of the canvas keeps them standing on it, with the arena growing
+  upward. The gap between their feet and the canvas bottom is 39 rows in every
+  battle state, so the composition does not shift as the camera moves.
+- **The affine layer takes the remainder, 2*PA/256 clamped to [1, 2]**: the
+  full 2x while the camera sits back, nothing extra once the game has pushed
+  all the way in, and only the anchor in between. The arena therefore holds one
+  apparent size for the whole battle -- the user's own "make it static" -- and
+  both layers agree, because both hang from the same bottom edge.
+- **The window band no longer clips a hooked arena layer** (engine:
+  `g_ws_bg_sample_provider_ignore_window_layers`). The game's window exists to
+  letterbox the arena into the authentic screen; we are deliberately spreading
+  that band over the whole canvas, so the letterbox would cut the very rows it
+  supplies. The menu layer keeps its windows -- they are how the game masks its
+  own panels.
+- **The menus move by panel, not by row split.** A run of rows the menu layer
+  drew on is one panel; a panel that fits entirely inside the top or bottom
+  strip travels whole into that margin, anything taller stays where the game
+  put it. The fixed split tore the Psynergy list in half in play (12:10
+  screenshot): that window straddles the split row, so its lower half jumped to
+  the bottom of the canvas on its own. The panel scan reads the menu layer's
+  rows from VRAM once per frame, not once per rendered row.
+
+**Not yet seen in play.** What to check: the party stands on ground rather than
+in black; the arena holds the same apparent size from the "monster appeared"
+message through the command menu and into a turn; the HP window sits at the top
+edge and the command row with its icons at the bottom edge; the Psynergy list
+and its description box are whole and where the game drew them.
+
+**Confirmed on 2026-09-12:** the stripe across the arena is gone.
+
+### Sprite positions are now found by identity, not by slot -- 2026-09-11
+
+Acting on the 2026-09-06 finding that "keying a position record by hardware slot
+cannot survive" the game's slot recycling. `golden_sun_obj_provider_provenance`
+now searches both provenance stores for a record whose epoch, full ATTR0/1/2
+identity and hardware-truncated coordinates match what is being rendered,
+regardless of which slot filed it. Two eligible records that agree are treated
+as one character described twice (what a reshuffle leaves behind); only records
+that disagree about the position refuse. Results are memoised per OAM entry,
+keyed by frame AND a provenance generation counter, because the pending store
+is written mid-frame.
+
+Not yet confirmed in play. The measure is `obj_trusted` in signals.csv holding
+up during a Move cast instead of collapsing to zero. If it does not, the
+remaining loss is characters whose attributes genuinely changed during the
+cast, and no identity search can recover those -- that is the object-list work.
+
+### Shelved -- shadows misbehaving on outer edges, 2026-09-11
+
+A shadow detaches from its owner and overlaps an NPC when that NPC walks into
+roughly the top 5-10% of the expanded view while a Psynergy effect is running.
+Shelved by the user as a small defect once the main expanded-view work landed.
+Cause is understood in shape: a shadow's position has a second valid reading at
+the opposite edge, and if a character happens to be standing there our position
+table matches it uniquely and confidently wrongly. A shape/size test already
+rules out most of these and is not sufficient here. See FACTS.md, "Our own
+position table fixes the expanded view during effects". **Do not add a third
+guard without a fresh screenshot of the case.**
+
+### 1. Menus garble the map
+
+**Symptom.** Opening a menu garbles the map in the expanded area.
+
+**Lead.** `room_buffer_supply` answers only when `is_field_signature(io)` holds,
+which tests the screen-base assignment BG3=5, BG2=6, BG1=7 (`src/room_buffer.cpp`).
+A menu that repoints any of those screen bases makes the signature fail, the
+supply declines, and `gba_ppu.cpp` keeps the hardware's wrapped-ring fetch --
+which is precisely the "garbage" appearance, and the same mechanism Goma Cave
+showed before the tile-offset fix. Note the margin-fade guard just added does
+NOT cover this: it only exempts backdrop pixels, and a wrapped-ring pixel is
+real content as far as the renderer is concerned.
+
+**Distinguishing test.** `not-field-signature` in the exit report rises sharply
+in a session that only opens and closes menus in one room. If instead
+`bad-offset` rises, a menu is moving a scroll register off the tile grid and the
+signature is innocent.
+
+**Capture.** Room buffer self-check + Function tracer. Stand in one room, mark a
+window, open and close the menu several times, quit cleanly. The per-refusal
+totals plus the tracer's per-frame hardware signals over that window say which
+register moved.
+
+**Likely shape of the fix.** Either widen the signature to accept the menu's
+assignment, or keep answering from the room while a menu is open, since the map
+underneath has not changed. Do not relax the signature blindly: it exists
+because a Mode 0 frame during the world-map transition carries the overworld's
+BGCNT and garbled the screen.
+
+### 2. Objects and sprites are wrong during map effects (e.g. receiving a Djinn)
+
+**Symptom.** During an on-map effect such as getting a Djinn, objects and
+sprites do not work in the expanded view.
+
+**Lead, shared with defect 3.** In `render_scanline_wide`, an object may be
+placed into the margin only when `g_ws_field_tilemap_source && sx_trusted &&
+sy_trusted`; otherwise `emit_obj` confines it to the native rectangle
+(`!sprite_trusted && (!native_row || out_base < native_first || out_base >=
+native_last)` returns). "Trusted" means a provider authenticated the real
+position, because a raw OAM X is a 9-bit wrapped value and turning that into a
+margin placement was a bug the field path already had to undo. A cutscene or
+effect actor is exactly the case the provider is least likely to have a record
+for, so those sprites fall back to the native rectangle and appear clipped or
+missing in the expanded area.
+
+**Capture.** Record sprite placement (`GSR_OBJ_RECORD`) with a marked window at
+the moment of the Djinn, plus Function tracer. The question the capture must
+answer is not "where was the sprite drawn" but **how many OBJs in that window
+were placed untrusted**, and what the provider had for them -- `lifetime.csv`
+already carries `entry_*` columns saying whether full-precision coordinates were
+found for a source.
+
+### 3. Objects cull too early at the bottom
+
+**Symptom.** Objects still disappear too early from the bottom of the expanded
+view. This is the long-standing "early disappearance" defect (2026-09-06),
+narrowed by the user to the bottom edge specifically.
+
+**Lead A, most likely -- same root as defect 2.** An untrusted sprite is
+confined to native rows: `native_row` is `logical_y >= 0 && logical_y < kVanH`,
+so a sprite in the bottom margin is dropped row by row regardless of the cull
+box. If the provider has no authenticated Y, the object cannot reach the bottom
+margin at all, which reads exactly as culling too early.
+
+**Lead B, latent and worth ruling out.** The cull box mixes units between axes:
+`ex_left`/`ex_right` divide by `pixel_scale`, while `ex_top`/`ex_bottom` use
+`oy` and `out_h` directly. `pixel_scale` is currently 1 everywhere it is
+constructed, so this is harmless today and cannot be the reported cause -- but
+it is a trap for the first person who scales vertically, and it should be made
+consistent while this area is open.
+
+**Capture.** Same sprite-placement capture as defect 2, filtered to objects
+whose authenticated Y lands below the native rectangle. Distinguishes A from B
+immediately: under A the objects never had a trusted Y; under B they had one and
+the box rejected them. The exit report's "placed objects culled outside the
+expanded bounds" counter (formerly and misleadingly labelled "skipped as
+parked") is the box's own tally -- it read `0` in the Goma session, which is
+already weak evidence against B.
+
+### 4. A stump in the top-left of Goma Cave that should not be there
+
+**Symptom.** A large stump appears in the top-left of Goma Cave, in the
+expanded area, where no stump belongs. Reported after the tile-offset fix, in
+the same room that fix was built for.
+
+**First question, before any hypothesis: is it a background tile or an object?**
+The two have nothing in common here. Toggle "Draw field from room buffer" off
+(Enhanced Options): if the stump survives with the margin reconstruction
+disabled, it is an object and belongs with defects 2 and 3. If it disappears,
+it is the room buffer resolving the wrong grid cell and belongs with the
+tile-offset work.
+
+**If it is the room buffer.** The new tile-space lookup resolves
+`lx = tile_x + tdx`, `sx = lx >> 1` with the sub-entry from `(ly & 1) * 2 +
+(lx & 1)`. Top-left is where `tile_x`/`tile_y` are smallest and any sign or
+rounding error surfaces first, and it is also where a negative intermediate
+would appear if a layer's offset were negative in that room. The self-check
+reports per-layer match rates but says nothing about *which* cells missed;
+BG3 was 99.32% and BG1 99.81% in Goma, so several hundred cells did miss.
+
+**Capture.** Room buffer self-check in Goma, plus -- likely a small addition --
+recording the grid coordinate of the first N mismatching cells per layer rather
+than only counting them. The existing counters cannot point at a corner.
+
+### Traces available today
+
+- **Room buffer self-check** (`GSR_ROOM_BUFFER`): per-layer cell match rates,
+  per-refusal totals, room rects, per-layer offset remainders, BG3-vs-camera
+  delta. Prints on clean exit only.
+- **Record sprite placement** (`GSR_OBJ_RECORD`): `lifetime.csv` with source
+  provenance and whether full-precision coordinates existed.
+- **Function tracer** (`GBARECOMP_FN_TRACER`): per-frame hardware signals,
+  window splitting on room-bounds/overlay/window-register change, manual marks.
+- **VRAM map write trace**, **Record map + scene data**, **Record CPU headroom**.
+
+Every one of these prints or flushes on a clean exit. Quit through the normal
+exit or the capture is lost.
+
+## Previous -- in-game options and dialogue renderers, 2026-09-10
 
 The boulder placement investigation is shelved at the user's request. The
 latest capture (`session_20260910_141441` / `objrec_20260910_141449`) verified
@@ -14,6 +360,123 @@ Current work is limited to the game-owned options screen and dialogue/text
 rendering. Establish their existing drawing paths and any measured text-speed
 control before considering changes. Keep the boulder trace and its evidence
 intact.
+
+### Instant text — state, 2026-09-10
+
+The source path is measured and written up in FACTS.md. The store at
+`0x08016E5C` writes the table result into the text context at `+0x22`
+(`0x020330FE` in the observed session), with the source expression
+`table[0x08073808 + setting]`. The source loads base `0x02000240`, adds
+`0x83 << 2` (`0x20C`), and reads the setting byte from `0x0200044C`.
+The linked capture measures the delay values as Slow=`4`, Normal=`0`, and
+Fast=`0`. This store is therefore an inter-character delay state; it does not
+account for the observed Normal-versus-Fast letters-per-frame difference.
+
+**Recorder gate and bounded ledger fixed and exercised in a linked capture:**
+GSR_TEXT_RECORD now uses a separate read-only memory-write
+observer, so it sees the exact halfword store at `0x08016E5C` even when
+PlayerWalkRun is 1x. The existing write-transform hook still runs only for the
+speed cheat, so recording does not change movement. The observer now feeds a
+per-window `text_delay.csv` ledger: every window gets a row even when it saw
+zero matching stores, while each distinct `(table index, base byte, delay)`
+triple is counted with its first/last text context. The table index is the
+source byte at `0x0200044C`; the base byte at `0x02000240` is retained as a
+diagnostic. This removes the old process-wide duplicate suppression and
+distinguishes a post-savestate window with no store from one repeating the boot
+pair.
+
+Session `20260910_213352` exercised the linked recorder. The savestate callback
+split the pre-load window at frame `373040`, and the bounded ledger recorded
+zero stores in that pre-load window and in the post-load menu/overlay windows.
+The non-empty rows were `32` and `16` stores of `(base=0, index=0, delay=4)`
+for the two Slow windows, `16` of `(base=0, index=0, delay=4)` plus `11` of
+`(base=0, index=1, delay=0)` in the Normal window, `21` of
+`(base=0, index=1, delay=0)` in the window labelled Fast, and `32` of
+`(base=0, index=2, delay=0)` at exit; all had zero overflow. The old CSV named
+the first field `table_index`, but it sampled the base byte at `0x02000240`, so
+the source-index interpretation was mislabeled. Its apparent `delay=11` was
+the `pair_stores=11` field; the file contains no index-1/delay-4 or delay-11
+row. The generated source and the hash-verified ROM table agree with every
+stored value in the capture.
+
+The same 32-glyph line was captured once at roughly one glyph every five
+frames and again at about one per active frame across the Normal/Fast window
+boundary, with one double draw in each marked segment. The rows in that
+boundary still have options byte `1`; value `2` only appears after the
+dialogue, so the window labelled Fast is not a Fast dialogue capture. Menu
+glyphs return from `0x08018CAC` to `0x08017BE5` and arrive in 16--20-glyph
+bursts, while dialogue glyphs return to `0x08016E4D` through processor
+`0x080168F4`. The existing traces therefore point to the dialogue processor's
+per-frame budget and the menu bulk caller as the next targeted comparison; no
+new capture is needed to determine the store values.
+
+The prior capture `session_20260910_204250` did enable the recorder, but its only
+`[textdelay]` line was the pre-save boot pair `setting=0 delay=0` at frame 763;
+it produced no *new* post-load pair. The linked text trace did confirm the
+labeled same-line rates (`1` = one glyph per frame, `2` = about `3.2`). The
+later bounded ledger measures the store values after the save load.
+
+**Decision:** do not add a 16-bit override for `0x08016E5C`. Forcing the Slow
+value from `4` to zero would only reach the already measured Normal/Fast delay
+value of zero, and forcing Normal or Fast to zero changes nothing. This store
+cannot produce instant text.
+
+**Historical deferred experiment, user's call 2026-09-10:** before the bounded
+ledger measured these values, an experimental zero-delay toggle was deliberately
+deferred so the intervention would be based on evidence. That decision is now
+closed by the measured values; the next work is the dialogue processor's
+per-frame budget and its comparison with the menu bulk caller.
+
+The menu comparison is diagnostic only. Menus and dialogue share glyph entry
+`0x08018CAC`, but dialogue is limited earlier by the text processor
+`0x080168F4`; compare those existing caller paths before considering any
+dialogue processor change.
+
+**The source comparison is now complete.** `0x080168F4` seeds a stack-local
+counter at `[sp+0x20]` from `0x0807380B + 0x0200044C`: the measured values are
+`1` for source indices `0` and `1`, and `10` for source index `2`. After each
+glyph or control token, `0x08016EB0` decrements that counter at `0x08016F00`
+and loops through `0x08016972` while it remains nonzero. A context-dependent
+branch can replace the initial value with `3`, `8`, or `13`; its runtime
+activity is the only missing control measurement. The menu's
+`0x08017B9A` caller loops over its string and calls `0x08018CAC` once per
+character, returning at `0x08017BE5`, so its instant bursts do not bypass the
+dialogue parser's control-code and wait handling.
+
+`GSR_TEXT_RECORD` now writes `text_budget.csv` for the base, override, and
+decrement stores, without changing their values. Session
+`20260910_225128` / `logs/trace_20260910_225135` now supplies the paired
+budget evidence. With source byte `0x0200044C=1`, the base store at
+`0x08016920` is `1` and the marked line emits one glyph per active frame. When
+the byte changes to `2` at frame `374083`, the base becomes `10` and the same
+32 glyphs emit in ten active frames (`3.20` per active frame). The capture has
+`318` base stores, `342` decrements, and zero `0x08016942` override stores for
+one stack slot/context, so the context override did not activate in this NPC
+line. A speed-1 processor call with no decrement (frame `373787`) and the
+speed-2 excess of `40` decrements for `32` glyphs show that the parser still
+handles control/wait tokens and can exit before another token; the budget is
+not the wait mechanism.
+
+The evidence closes the measurement phase. The Fast seed is consumed by
+parser work across and within guest frames: three of the 15 Fast invocations
+cross a frame boundary, and five post-line invocations still seed `10` and
+exit after a zero decrement. A larger seed may reduce ordinary text frames,
+but its added parser and glyph work has an unmeasured cost and it cannot remove
+explicit page/control waits.
+
+The source comparison also rules out a seed-only intervention as the complete
+solution. The entry checks `+0x1C` and `+0x22` once; the budget back-edge at
+`0x08016F06` re-enters `0x08016972` without repeating those gates. The exact
+loop decision is the exhausted-budget branch at `0x08016F04`. The bounded
+candidate is therefore an opt-in conditional-branch override at that address:
+preserve the original exit while a measured control/page-wait state is
+pending, otherwise allow the parser to continue through its existing token
+logic. The capture does not enumerate every control token's state bits, so the
+guard still needs a focused gameplay check for explicit pauses and page waits.
+Do not change the menu caller or bypass the dialogue parser. No feature code
+has been changed in this analysis phase; implementation follows after the
+guard is concrete and then gets a compile check before returning to the room
+buffer.
 
 ## Shelved -- capture the cutscene source before filtering, 2026-09-09
 
@@ -429,6 +892,22 @@ would guess all three, and each wrong guess costs a rebuild.
 
 ## Milestone 2 — the room buffer
 
+**The approach is provisional, decided with the user 2026-09-10.** The goal is
+the expanded view working across the whole game -- every map, every layer,
+every scene. The room buffer is the current best way of getting there, not the
+destination, and everything in this milestone is subject to change the moment a
+better way to cast the expanded view over the entire game appears. Per-layer
+resolvers, the cell-alignment rule, the decision to rebuild BG0 the same way
+the others are rebuilt: all of it is means, not ends. If a general mechanism
+turns up -- a camera or render-size value the game itself respects, a different
+seam in the renderer, something the hardware layer can do that the game need
+not know about -- take it, and do not preserve this machinery for its own sake.
+
+Measured evidence stays valuable regardless: what the map tables contain, how
+the layers scroll, which writers touch what. Those are facts about Golden Sun
+and survive any change of approach. The resolver built on top of them is
+disposable.
+
 Build the room's tilemap once into a plain buffer and render from it, instead of
 calling back into game-specific host code per pixel.
 
@@ -537,9 +1016,18 @@ Known open, in the order they should be taken:
    background across the whole margin and was mistaken for a Goma Cave-specific
    fault for several rounds. It is reverted; the stray text/menu tiles it was
    meant to suppress are still open and need a different approach.
-2. **Goma Cave Entrance** — status genuinely unknown. Its failures were
-   conflated with the clamp regression and with a build that contained none of
-   the fixes. Re-test before theorising.
+2. **Goma Cave Entrance** — re-tested 2026-09-10, no longer unknown. Session
+   `20260910_193908` ran the self-check through it with the current build:
+   BG3 `79.09%`, BG1 `82.79%`, and **BG2 with no cells checked at all** across
+   951 frames. Declines are dominated by `bad-offset` (`79.7M` samples), i.e.
+   `layer_offset()` refusing because a layer is not a whole number of 16px
+   cells from the camera. Two candidate causes, in order: a layer scrolling at
+   its own rate rather than the camera's, and the lighting layer having no
+   reconstruction at all (FACTS.md, both entries dated 2026-09-10). The
+   earlier 2026-09-05 dungeon comparison already scored lower than town
+   (BG3 61%, BG2 77%, BG1 89%), so this is a longstanding weakness in dungeons
+   rather than a new regression. Measure which layer fails the alignment test
+   before changing the rule.
 3. **Sprite pop-in** with 64 px slack — untested.
 4. **Performance** — the room-buffer source is consulted per sample, while
    OBJ placement providers run once per OAM slot per rendered scanline. The
@@ -555,6 +1043,35 @@ Method note, because it kept paying off: every real cause this session was
 found by a counter, not by reasoning about the code. Three separate wrong
 diagnoses were stated confidently before the numbers arrived. Instrument
 first.
+
+### All four layers, decided with the user 2026-09-10
+
+**Every map and every layer must come from the buffer, BG0 included.** This
+reverses the earlier "BG0 margin work is out of scope" line, which is removed
+below: the buffer today builds BG3/BG2/BG1 only, so the expanded view
+reconstructs three layers in the margin and leaves the lighting layer to the
+emulator's ordinary fetch. That is invisible in a lit town and severe in a dark
+cave, which is what Goma Cave has been showing.
+
+BG0 cannot use the existing method, and the reasons are measured rather than
+assumed (FACTS.md, "The lighting layer cannot be reconstructed"): its content
+is not in the metatile grid or the atlas, and it does not scroll with the room
+-- captured field frames hold BG0 at `0/0` while the other three carry real
+per-frame scroll. So "which metatile belongs at this screen position, given the
+camera" is the wrong question for it.
+
+First step is therefore a measurement, not an implementation: **find what
+writes BG0's screenblock for a room, and whether that writer knows about a room
+at all or only about the screen.** The technique is the one that found the grid
+and the room bounds -- watch the writes, identify the writers, then work out
+what they are reading. Do not extend the existing resolver to BG0 before that
+answer exists; a screen-pinned layer fed a camera would produce confidently
+wrong margins, and BG0 also carries dialogue and menus, so a wrong answer puts
+text boxes out in the margin.
+
+Related and still open: the `bad-offset` refusals that dominate dungeon frames
+(item 2 above) are a separate defect in the BG1-3 path. Fix that first -- it
+affects layers we already know how to build.
 
 Still open:
 - **Cost.** The room-buffer path repeats camera, room-rect and layer-scroll
@@ -988,8 +1505,6 @@ first.
   not wanted.
 - **Readable or idiomatic generated code.**
 - **A GPU/OpenGL renderer**, unless the room buffer proves insufficient.
-- **BG0 margin work** — was built on 2026-09-04, never viewed, and removed with
-  the rest of the widescreen implementation.
 
 ## Open questions for the user
 

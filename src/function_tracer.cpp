@@ -3,6 +3,7 @@
 #include "function_tracer.h"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
@@ -475,8 +476,17 @@ void maybe_save_screenshot(const std::string& base_name) {
 // then resets the table and opens a fresh window. Called both from
 // check_hardware_boundaries() (auto-detected boundaries) and from the
 // manual "Mark window" button.
+// Defined below with the text-speed probe. Flushed here, on every window
+// close, so a marked Normal/Fast window's last letters survive whatever the
+// session does next -- signals.csv lost its tail exactly this way in session
+// 20260910_144421 (FACTS.md).
+void flush_text_log();
+void flush_text_budget_log();
+
 void close_and_reopen_window(const std::string& label) {
     ensure_session_dir();
+    flush_text_log();
+    flush_text_budget_log();
     const std::string safe = sanitize_label(label);
 
     std::sort(g_window_overlays.begin(), g_window_overlays.end());
@@ -525,8 +535,12 @@ void close_and_reopen_window(const std::string& label) {
     g_last_close_new = new_count;
 
     const std::uint64_t end_frame = runtime_current_frame();
+    if (g_text_record) {
+        text_trace_window_closed(g_window_index, display_name.c_str(),
+                                 g_window_start_frame, end_frame);
+    }
     write_index_line(g_window_index, display_name, g_window_start_frame,
-                      end_frame, overlays_joined, room);
+                     end_frame, overlays_joined, room);
 
     // D2: one capped, pc-sorted snapshot of this window feeds the
     // fingerprint and the repeat-matching merge below -- see
@@ -561,6 +575,8 @@ void close_and_reopen_window(const std::string& label) {
     ++g_window_index;
     g_window_label = "unlabeled";
     g_window_start_frame = end_frame;
+    if (g_text_record)
+        text_trace_window_opened(g_window_index, g_window_start_frame);
 }
 
 // Item 3: builds a filesystem-safe, sequence-first auto name from what
@@ -709,11 +725,159 @@ void flush_signal_log() {
     g_signal_buf_rows = 0;
 }
 
+// Previous frame's g_ws_obj_*_total / g_ws_expanded_diag[2] totals, so the
+// signal log can report the per-frame delta instead of the session-running
+// total those counters accumulate to (see the header comment below for why
+// a delta is what a marked window needs).
+std::uint64_t g_prev_obj_trusted_total = 0;
+std::uint64_t g_prev_obj_untrusted_total = 0;
+std::uint64_t g_prev_obj_culled_total = 0;
+
+// Defined in runner_main.cpp, not gba_ppu.*: only golden_sun_obj_provider_
+// provenance's usable() predicate knows *why* a candidate was rejected
+// (no record, stale epoch, pending-frame mismatch, identity mismatch,
+// attrs moved, or truncation mismatch), versus just that it was. Same
+// once-per-frame-per-object gate and running-total-since-session-start
+// shape as g_ws_obj_trusted_total/g_ws_obj_untrusted_total above.
+// Indices 7..11 break down index 4 (attrs_moved) further: 7/8 split it by
+// whether the held record is from this frame or an older one (recorder
+// keeping up vs. not), and 9/10/11 flag which of ATTR0/1/2 actually differs
+// (may overlap). See runner_main.cpp's golden_sun_obj_provider_provenance
+// for the attribution rule; this file only reads the running totals.
+extern "C" unsigned long long g_ws_obj_reject_totals[12];
+std::uint64_t g_prev_obj_reject_totals[12] = {
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+
+// Defined in runner_main.cpp: per-OAM-upload tally of which sprite table an
+// upload's source address belongs to (0 primary, 1 alt, 2 the 0x03002000
+// address, 3 other). Same running-total-since-session-start shape as
+// g_ws_obj_reject_totals above; the tracer reports the per-frame delta.
+extern "C" unsigned long long g_ws_oam_src_totals[4];
+std::uint64_t g_prev_oam_src_totals[4] = {0, 0, 0, 0};
+
+// Defined in runner_main.cpp: per-object-per-frame tally of sprites resolved
+// via the persistent position table (golden_sun_obj_track_lookup) rather
+// than the record path or the raw-coordinate fallback. Same running-total-
+// since-session-start shape as g_ws_obj_reject_totals above.
+extern "C" unsigned long long g_ws_obj_from_track_total;
+std::uint64_t g_prev_obj_from_track_total = 0;
+
+// ---- OBJ parked-vs-room census (measurement only, no rendering change) ---
+//
+// Tests whether the ROOM rect (not the 240x160 hardware screen) separates
+// Golden Sun's parked/hidden sprites from real ones when a sprite's world
+// position is reconstructed from the camera plus its raw OAM coordinate,
+// instead of from an authenticated provider record (see ROADMAP.md /
+// FACTS.md 2026-09-11: authenticated records collapse to 0/frame during
+// Move Psynergy, which is why a camera+raw reconstruction is the candidate
+// replacement under test here). This does not feed rendering or the room
+// buffer; it only counts, once per frame, into new signals.csv columns.
+struct ObjParkCensus {
+    std::uint32_t live = 0;
+    std::uint32_t in_room = 0;
+    std::uint32_t out_room = 0;
+    std::uint32_t no_room = 0;
+};
+
+// Mirrors room_buffer.cpp's kEwramBase/read_u16 exactly (that file's helpers
+// are anonymous-namespace-local and not reachable here, so the layout is
+// re-read rather than the linkage altered).
+constexpr std::uint32_t kCensusEwramBase = 0x02000000u;
+constexpr std::uint32_t kCensusEwramMask = 0x0003FFFFu;
+constexpr std::uint32_t kCensusRoomRect = 0x02030DC0u;  // min_x,max_x,min_y,max_y u16
+constexpr std::uint32_t kCensusCamera = 0x02030DB0u;    // x,y, 16.16 fixed point
+
+std::uint16_t census_read_u16(const std::uint8_t* ewram, std::uint32_t address) {
+    const std::uint32_t off = (address - kCensusEwramBase) & kCensusEwramMask;
+    return static_cast<std::uint16_t>(ewram[off] | (ewram[off + 1] << 8));
+}
+
+// Mirrors room_buffer.cpp's rect_is_room() exactly: excludes the all-zero
+// between-rooms marker and the (0,1,8,256) world-map constant, and requires
+// real extent of at least one 16px cell per axis.
+bool census_rect_is_room(std::uint16_t min_x, std::uint16_t max_x,
+                         std::uint16_t min_y, std::uint16_t max_y) {
+    if (max_x == 1 && min_y == 8 && max_y == 256) return false;
+    if (max_x <= min_x || max_y <= min_y) return false;
+    return (max_x - min_x) >= 16 && (max_y - min_y) >= 16;
+}
+
+ObjParkCensus compute_obj_park_census() {
+    ObjParkCensus c;
+    const gba::GbaBus* bus = gbarecomp::active_bus();
+    if (!bus) return c;
+    const std::uint8_t* ewram = bus->ewram_ptr();
+    const std::uint8_t* oam = bus->oam_ptr();
+    if (!ewram || !oam) return c;
+
+    const std::uint16_t min_x = census_read_u16(ewram, kCensusRoomRect);
+    const std::uint16_t max_x = census_read_u16(ewram, kCensusRoomRect + 2);
+    const std::uint16_t min_y = census_read_u16(ewram, kCensusRoomRect + 4);
+    const std::uint16_t max_y = census_read_u16(ewram, kCensusRoomRect + 6);
+    const bool room_valid = census_rect_is_room(min_x, max_x, min_y, max_y);
+
+    // Camera is 16.16 fixed point; the integer part is the high u16 of each
+    // 4-byte field (x at +0, y at +4), same as room_buffer.cpp.
+    const int cam_x = static_cast<int>(census_read_u16(ewram, kCensusCamera + 2));
+    const int cam_y = static_cast<int>(census_read_u16(ewram, kCensusCamera + 6));
+
+    for (int idx = 0; idx < 128; ++idx) {
+        const std::uint8_t* entry = oam + idx * 8;
+        const std::uint16_t attr0 =
+            static_cast<std::uint16_t>(entry[0] | (entry[1] << 8));
+        const std::uint16_t attr1 =
+            static_cast<std::uint16_t>(entry[2] | (entry[3] << 8));
+
+        // Mirrors gba_ppu.cpp's OBJ loop skips exactly (~1601-1609), in the
+        // same order, so these counts are comparable with obj_trusted/
+        // obj_untrusted.
+        const bool rot_scale = (attr0 & 0x0100u) != 0;
+        const bool disable_or_double = (attr0 & 0x0200u) != 0;
+        if (!rot_scale && disable_or_double) continue;
+        const std::uint32_t obj_mode = (attr0 >> 10) & 0x3u;
+        if (obj_mode == 2 || obj_mode == 3) continue;
+        const std::uint32_t shape = (attr0 >> 14) & 0x3u;
+        if (shape >= 3) continue;
+
+        ++c.live;
+        if (!room_valid) continue;  // no_room is set from live below.
+
+        // Reconstruction under test: NOT the renderer's trusted path (which
+        // prefers an authenticated provider position). This mirrors only
+        // the untrusted-fallback arithmetic in gba_ppu.cpp (~1611-1617,
+        // ~1653-1655): raw OAM coordinate, sign-extended, plus camera.
+        const int raw_y = static_cast<int>(attr0 & 0xFFu);
+        const int raw_x = static_cast<int>(attr1 & 0x1FFu);
+        const int sy = (raw_y >= 160) ? raw_y - 256 : raw_y;
+        const int sx = (raw_x & 0x100) ? raw_x - 0x200 : raw_x;
+        const int world_x = sx + cam_x;
+        const int world_y = sy + cam_y;
+
+        if (world_x >= min_x && world_x < max_x && world_y >= min_y &&
+            world_y < max_y) {
+            ++c.in_room;
+        } else {
+            ++c.out_room;
+        }
+    }
+    if (!room_valid) c.no_room = c.live;
+    return c;
+}
+
 void log_raw_signals(std::uint64_t frame, const std::uint8_t* io) {
     if (!g_signal_header_written) {
         g_signal_buf +=
             "frame,bldy,win_enable,win0h,win0v,win1h,win1v,room_valid,"
-            "min_x,min_y,ext_x,ext_y,overlays\n";
+            "min_x,min_y,ext_x,ext_y,overlays,"
+            "field_sig,bg1_base,bg2_base,bg3_base,"
+            "obj_untrusted,obj_trusted,obj_culled,"
+            "obj_rej_no_record,obj_rej_epoch,obj_rej_pending,obj_rej_identity,"
+            "obj_rej_attrs,obj_rej_trunc,obj_ok,"
+            "obj_rej_attrs_this_frame,obj_rej_attrs_old_frame,obj_rej_attr0,"
+            "obj_rej_attr1,obj_rej_attr2,"
+            "obj_live,obj_in_room,obj_out_room,obj_no_room,"
+            "oam_src_primary,oam_src_alt,oam_src_0x03002000,oam_src_other,"
+            "obj_from_track\n";
         g_signal_header_written = true;
     }
     const std::uint8_t bldy = io[0x54] & 0x1Fu;
@@ -738,18 +902,452 @@ void log_raw_signals(std::uint64_t frame, const std::uint8_t* io) {
         overlays += name;
     }
 
-    char line[256];
+    // Field screen-base signature (mirrors room_buffer.cpp's
+    // is_field_signature(), which is anonymous-namespace-local to that TU
+    // and not reachable here): BG3CNT/BG2CNT/BG1CNT screen-base fields
+    // (bits 8-12 of IO 0x0E/0x0C/0x0A) must read 5/6/7 respectively for the
+    // room buffer to accept the frame. A menu that repoints a screen base
+    // makes the room buffer decline and the margin falls back to the
+    // hardware's wrapped ring; the existing refusal counters are session
+    // totals printed at exit and cannot say which frames, which is why
+    // this is logged per frame instead.
+    const std::uint16_t bg1cnt =
+        static_cast<std::uint16_t>(io[0x0A] | (io[0x0B] << 8));
+    const std::uint16_t bg2cnt =
+        static_cast<std::uint16_t>(io[0x0C] | (io[0x0D] << 8));
+    const std::uint16_t bg3cnt =
+        static_cast<std::uint16_t>(io[0x0E] | (io[0x0F] << 8));
+    const std::uint8_t bg1_base =
+        static_cast<std::uint8_t>((bg1cnt >> 8) & 0x1Fu);
+    const std::uint8_t bg2_base =
+        static_cast<std::uint8_t>((bg2cnt >> 8) & 0x1Fu);
+    const std::uint8_t bg3_base =
+        static_cast<std::uint8_t>((bg3cnt >> 8) & 0x1Fu);
+    const int field_sig =
+        (bg3_base == 5u && bg2_base == 6u && bg1_base == 7u) ? 1 : 0;
+
+    // OBJ trust/cull deltas since the previous row. obj_untrusted high with
+    // obj_culled flat means objects never had an authenticated position;
+    // obj_culled rising means they had one and the expanded cull box
+    // rejected it -- that pair separates the two leads for the bottom-edge
+    // culling defect. Totals are running session counters accumulated by
+    // the PPU (gba_ppu.cpp) and never reset here.
+    // gba_ppu.h declares these inside namespace gba, so they need the
+    // qualification here even though they have C linkage.
+    const std::uint64_t obj_trusted_total = gba::g_ws_obj_trusted_total;
+    const std::uint64_t obj_untrusted_total = gba::g_ws_obj_untrusted_total;
+    const std::uint64_t obj_culled_total = gba::g_ws_expanded_diag[2];
+    const std::uint64_t obj_trusted_delta =
+        obj_trusted_total - g_prev_obj_trusted_total;
+    const std::uint64_t obj_untrusted_delta =
+        obj_untrusted_total - g_prev_obj_untrusted_total;
+    const std::uint64_t obj_culled_delta =
+        obj_culled_total - g_prev_obj_culled_total;
+    g_prev_obj_trusted_total = obj_trusted_total;
+    g_prev_obj_untrusted_total = obj_untrusted_total;
+    g_prev_obj_culled_total = obj_culled_total;
+
+    // Per-reject-reason deltas, same shape as obj_trusted/obj_untrusted
+    // above: distinguishes an untrusted object that never had a provenance
+    // record (obj_rej_no_record) from one whose record went stale after the
+    // sprite moved (obj_rej_epoch/pending/identity/attrs/trunc), which is
+    // the question the two totals above can't answer on their own.
+    // g_ws_obj_reject_totals is defined in runner_main.cpp, not gba_ppu.*,
+    // so (unlike the gba:: symbols above) it is not namespace-qualified.
+    std::uint64_t obj_reject_delta[12];
+    for (int i = 0; i < 12; ++i) {
+        const std::uint64_t total = g_ws_obj_reject_totals[i];
+        obj_reject_delta[i] = total - g_prev_obj_reject_totals[i];
+        g_prev_obj_reject_totals[i] = total;
+    }
+
+    // Per-frame (not running-total) OBJ parked-vs-room census; see
+    // compute_obj_park_census() above.
+    const ObjParkCensus census = compute_obj_park_census();
+
+    // Per-OAM-upload source-table deltas, same shape as obj_reject_delta
+    // above: g_ws_oam_src_totals is a session-running total, this reports
+    // the per-frame delta.
+    std::uint64_t oam_src_delta[4];
+    for (int i = 0; i < 4; ++i) {
+        const std::uint64_t total = g_ws_oam_src_totals[i];
+        oam_src_delta[i] = total - g_prev_oam_src_totals[i];
+        g_prev_oam_src_totals[i] = total;
+    }
+
+    // obj_from_track delta, same shape as obj_trusted/obj_untrusted above;
+    // appended last so the existing columns keep their positions.
+    const std::uint64_t obj_from_track_total = g_ws_obj_from_track_total;
+    const std::uint64_t obj_from_track_delta =
+        obj_from_track_total - g_prev_obj_from_track_total;
+    g_prev_obj_from_track_total = obj_from_track_total;
+
+    // 420 covered the columns through obj_ok; the 5 appended attrs_moved
+    // breakdown columns add up to 5 more "%llu," fields (<=20 digits each),
+    // the 4 obj_* census columns add up to 4 more "%u," fields, the 4
+    // oam_src_* columns add up to 4 more "%llu," fields, and obj_from_track
+    // below adds one more "%llu" field, so grow the buffer with headroom
+    // rather than trim it tight.
+    char line[800];
     const int n = std::snprintf(line, sizeof(line),
-        "%llu,%u,%u,%u,%u,%u,%u,%d,%08X,%08X,%08X,%08X,%s\n",
+        "%llu,%u,%u,%u,%u,%u,%u,%d,%08X,%08X,%08X,%08X,%s,"
+        "%d,%u,%u,%u,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,"
+        "%llu,%llu,%llu,%llu,%llu,"
+        "%u,%u,%u,%u,"
+        "%llu,%llu,%llu,%llu,"
+        "%llu\n",
         static_cast<unsigned long long>(frame), bldy, win_enable,
         win0h, win0v, win1h, win1v, room.valid ? 1 : 0,
-        room.min_x, room.min_y, room.ext_x, room.ext_y, overlays.c_str());
+        room.min_x, room.min_y, room.ext_x, room.ext_y, overlays.c_str(),
+        field_sig, bg1_base, bg2_base, bg3_base,
+        static_cast<unsigned long long>(obj_untrusted_delta),
+        static_cast<unsigned long long>(obj_trusted_delta),
+        static_cast<unsigned long long>(obj_culled_delta),
+        static_cast<unsigned long long>(obj_reject_delta[0]),
+        static_cast<unsigned long long>(obj_reject_delta[1]),
+        static_cast<unsigned long long>(obj_reject_delta[2]),
+        static_cast<unsigned long long>(obj_reject_delta[3]),
+        static_cast<unsigned long long>(obj_reject_delta[4]),
+        static_cast<unsigned long long>(obj_reject_delta[5]),
+        static_cast<unsigned long long>(obj_reject_delta[6]),
+        static_cast<unsigned long long>(obj_reject_delta[7]),
+        static_cast<unsigned long long>(obj_reject_delta[8]),
+        static_cast<unsigned long long>(obj_reject_delta[9]),
+        static_cast<unsigned long long>(obj_reject_delta[10]),
+        static_cast<unsigned long long>(obj_reject_delta[11]),
+        census.live, census.in_room, census.out_room, census.no_room,
+        static_cast<unsigned long long>(oam_src_delta[0]),
+        static_cast<unsigned long long>(oam_src_delta[1]),
+        static_cast<unsigned long long>(oam_src_delta[2]),
+        static_cast<unsigned long long>(oam_src_delta[3]),
+        static_cast<unsigned long long>(obj_from_track_delta));
     if (n > 0) {
         g_signal_buf.append(line, static_cast<std::size_t>(
             n < static_cast<int>(sizeof(line)) ? n : static_cast<int>(sizeof(line)) - 1));
     }
 
     if (++g_signal_buf_rows >= kSignalFlushRows) flush_signal_log();
+}
+
+// ---- text-speed probe (GSR_TEXT_RECORD) -----------------------------------
+//
+// FACTS.md "Display signals" (2026-09-10) left one thing unmeasured: the
+// per-character delay state was found in source, but never observed running,
+// so no Message-speed option can be tied to a number and no instant-text fix
+// can be claimed. It names the join to make -- the delay state against the
+// glyph uploads -- and this is it.
+//
+// Every PC below is an entry actually observed in that session's Normal and
+// Fast windows (logs/trace_20260910_153228/014_Normal.txt, 015_Fast.txt),
+// not a guessed function start:
+//
+//   0x080168F4  text processor, 252 Normal / 190 Fast entries. Its delay
+//               check at 0x0801695E decrements a nonzero halfword and
+//               returns before processing another character.
+//   0x08016E80  entered with r2 = 0x08073808, the delay table itself, 32
+//               entries in both windows.
+//   0x08016EB0  entered with r2 = r3 = 1 under Normal and 2 under Fast --
+//               the single strongest speed signal in that capture, but the
+//               tracer keeps only the last call's arguments per window, so
+//               it is one sample each and proves nothing on its own.
+//   0x08018CAC  glyph routine, 35 Normal / 115 Fast, returning to the text
+//               processor's call site (r14 = 0x08016E4D). One entry is one
+//               letter drawn, so its frame spacing IS the text speed.
+//
+// One row per call rather than per window is the whole point: it turns those
+// single end-of-window samples into a per-letter series, timestamped by frame
+// and stamped with the current window label, so a Normal window and a Fast
+// window of the same line can be compared directly. The store ledger below
+// records the source's table index at 0x0200044C alongside the base byte at
+// 0x02000240. The latter was the old recorder's mislabeled "table_index"
+// column; retaining it makes the correction auditable in the next capture.
+//
+// Flushed every kTextFlushRows rows, unlike signals.csv: that file is flushed
+// only every 300 rows and lost its tail in session 20260910_144421 (FACTS.md),
+// which is exactly how a capture of the last few letters of a line would be
+// lost here.
+constexpr std::uint32_t kTextProcessorPc = 0x080168F4u;
+constexpr std::uint32_t kTextDelayTablePc = 0x08016E80u;
+constexpr std::uint32_t kTextDelayWaitPc = 0x08016EB0u;
+constexpr std::uint32_t kTextGlyphPc = 0x08018CACu;
+// 0x080168F4 seeds a stack-local counter at 0x08016920, may replace it at
+// 0x08016942 from a context-dependent branch, and 0x08016EB0 consumes it at
+// 0x08016F00. These are observed as writes so the effective budget is known
+// before any behavior change is considered.
+constexpr std::uint32_t kTextBudgetBasePc = 0x08016920u;
+constexpr std::uint32_t kTextBudgetOverridePc = 0x08016942u;
+constexpr std::uint32_t kTextBudgetDecrementPc = 0x08016F00u;
+constexpr std::uint32_t kMessageSpeedOptionAddress = 0x0200044Cu;
+constexpr std::uint32_t kEwramBaseAddress = 0x02000000u;
+constexpr std::uint32_t kEwramMirrorMask = 0x0003FFFFu;  // 256 KiB, matches
+                                                         // gba_memory.cpp
+constexpr std::size_t kTextFlushRows = 32;
+
+// Bytes of the text-context struct dumped beside every "proc" row.
+//
+// Measured (FACTS.md, 2026-09-10): Message speed sets how many letters the
+// processor emits per frame -- 1 on Normal, ~3 on Fast -- so the control is a
+// per-frame budget living in this struct, and source puts the delay state at
+// context+0x22. Call counts cannot show a budget's value; the struct can.
+// 64 bytes covers 0x00..0x3F, so the field is in range wherever inside the
+// struct it turns out to sit, and a Normal capture diffed against a Fast one
+// identifies it without guessing the offset up front.
+//
+// Every argument that looks like an EWRAM pointer is dumped, at every hooked
+// entry, rather than one pointer at one entry.
+//
+// Session 20260910_183742 dumped r2 at the processor entry alone; session
+// 20260910_185836 widened that to r0..r3 there. Both came back with no byte
+// constant per setting and different between settings, across 518 samples of
+// each pointer -- so the budget is not a settled field of either struct as
+// seen from THAT sample point. Source stores the delay at R6+0x22 near
+// 0x08016E5C and the check at 0x0801695E decrements it, so by the next
+// processor entry it has already been spent and reads the same under both
+// settings. Sampling at the other three hooked entries catches the struct at
+// different points in that cycle, and 0x08016E80 in particular is entered
+// with the delay table in r2 and a further EWRAM pointer in r1 that no dump
+// has covered yet.
+constexpr std::size_t kTextContextBytes = 64;
+constexpr std::uint32_t kEwramLimit = 0x02040000u;
+
+// The delay store is observed from runner_main.cpp, while this translation
+// unit owns the labeled tracer windows and their session directory. Keep the
+// store side bounded by aggregating one row per observed
+// (table-index, base-byte, delay) triple in each window.
+constexpr std::size_t kTextDelayPairLimit = 64;
+struct TextDelayPair {
+    std::uint32_t table_index = 0;
+    std::uint32_t base_byte = 0;
+    std::uint32_t delay = 0;
+    std::uint64_t stores = 0;
+    std::uint32_t first_context = 0;
+    std::uint32_t last_context = 0;
+    std::uint32_t context_changes = 0;
+};
+
+std::array<TextDelayPair, kTextDelayPairLimit> g_text_delay_pairs{};
+std::size_t g_text_delay_pair_count = 0;
+std::uint64_t g_text_delay_store_count = 0;
+std::uint64_t g_text_delay_overflow_stores = 0;
+std::uint32_t g_text_delay_window_index = 0;
+std::uint64_t g_text_delay_window_start_frame = 0;
+bool g_text_delay_window_active = false;
+bool g_text_delay_header_written = false;
+
+std::string g_text_buf;
+std::size_t g_text_buf_rows = 0;
+bool g_text_header_written = false;
+std::string g_text_budget_buf;
+std::size_t g_text_budget_buf_rows = 0;
+bool g_text_budget_header_written = false;
+
+void flush_text_log() {
+    if (g_text_buf.empty()) return;
+    ensure_session_dir();
+    const std::string path = g_session_dir + "/text_speed.csv";
+    FILE* f = std::fopen(path.c_str(), "a");
+    if (!f) {
+        note_write_failure(path);
+        g_text_buf.clear();
+        g_text_buf_rows = 0;
+        return;
+    }
+    std::fwrite(g_text_buf.data(), 1, g_text_buf.size(), f);
+    std::fclose(f);
+    g_text_buf.clear();
+    g_text_buf_rows = 0;
+}
+
+void flush_text_budget_log() {
+    if (g_text_budget_buf.empty()) return;
+    ensure_session_dir();
+    const std::string path = g_session_dir + "/text_budget.csv";
+    FILE* f = std::fopen(path.c_str(), "a");
+    if (!f) {
+        note_write_failure(path);
+        g_text_budget_buf.clear();
+        g_text_budget_buf_rows = 0;
+        return;
+    }
+    std::fwrite(g_text_budget_buf.data(), 1, g_text_budget_buf.size(), f);
+    std::fclose(f);
+    g_text_budget_buf.clear();
+    g_text_budget_buf_rows = 0;
+}
+
+void reset_text_delay_window(std::uint32_t window_index,
+                             std::uint64_t start_frame) {
+    g_text_delay_pairs = {};
+    g_text_delay_pair_count = 0;
+    g_text_delay_store_count = 0;
+    g_text_delay_overflow_stores = 0;
+    g_text_delay_window_index = window_index;
+    g_text_delay_window_start_frame = start_frame;
+    g_text_delay_window_active = true;
+}
+
+void write_text_delay_window(std::uint32_t window_index,
+                             const char* label,
+                             std::uint64_t start_frame,
+                             std::uint64_t end_frame) {
+    ensure_session_dir();
+    const std::string path = g_session_dir + "/text_delay.csv";
+    FILE* f = std::fopen(path.c_str(), "a");
+    if (!f) {
+        note_write_failure(path);
+        return;
+    }
+    if (!g_text_delay_header_written) {
+        std::fprintf(f,
+                     "window,label,start_frame,end_frame,total_stores,"
+                     "overflow_stores,table_index,base_byte,delay,"
+                     "pair_stores,context_first,context_last,context_changes\n");
+        g_text_delay_header_written = true;
+    }
+    const char* safe_label = label && label[0] ? label : "unlabeled";
+    if (g_text_delay_pair_count == 0) {
+        std::fprintf(f, "%u,%s,%llu,%llu,%llu,%llu,0,0,0,0,0,0,0\n",
+                     window_index, safe_label,
+                     static_cast<unsigned long long>(start_frame),
+                     static_cast<unsigned long long>(end_frame),
+                     static_cast<unsigned long long>(g_text_delay_store_count),
+                     static_cast<unsigned long long>(
+                         g_text_delay_overflow_stores));
+    } else {
+        for (std::size_t i = 0; i < g_text_delay_pair_count; ++i) {
+            const TextDelayPair& pair = g_text_delay_pairs[i];
+            std::fprintf(
+                f,
+                "%u,%s,%llu,%llu,%llu,%llu,%u,%u,%u,%llu,0x%08X,"
+                "0x%08X,%u\n",
+                window_index, safe_label,
+                static_cast<unsigned long long>(start_frame),
+                static_cast<unsigned long long>(end_frame),
+                static_cast<unsigned long long>(g_text_delay_store_count),
+                static_cast<unsigned long long>(g_text_delay_overflow_stores),
+                pair.table_index, pair.base_byte, pair.delay,
+                static_cast<unsigned long long>(pair.stores),
+                pair.first_context, pair.last_context,
+                pair.context_changes);
+        }
+    }
+    std::fclose(f);
+}
+
+void flush_text_delay_window_at_exit() {
+    if (!g_text_record) return;
+    flush_text_log();
+    flush_text_budget_log();
+    if (!g_text_delay_window_active) return;
+    write_text_delay_window(g_text_delay_window_index, "exit",
+                            g_text_delay_window_start_frame,
+                            runtime_current_frame());
+    g_text_delay_window_active = false;
+}
+
+// Called for every guest function entry while GSR_TEXT_RECORD is on. Four
+// compares against constants on the miss path, so a normal text-record run
+// pays a handful of instructions per entry and writes nothing.
+void log_text_event(std::uint32_t entry_pc) {
+    const char* kind = nullptr;
+    switch (entry_pc) {
+        case kTextProcessorPc: kind = "proc"; break;
+        case kTextDelayTablePc: kind = "table"; break;
+        case kTextDelayWaitPc: kind = "wait"; break;
+        case kTextGlyphPc: kind = "glyph"; break;
+        default: return;
+    }
+
+    // Unavailable before the bus exists; the setting is reported as -1 rather
+    // than 0 so "not read" can never be mistaken for a real speed value.
+    int speed = -1;
+    if (const gba::GbaBus* bus = gbarecomp::active_bus()) {
+        if (const std::uint8_t* ewram = bus->ewram_ptr()) {
+            speed = ewram[(kMessageSpeedOptionAddress - kEwramBaseAddress) &
+                          kEwramMirrorMask];
+        }
+    }
+
+    if (!g_text_header_written) {
+        g_text_buf += "frame,label,kind,speed,r0,r1,r2,r3,lr,"
+                      "ctx0,ctx1,ctx2,ctx3\n";
+        g_text_header_written = true;
+    }
+
+    std::string ctx[4];
+    {
+        if (const gba::GbaBus* bus = gbarecomp::active_bus()) {
+            if (const std::uint8_t* ewram = bus->ewram_ptr()) {
+                for (int reg = 0; reg < 4; ++reg) {
+                    const std::uint32_t p = g_cpu.R[reg];
+                    if (p < kEwramBaseAddress ||
+                        p + kTextContextBytes > kEwramLimit) {
+                        continue;
+                    }
+                    std::string& out = ctx[reg];
+                    out.reserve(kTextContextBytes * 2);
+                    const std::uint32_t off = p - kEwramBaseAddress;
+                    for (std::size_t i = 0; i < kTextContextBytes; ++i) {
+                        char hex[3];
+                        std::snprintf(hex, sizeof(hex), "%02X", ewram[off + i]);
+                        out.append(hex, 2);
+                    }
+                }
+            }
+        }
+    }
+    char line[832];
+    const int n = std::snprintf(
+        line, sizeof(line),
+        "%llu,%s,%s,%d,%08X,%08X,%08X,%08X,%08X,%s,%s,%s,%s\n",
+        static_cast<unsigned long long>(runtime_current_frame()),
+        g_window_label.c_str(), kind, speed, g_cpu.R[0], g_cpu.R[1],
+        g_cpu.R[2], g_cpu.R[3], g_cpu.R[14], ctx[0].c_str(), ctx[1].c_str(),
+        ctx[2].c_str(), ctx[3].c_str());
+    if (n > 0) {
+        g_text_buf.append(line, static_cast<std::size_t>(
+            n < static_cast<int>(sizeof(line)) ? n
+                                               : static_cast<int>(sizeof(line)) - 1));
+    }
+    if (++g_text_buf_rows >= kTextFlushRows) flush_text_log();
+}
+
+void log_text_budget_store(std::uint32_t pc, std::uint32_t address,
+                           std::uint32_t value, std::uint32_t context) {
+    const char* phase = nullptr;
+    switch (pc) {
+        case kTextBudgetBasePc: phase = "base"; break;
+        case kTextBudgetOverridePc: phase = "override"; break;
+        case kTextBudgetDecrementPc: phase = "decrement"; break;
+        default: return;
+    }
+
+    int speed = -1;
+    if (const gba::GbaBus* bus = gbarecomp::active_bus()) {
+        if (const std::uint8_t* ewram = bus->ewram_ptr()) {
+            speed = ewram[(kMessageSpeedOptionAddress -
+                           kEwramBaseAddress) & kEwramMirrorMask];
+        }
+    }
+
+    if (!g_text_budget_header_written) {
+        g_text_budget_buf +=
+            "frame,window,phase,speed,pc,stack_addr,value,context\n";
+        g_text_budget_header_written = true;
+    }
+    char line[192];
+    const int n = std::snprintf(
+        line, sizeof(line), "%llu,%u,%s,%d,0x%08X,0x%08X,%u,0x%08X\n",
+        static_cast<unsigned long long>(runtime_current_frame()),
+        g_window_index, phase, speed, pc, address, value, context);
+    if (n > 0) {
+        g_text_budget_buf.append(
+            line, static_cast<std::size_t>(
+                n < static_cast<int>(sizeof(line)) ? n
+                                                   : static_cast<int>(sizeof(line)) - 1));
+    }
+    if (++g_text_budget_buf_rows >= kTextFlushRows)
+        flush_text_budget_log();
 }
 
 // Returns true if a window was just closed (and reopened) this call --
@@ -954,9 +1552,11 @@ void draw_tracer_window() {
                g_session_seen_pcs.size(), g_all_seen_pcs.size());
     if (g_text_record) {
         ImGui::TextWrapped(
-            "Text recording: label and mark Normal/Fast settings and the "
-            "same dialogue step; windows compare calls, frame timing, and "
-            "BG0 writes in text_vram_writes.csv.");
+            "Text recording: play a menu or the same NPC line, type its label "
+            "in Label, then click Mark window. Repeat at each Message speed. "
+            "text_speed.csv has per-call rows; text_delay.csv has counted "
+            "halfword stores, and text_budget.csv records the effective "
+            "dialogue counter writes.");
     }
     // U2: stays up until the next window closes.
     if (g_has_last_close) {
@@ -1029,6 +1629,63 @@ bool tracer_wants_keyboard() { return false; }
 
 }  // namespace
 
+void text_trace_window_opened(std::uint32_t window_index,
+                              std::uint64_t start_frame) {
+    if (!g_text_record) return;
+    reset_text_delay_window(window_index, start_frame);
+}
+
+void text_trace_window_closed(std::uint32_t window_index, const char* label,
+                              std::uint64_t start_frame,
+                              std::uint64_t end_frame) {
+    if (!g_text_record) return;
+    if (!g_text_delay_window_active ||
+        g_text_delay_window_index != window_index) {
+        reset_text_delay_window(window_index, start_frame);
+    }
+    write_text_delay_window(window_index, label, start_frame, end_frame);
+    g_text_delay_window_active = false;
+}
+
+void text_trace_delay_store(std::uint32_t table_index,
+                            std::uint32_t base_byte,
+                            std::uint32_t delay,
+                            std::uint32_t context) {
+    if (!g_text_record) return;
+    if (!g_text_delay_window_active)
+        reset_text_delay_window(0, runtime_current_frame());
+
+    ++g_text_delay_store_count;
+    for (std::size_t i = 0; i < g_text_delay_pair_count; ++i) {
+        TextDelayPair& pair = g_text_delay_pairs[i];
+        if (pair.table_index != table_index ||
+            pair.base_byte != base_byte || pair.delay != delay) {
+            continue;
+        }
+        ++pair.stores;
+        if (pair.last_context != context) ++pair.context_changes;
+        pair.last_context = context;
+        return;
+    }
+    if (g_text_delay_pair_count == kTextDelayPairLimit) {
+        ++g_text_delay_overflow_stores;
+        return;
+    }
+    TextDelayPair& pair = g_text_delay_pairs[g_text_delay_pair_count++];
+    pair.table_index = table_index;
+    pair.base_byte = base_byte;
+    pair.delay = delay;
+    pair.stores = 1;
+    pair.first_context = context;
+    pair.last_context = context;
+}
+
+void text_trace_budget_store(std::uint32_t pc, std::uint32_t address,
+                             std::uint32_t value, std::uint32_t context) {
+    if (!g_text_record) return;
+    log_text_budget_store(pc, address, value, context);
+}
+
 void function_tracer_init() {
     const char* e = std::getenv("GBARECOMP_FN_TRACER");
     g_enabled = e != nullptr && e[0] != '\0' && e[0] != '0';
@@ -1036,12 +1693,24 @@ void function_tracer_init() {
     g_text_record = text != nullptr && text[0] != '\0' && text[0] != '0';
     if (!g_enabled) return;
 
+    // The tracer answers "what happened between frames"; the expanded view's
+    // battle work needed the one thing it cannot show -- what the game changes
+    // WITHIN a frame. Arm the renderer's row-state dump alongside it, bounded
+    // to a handful of Mode 1 (battle) frames, so a single traced battle also
+    // leaves logs/battle_rows.csv behind. Diagnostic only.
+    gba::g_ws_row_state_dump_mode = 1;
+    gba::g_ws_row_state_dump_frames = 16;  // full-row blocks, one per screen
+
     ensure_session_dir();
     if (g_text_record)
         gba::vram_trace::set_text_trace_directory(g_session_dir.c_str());
     load_fingerprints();
     g_window_label = "unlabeled";
     g_window_start_frame = runtime_current_frame();
+    if (g_text_record) {
+        text_trace_window_opened(g_window_index, g_window_start_frame);
+        std::atexit(&flush_text_delay_window_at_exit);
+    }
     gbarecomp::g_config_ui_extra_draw = &draw_tracer_window;
     gbarecomp::g_config_ui_extra_wants_keyboard = &tracer_wants_keyboard;
     gbarecomp::set_savestate_load_hook(&on_savestate_load);
@@ -1066,6 +1735,8 @@ void function_tracer_on_entry(std::uint32_t entry_pc) {
     slot.r14 = g_cpu.R[14];
     ++slot.count;
     ++g_window_total_calls;
+
+    if (g_text_record) log_text_event(entry_pc);
 
     static std::uint64_t s_last_seen_frame = ~std::uint64_t{0};
     const std::uint64_t frame = runtime_current_frame();

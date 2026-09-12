@@ -1,5 +1,13 @@
 # Verified facts
 
+**Captures pruned 2026-09-11.** `logs/` was cut from 4.3 GB to 1.7 GB: the
+four newest sessions of each kind were kept, plus the six battle scene
+captures the expanded-view battle work rests on (`maprec_20260904_211752`,
+`_214216`, `maprec_20260905_084802`, `_093001`, `_153555`, `_161243`). Older
+sprite and tracer sessions are gone. Findings below that name a deleted
+session still stand on the measurement recorded here; re-checking one means
+recording it again.
+
 Measured findings and their evidence. **Read this before investigating
 anything** — it exists so nobody re-derives what is already known.
 
@@ -1348,6 +1356,871 @@ them apart**, so distinguishing them needs a human label on the capture.
   `0x08018E70`, rather than another general BG0 capture. ROM SHA-1 freshly
   verified as `5c4695205413df7db52b9a184815a07783999971`.
 
+- **The automatic overclock removes every multi-frame stall at 2x,
+  2026-09-10.** First run of the controller, session `20260910_193908`,
+  `logs/headroom_20260910_193917.csv`, 4,928 frames with traces and the
+  expanded view both active. Auto raised 1x->2x at frame `440983`, dropped
+  back at `441106` (123 frames, the 120-frame step-down plus detection), and
+  raised again at `441477`, holding 2x for the remaining 991 frames. It never
+  reached 4x, and the measurement says why that is correct rather than a
+  failure: at 1x, 195 frames never reached the idle wait, in runs of up to 16
+  frames; at 2x, 56 frames did, and **every one of them is a single frame**
+  (run lengths `{1: 56}`, no run of 2 or more). 2x eliminated the multi-frame
+  stalls -- the visible stutter -- while a residual ~6% of single saturated
+  frames persists at both factors and appears to be Golden Sun's ordinary
+  VBlank-tight frame rather than a stall. The user reported the battle as
+  smoother but not full speed; the guest-side data does not explain the
+  remainder, which points at host-side cost (traces, expanded view) and not at
+  the step-up rule.
+- **The delay field is at `0x020330FE`, and the first store observer measured
+  nothing useful, 2026-09-10.** The store observer on `0x08016E5C` fired with
+  `ctx=0x020330FE`, so R6 is `0x020330DC` -- one of the pointers the context
+  dump already covered -- and the delay halfword is that pointer + `0x22`,
+  exactly as source said. Every one of the 400 logged stores came from frames
+  `934..935`, the boot intro, reading `setting=0 delay=0`: the settings byte
+  before a save is loaded. A first-N cap is spent by whatever text appears
+  first, so the observer now logs one line per distinct (setting, delay) pair
+  instead. The delay value each Message-speed option produces is still
+  unmeasured.
+- **Session `20260910_204250` enabled the delay recorder but still did not
+  distinguish a gameplay setting, 2026-09-10.** Its launcher log explicitly sets
+  `GSR_TEXT_RECORD`, and the session log has exactly one `[textdelay]` line:
+  frame `763`, `ctx=0x020330FE`, `delay=0`, `setting=0`, before the save load at
+  frame `373040`. No new post-load pair was printed, but the observer's static
+  `seen` array suppresses a pair for the entire process and is not reset by a
+  savestate load, so this cannot distinguish no post-load store from repeated
+  `(setting=0, delay=0)` stores. The linked
+  `logs/trace_20260910_204306/text_speed.csv` is active and contains `715`
+  rows (`150` glyph, `448` processor, `64` table and `53` wait rows), but it
+  cannot supply the halfword written at `0x08016E5C`. The capture therefore
+  proves the text pipeline ran and that the store executed at least once in
+  this binary, but not whether it executed after the load.
+- **That same capture does support the Normal/Fast dialogue mapping,
+  2026-09-10.** The index labels the same NPC screen as `Normal`
+  (`373177..373574`) and `fast` (`373574..373988`), and their local screenshots
+  show the same line. In the Normal window, speed byte `0x0200044C=1` produced
+  `32` glyphs at one per frame over `373340..373373`; after the byte became `2`
+  inside the fast window, the same `32`-glyph line was drawn over
+  `373847..373856` at `4,4,3,3,4,2,2,4,2,4` glyphs per frame (`3.20` average).
+  All `448` processor rows used `r0=0x020330DC` and `r2=0x02032FBC`; neither
+  dumped context showed a byte in `0x00..0x3F` that was constant within one
+  setting and different in the other, and both showed `00` at `+0x22` at the
+  processor entry. The rate mapping is therefore confirmed, while the delay
+  value written for each option remains the blocker for the planned override.
+- **The delay observer now has a bounded per-window ledger, 2026-09-10.**
+  `GSR_TEXT_RECORD` still observes the read-only halfword store at
+  `0x08016E5C`, but it now aggregates every matching store in the tracer's
+  current window and writes `text_delay.csv` beside `text_speed.csv`. Each
+  window writes a row even when its store count is zero; non-empty windows
+  report the source table-index byte at `0x0200044C`, the base byte at
+  `0x02000240`, the stored delay, pair count, and first/last context. The
+  source compiles in the normal `build/gs011_opt` object check; the linked
+  capture below used the previous column names and is interpreted accordingly.
+- **Session `20260910_213352` exercised the linked delay recorder and measured
+  the stores, but its labels crossed option changes, 2026-09-10.** The
+  launcher log sets `GSR_TEXT_RECORD`; the linked trace is
+  `logs/trace_20260910_213359`. The savestate log reports frame `373040`, and
+  `index.txt` closes the pre-load window at that frame and opens a fresh
+  post-load window, so the savestate callback and ledger reset are live. The
+  pre-load window and post-load menu/overlay windows have zero stores. Every
+  non-empty row has `overflow_stores=0`, and its `total_stores` equals the sum
+  of its pair rows. The captured file has 13 header fields and 13 fields on
+  every data row; after `overflow_stores`, the old columns are
+  `table_index,option_setting,delay,pair_stores`. The two rows for window 8
+  are two distinct pairs, not a shifted or comma-broken row:
+
+  - `Dialogue_Slow` window 6: `32` stores of `(base_byte=0,
+    source_index=0, delay=4)`.
+  - `Dialogue_Slow` window 7: `16` stores of the same triple.
+  - `Dialogue_Normal` window 8: `16` stores of `(base_byte=0,
+    source_index=0, delay=4)` and `11` of `(base_byte=0, source_index=1,
+    delay=0)`.
+  - `Dialogue_Fast` window 9: `21` stores of `(base_byte=0,
+    source_index=1, delay=0)`.
+  - The final `exit` window: `32` stores of `(base_byte=0, source_index=2,
+    delay=0)`.
+
+  The old `table_index` column was the byte at `0x02000240`, not the byte the
+  game indexes with. The generated path loads that address at `0x08016E4C`,
+  adds `0x83 << 2` (`0x20C`) at `0x08016E50..0x08016E54`, then reads the
+  source index at `0x0200044C` in `0x08016E58`. The hash-verified ROM table
+  bytes at indices `0`, `1`, and `2` are `4`, `0`, and `0`. The old ledger
+  therefore agrees with the generated table path after the column names are
+  corrected: there is no `source_index=1, delay=4` row and no `delay=11` row;
+  the apparent `11` was `pair_stores=11`. `runtime_trace_event` invokes the
+  observer before the generated `bus_write_u16`, and the generated call passes
+  the low 16 bits of R3 as the delay value. The observer's address samples are
+  diagnostics only and are not used to compute that stored value. No source,
+  table, or store contradiction remains in this capture; a later capture is
+  needed only to isolate one visible setting per window if the per-setting
+  delay-to-glyph relationship is measured.
+- **The same-line and caller comparison in session `20260910_213352` is
+  diagnostic, not a Fast capture, 2026-09-10.** The same 32-glyph character
+  sequence appears in the slow run at frames `374038..374195` and again as
+  `11` glyphs at `375783..375793` followed by `21` at `375795..375816` across
+  the Normal/Fast window boundary. The slow sequence draws one glyph every
+  roughly five guest frames; the later sequence draws about one per active
+  frame, with one double in each marked segment. The later rows all still report
+  `0x0200044C=1`; the only rows with value `2` are after the dialogue in the
+  `exit` window. Thus the window named `Dialogue_Fast` is the tail of the
+  Normal line, and this session does not measure a Fast dialogue rate.
+
+  Menu glyph calls through `0x08018CAC` return to `0x08017BE5` and occur in
+  bursts of `3`, `20`, and `16` glyphs in one active frame, with no
+  `0x080168F4` processor rows. Dialogue glyph calls return to
+  `0x08016E4D`; the corresponding processor rows enter `0x080168F4` and
+  return to `0x080168A9`. The caller split confirms that the menu's bulk draw
+  path is capable of painting many letters, but it does not identify a safe
+  dialogue override. The existing `session_20260910_180913` Fast result
+  remains the evidence for about `3.2` dialogue glyphs per frame.
+- **The menu remains a comparison path, not an override target, 2026-09-10.**
+  Existing `text_speed.csv` evidence shows menus and dialogue enter the same
+  glyph routine `0x08018CAC`, while the text processor `0x080168F4` limits
+  dialogue to about 1 or 3 letters per frame and menu windows reach 14--33
+  glyph calls in a frame. The common glyph entry therefore identifies the
+  drawing capability, but does not prove that bypassing dialogue's processor
+  is safe.
+- **The lighting layer cannot be reconstructed by the room buffer's method,
+  2026-09-10.** `src/room_buffer.cpp` builds `kLayers[3] = {3, 2, 1}` and its
+  render callback refuses anything else (`if (bg < 1 || bg > 3) return false`).
+  Two measured reasons, not an oversight: BG0's content does not come from the
+  metatile grid and atlas the buffer rebuilds from -- one grid, one atlas and
+  one writer family serve BG1-3 only (see "Towns, indoor rooms and dungeons
+  are one mechanism") -- and **BG0 does not scroll with the room**. Captured
+  field frames have BG0 at `0/0` while BG1/BG2/BG3 carry real per-frame scroll
+  (`1096/300`, `616/300`, `136/300` in the sample at session
+  `20260910_130502`). The buffer answers "which metatile belongs at this
+  screen position, given the camera", which is meaningless for a
+  screen-pinned layer. BG0 also carries dialogue and menus at the same `0/0`
+  scroll, so extending it blindly would drag text boxes into the margin -- the
+  failure the window-register fix already had to undo. Consequence: in the
+  expanded view three layers are reconstructed in the margin and the lighting
+  layer is not, which is invisible in a lit town and severe in a dark cave.
+  Closing it needs a new measurement -- what writes BG0's tiles for a room,
+  and whether that writer knows about a room at all -- not a fix to the
+  buffer. Note ROADMAP.md currently lists BG0 margin work as out of scope.
+- **Goma Cave breaks the per-layer cell-alignment rule, 2026-09-10.** Same
+  session, room-buffer self-check across rooms including `664x832` and
+  `480x1504`: BG3 `79.09%` and BG1 `82.79%` of cells matched, against
+  `98.77/98.40/99.18%` in the original 2026-09-05 check, and **BG2 had no
+  cells checked at all** -- its offset never resolved in 951 frames. Declines
+  were dominated by `bad-offset` (`79,675,738` samples) over `outside-room`
+  (`15,669,075`), `not-mode0` (`52,119,360`) and `not-field-signature`
+  (`2,998,080`), with `82,839,075` margin samples blanked. `layer_offset()`
+  refuses whenever `BGxHOFS - camera_x` or `BGxVOFS - camera_y` is not an
+  exact multiple of the 16px cell, so at least one layer in these rooms does
+  not sit at a whole number of cells from the camera. A layer scrolling at its
+  own rate rather than the camera's would produce exactly this and is the
+  first thing to test. Note this also settles an open contradiction: margin
+  samples ARE blanked when the source declines, so a declining layer shows
+  blank rather than the wrapped ring.
+- **The Message-speed store, read from the generated image, 2026-09-10.**
+  `local/gs011/main/recompiled_018.cpp` (function `0x08016DEC..0x08016E6A`)
+  carries the sequence Astra described, and resolving its literal pool against
+  the hash-verified ROM gives the exact addresses:
+  `0x08016E4C ldr r3,[pc,#0x24]` loads base `0x02000240`;
+  `0x08016E50..0x08016E54` add `0x83 << 2` (`0x20C`), making `r3` equal
+  `0x0200044C`;
+  `0x08016E56 ldr r2,[pc,#0x20]` loads `0x08073808`;
+  `0x08016E58 ldrb r3,[r3]` reads the source index from `0x0200044C`;
+  `0x08016E5A ldrb r3,[r2,+r3]` indexes the table by it;
+  `0x08016E5C strh r3,[r6,#0x22]` stores the result in the text context.
+  The table is bytes, not halfwords. The linked `20260910_213352` capture
+  sampled both the source index and the base byte, but its windows crossed
+  option changes. Its parsed delay values agree with the table entries: `4`
+  for source index `0`, and `0` for source indices `1` and `2`; the apparent
+  `11` was the pair-store count in the adjacent CSV field.
+- **Text-context offset `+0x0C` is NOT the Message-speed field, 2026-09-10.**
+  Session `20260910_191758` showed `08` under Normal and `09` under Fast at
+  `r2+0x0C` (context `0x02032FBC`), constant within each setting across 66
+  samples -- a convincing false positive. Session `20260910_185836` reads `09`
+  under BOTH settings, 289 and 229 samples. Cross-session checking is
+  mandatory here: one session cannot distinguish "tracks the setting" from
+  "happened to hold still". No byte in the first 64 bytes of any pointer
+  argument of `0x080168F4` survives that check.
+- **Per-frame CPU headroom during real play, 2026-09-10.**
+  `logs/headroom_20260910_191800.csv` via `tools/analyze_headroom.py`: 3,392
+  frames of field play and battle at 1x. 212 frames (6.25%) never reached the
+  idle wait, in 138 runs -- but 113 of those runs are a single frame and 16
+  are two; only 9 reach 3 frames or more, covering 67 of the 212 frames, and
+  the three longest are 14, 14 and 18 frames (0.23-0.30s). Gaps between
+  saturated frames: median 6 frames, upper quartile 31, with 122 of 136 gaps
+  at 60 frames or less. 61.9% of all frames sit in the 50-75%-idle band and
+  9.3% fall under 25% idle. These are the numbers the automatic overclock's
+  step-up (3 saturated frames) and step-down (120 relaxed frames) come from;
+  re-measure before changing either.
+- **Message speed is letters-per-frame, not a per-character delay,
+  2026-09-10.** Session `20260910_180913`,
+  `logs/trace_20260910_180913/text_speed.csv`. The speed byte at
+  `0x0200044C` held `2` (Fast) for frames `373476..373718` and `1` (Normal)
+  after it, so both readings come from one session, one save, and the same
+  NPC. A 32-letter line at Fast ran frames `373476..373485`: ten consecutive
+  frames drawing `6,2,3,3,4,2,2,4,2,4` letters. The same 32-letter line at
+  Normal ran frames `373718..373751`: thirty-four frames drawing exactly one
+  letter each, bar two single-frame pauses. Fast is therefore ~3.2 letters
+  per frame and Normal is exactly 1 -- the option changes how many
+  characters the processor emits per frame, and Normal is already at the
+  one-per-frame floor a frame-delay counter can reach.
+- **The letter budget is per text context, and battle text already runs at
+  8 per frame, 2026-09-10.** Session `20260910_180913` via
+  `tools/analyze_text_speed.py`. With the Message-speed byte at `1`
+  throughout, battle messages drew `8,8,8,2`, `8,8,7`, `8,8,8,4` and
+  `8,8,8,5` letters on consecutive frames (frames `440006`, `440057`,
+  `440220`, `440293`), while NPC dialogue under the same setting drew
+  exactly 1 per frame. The same setting therefore yields 1 or 8 depending on
+  which text is running, so the budget is a field of the text context rather
+  than a global speed, and a value of 8 is already reached by stock game
+  code. The text processor `0x080168F4` takes that context in r2
+  (`0x02032FBC` and `0x020348C0` in this session) and the glyph routine
+  `0x08018CAC` takes the same pointer in r0, with the character code in r1
+  and an advancing x position in r2.
+- **The glyph routine is not the bottleneck, 2026-09-10.** Same file: menu
+  and battle text through the same entry `0x08018CAC` paints `14`, `16`,
+  `18`, `20`, `27`, `28`, `29` and `33` letters within a single frame
+  (frames `373242`, `373550`, `439653`, `439777` among others). Whatever
+  limits dialogue to 1 or 3 letters per frame is a budget in the text
+  processor, not a cost in the drawing path, so instant text means raising
+  that budget rather than removing a wait.
+- **`0x0200044C` is the Message-speed setting, and Normal draws one letter
+  per frame, 2026-09-10.** Session `20260910_162349`,
+  `logs/trace_20260910_162356/text_speed.csv`, the first capture from the
+  per-call text probe (one row per glyph draw and per delay read, joined to
+  windows by `index.txt` frame ranges -- the probe's own `label` column is
+  always `unlabeled`, because this tracer names a window when it closes).
+  The byte read `1` for the whole session and flipped to `2` at frame
+  `374352`, the moment the Message-speed option was changed in the settings
+  menu: `1` = Normal, `2` = Fast. Two separate Normal dialogue windows drew
+  `35` letters across `33` frames and `32` letters across `32` frames, with
+  the gap between consecutive letter frames being 1 frame 29 times in each
+  window and 2 frames twice. Glyph routine `0x08018CAC`; the counts match
+  its sibling entry `0x08018D50` exactly, as in the earlier session.
+- **The labeled `Fast` window in session `20260910_162349` is the settings
+  menu, not fast dialogue, 2026-09-10.** The speed byte only reached `2`
+  seventeen frames before that window ended, and no conversation followed.
+  Its `115` glyph draws land on `16` frames (7.19 per frame) with gaps of
+  10, 20, 25, 54 and 266 frames -- menu text being painted in bursts, which
+  is what dialogue at Fast must NOT be assumed to look like. Session
+  `20260910_180913` above supplies the Fast dialogue rate this session
+  lacked.
+- **A per-character delay cannot be the whole instant-text story,
+  2026-09-10.** Normal already reveals a letter every frame, and the linked
+  `session_20260910_225128` Fast dialogue reaches `3.20` letters per active
+  frame with budget `10`. Driving the delay field to zero therefore cannot
+  supply the several-letters-per-frame behavior; the measured intervention
+  point is the dialogue processor's local budget.
+- **Arguments at `0x08016E80` do not vary with Message speed, 2026-09-10.**
+  Same session: `32` calls in every window, always r0=`0x20C`,
+  r2=`0x08073808` (the delay table), r3=`0x110`, under both setting values.
+  Entry `0x08016EB0` counts r2=r3 upward (1..3 in each Normal dialogue
+  window, 1..10 in the menu window) rather than holding a speed constant,
+  so the earlier one-sample reading of "1 under Normal, 2 under Fast" at
+  that entry was a coincidence of where each window happened to end. Do not
+  treat either entry as the speed control.
+- **The dialogue processor's character budget is a stack-local loop counter,
+  and the menu uses a separate bulk caller, 2026-09-10.** Hash-verified
+  source and the generated image show `0x080168F4` first stores the byte from
+  `0x0807380B + source_index` into `[sp+0x20]` at `0x08016920`, where the
+  source index is the Message-speed byte at `0x0200044C`. The three measured
+  table bytes for source indices `0`, `1`, and `2` are `1`, `1`, and `10`.
+  If the byte at `r8+0xEA5` is nonzero, the same function replaces that value
+  at `0x08016942` with `5*clamp(halfword(0x03001CD0), 0, 2)+3`; whether that
+  branch is active in dialogue is not yet measured. After each parsed glyph or
+  control token, `0x08016EB0` decrements `[sp+0x20]` at `0x08016F00` and
+  returns through `0x08016972` while the counter remains nonzero. The
+  context's `+0x1C` control/wait check and `+0x22` delay gate are earlier
+  decisions in that path, so a larger budget must not skip them. The menu
+  caller `0x08017B9A` instead advances its string until the `0xFF` sentinel,
+  calls the glyph path at `0x08018CAC` once per character, and returns there
+  at `0x08017BE5`; it does not enter `0x080168F4`. This explains the menu's
+  16--20-glyph bursts and identifies the smallest dialogue intervention point
+  as the processor's local budget, while leaving control-code handling intact.
+  The new opt-in `text_budget.csv` observer records the three stack-counter
+  stores (`base`, `override`, and `decrement`) with their window and context;
+  it changes no guest value.
+- **Session `20260910_225128` measures the budget path at both message speeds,
+  2026-09-10.** The linked files are
+  `logs/trace_20260910_225135/text_speed.csv` and
+  `logs/trace_20260910_225135/text_budget.csv`. The recorder logged `660`
+  budget stores for one stack slot (`0x03007D7C`) and one text context
+  (`0x020330DC`): `318` base stores and `342` decrements, with **zero**
+  override stores. At source byte `0x0200044C=1`, the base was `1` and the
+  same 32-glyph sequence appeared at one glyph per active frame. When the
+  byte changed to `2` at frame `374083`, the base became `10`; the same 32
+  glyphs appeared over frames `374083..374092` in counts
+  `3,5,3,3,6,2,4,2,4` (`3.20` per active frame). The marked Fast window
+  contains `15` budget seeds and `40` decrements after that change.
+  Decrements are parser-token work rather than a one-to-one glyph count:
+  those Fast rows contain `40` decrements for `32` glyphs, and the speed-1
+  portion has one processor call with a seed but no decrement (frame `373787`),
+  showing an early parser exit. The capture does not exercise the
+  context-dependent override branch, so its active behavior remains unmeasured.
+- **The Fast budget is consumed across parser work and can cross guest frames,
+  2026-09-10.** Grouping the ordered budget stores by each base seed gives 15
+  source-index-2 invocations after the Fast switch. Three cross a guest-frame
+  boundary: `374083..374084` (6 decrements), `374085..374086` (4), and
+  `374092..374093` (5). Calls `374093..374097` still seed `10` and decrement
+  once to zero with no glyph, after the visible line has finished. A seed of
+  `10` is therefore a parser-work allowance, not a ten-glyph one-frame quota;
+  increasing it may collapse ordinary text frames but consumes more guest
+  instructions and glyph writes before the scheduler yields. It cannot remove
+  explicit control/page waits, and this capture cannot measure the exact frame
+  reduction or host cost of a larger seed.
+- **The budget loop bypasses the entry wait gates, 2026-09-10.** The processor
+  entry checks context `+0x1C` at `0x08016944`/`0x08016950` and `+0x22` at
+  `0x0801695E`; the back-edge at `0x08016F06` goes straight to parser entry
+  `0x08016972`. The only counter-specific loop decision is `beq` at
+  `0x08016F04`, after the decrement at `0x08016F00`. Re-entry does repeat the
+  parser/token state checks at `0x08016972` and `0x08016D76`, but does not repeat
+  the `+0x1C`/`+0x22` entry gates. A speed-1 seed with no decrement and the
+  post-line speed-2 zero-decrement calls are the measured early-exit cases.
+- **The evidence rules out a seed-only instant-text change as the complete
+  intervention, 2026-09-10.** Writing a large value at `0x08016920` would
+  allow more parser work, but the loop can re-enter through `0x08016972` after
+  the entry-only wait gates have already been passed. An earlier reading named
+  `0x08016F04` as the intervention seam; the counter analysis below supersedes
+  that, because the branch at `0x08016F04` is reached with the counter already
+  forced to zero by another store, not by exhaustion.
+- **At Fast the budget of 10 is never spent -- the loop is stopped early by
+  three other writers of the same stack slot, 2026-09-10.** Re-analysis of
+  `logs/trace_20260910_225135/text_budget.csv`, grouping the 660 rows into the
+  318 processor invocations each `base` store opens. At source index `1`
+  (Normal) all `162` invocations seed `1` and take exactly one decrement to
+  zero: genuine exhaustion, one token per call. At source index `2` (Fast) all
+  `156` invocations seed `10` and **none** of them exhausts it. The value
+  standing immediately before the final store of zero is `10` in `146`
+  invocations and `9`, `8`, `7`, `6` or `5` in the other ten; the deepest
+  countdown in the whole capture is `10 -> 5`, and the most decrements in one
+  call is `6`. A step from `5` to `0` cannot come from `subs r0,r0,#1` at
+  `0x08016EFE`, so a different store wrote `1` first. The generated image lists
+  four writers of `[sp+0x20]` inside `0x080168F4`: the seed at `0x08016920`,
+  the override at `0x08016942`, the decrement at `0x08016F00`, and
+  `movs r0/r1,#1; str` at `0x08016A34`, `0x08016D72` and `0x08016EDC` -- three
+  forced stops the `GSR_TEXT_RECORD` probe does not observe. Raising the table
+  value or the seed therefore cannot make Fast dialogue instant: the terminator
+  is a forced stop, and the budget is not the binding constraint at Fast.
+- **The word boundary is what ends a Fast dialogue frame, and one guest byte
+  disables it, 2026-09-10.** `0x08016ECC..0x08016EDC` reads the token in r7,
+  and when `r7 == 0x20` (space) and the byte at `r8 + 0xEA5` is zero it stores
+  `1` into the counter, so the next decrement ends the call. `0x08016D64` is
+  the same shape on the same byte. Literals resolved against the hash-verified
+  ROM: `0x08016F14` and `0x08016DD4` both hold `0x00000EA5`, and the entry
+  guard at `0x0801691E..0x08016928` reads the same `r8 + 0xEA5` before the
+  override at `0x08016942`. The one byte therefore does two things at once --
+  nonzero replaces the table budget with `5*clamp(halfword(0x03001CD0), 0, 2)
+  + 3` (`3`, `8` or `13`) **and** disables both word-boundary stops. Glyph
+  codes for the same Fast line confirm the boundary directly: frames
+  `374083..374092` draw `Welco | me to | Vault, | the | town at | the |
+  heart | of | Angara.`, each call ending on the space. This also explains the
+  battle reading of `8` letters per frame under Message speed Normal: `8` is
+  `5*1+3`, the override value, so stock game code already runs dialogue text
+  with the stops off. The measured intervention point is that byte / the
+  `0x08016942` override, not the seed and not the `0x08016F04` branch. Still
+  unmeasured: what sets `r8 + 0xEA5`, whether `0x03001CD0` is stable in field
+  dialogue, and whether the `0x08016A34` stop (which fires regardless of the
+  byte) preserves page and control waits.
+- **Instant text works in play, 2026-09-11.** The launcher's "Instant text"
+  checkbox sets `GSR_INSTANT_TEXT`; the runner overrides two writes to the
+  dialogue processor's stack counter -- the seed at `0x08016920` and the
+  space stop at `0x08016EDC` -- with `255`, and only while the Message speed
+  byte at `0x0200044C` reads `2` (Fast). The line-break/box stops at
+  `0x08016A34` and `0x08016D72` and the decrement at `0x08016F00` are left
+  alone. User-confirmed working. This also required one engine change: the
+  write-override hook was gated on `runtime_get_mem_write_override_enabled()
+  > 1`, i.e. on the player-speed cheat being on, which made it unreachable
+  for any other policy. The gate is gone; the factor of 1 is the identity
+  transform and the runtime records nothing unless the callback changes the
+  value, so the speed cheat is unaffected.
+- **The expanded view falls back to the hardware's wrapped fetch, not black,
+  when the room buffer declines, 2026-09-11.** `gba_ppu.cpp` reads the
+  tilemap entry from VRAM first and only replaces it when
+  `g_ws_field_tilemap_source` answers (lines ~769 and ~1393): on a decline
+  `entry` keeps the wrapped-ring value. So a room where `layer_offset()`
+  refuses shows repeating garbage in the margin rather than blank. Observed
+  in Goma Cave (user screenshot, 2026-09-10), which is the room FACTS already
+  records as breaking the per-layer cell-alignment rule. This contradicts the
+  2026-09-10 note that "margin samples ARE blanked when the source declines";
+  that note is wrong for the render path.
+- **Goma Cave fails because BG2 sits half a cell low, 2026-09-11.** Session
+  `20260911_005648`, room-buffer self-check with the expanded view on. The room
+  rect is `0..496` by `0..464` -- both a whole number of 16px cells, so the
+  earlier guess that the room's own width was not cell-aligned is wrong (`664`
+  belonged to a different room). BG3 matched `70067/70544` cells (`99.32%`) and
+  BG1 `70410/70544` (`99.81%`), every miss on the ring edge and none in the
+  interior. BG2 refused **every one of the 298 checked frames**, always with the
+  same measured offset: `0,8` px within the 16px cell, raw `0,920`. Eight pixels
+  is exactly half a cell, which a whole-cell offset cannot express, so
+  `layer_offset()` declined all session and the margin fell back to the
+  hardware's wrapped ring -- the repeating pattern in the user's screenshot.
+  `bad-offset` was `24,740,036` of the declines against `989,280` outside-room.
+  `BG3 scroll minus camera` read `0,0` for the great majority of frames (`1,2`
+  on 36 and `1,1` on 9, mid-scroll sampling skew), so the draw path's assumption
+  that BG3's scroll register is the camera holds here.
+- **The offsets are now carried in 8px tiles, 2026-09-11.** `layer_offset()`
+  returns tile offsets and refuses only on a non-multiple of 8;
+  `entry_for_tile()` converts to the layer's own tile space before resolving the
+  grid cell and the sub-entry, so a half-cell offset takes the two tile rows of
+  a room cell from two different grid cells. The atlas record already holds four
+  8px tiles per cell, so nothing new is read. A whole-cell offset resolves to
+  exactly the tiles it did before (`(gy*2 + 2*cell_dy) % 32 == 2*((gy+cell_dy) %
+  16)`), so the rooms that already worked are arithmetically unchanged. The
+  self-check's ring position is computed per tile for the same reason.
+  **User-confirmed working in Goma Cave, 2026-09-11**: the margin shows
+  reconstructed cave instead of the wrapped ring, and the rooms that already
+  worked were unaffected.
+- **Our own position table fixes the expanded view during effects; one small
+  defect remains, 2026-09-11.** Design: positions exist only at the moment the
+  game computes them (see the disassembly entry below), so the record path's
+  answers are written into a 64-entry table of our own, keyed by proximity and
+  identity rather than by hardware slot. When the record path declines, the
+  table does NOT supply the position -- it only decides which of the two
+  readings of the ambiguous hardware byte is meant, and the surviving reading
+  (this frame's true position, wrap resolved) is returned.
+  Two mistakes made and corrected in the same session, both worth remembering:
+  (1) **returning the remembered position made moving NPCs jitter** -- a walking
+  character's stored position is a frame or two stale, so they snapped back and
+  caught up. Memory must be the tiebreaker, never the answer.
+  (2) **the table only updated on confirmation from the record path, which is
+  silent exactly when we need the table** -- so an entry stayed pinned where a
+  character entered the ambiguous stripe, and a child running circles in Vault
+  was dropped a few pixels later (user-reported, with video). A tracker that
+  does not update is only an anchor. Carrying an entry on our own evidence is
+  bounded to 300 frames so it cannot drift onto the wrong sprite.
+  A shape/size test (the OAM bits that do not change as a character animates)
+  guards against matching a shadow to an unrelated person standing where the
+  shadow's other reading lands.
+  **User-confirmed working:** characters, including moving ones, stay correct
+  through a Move cast and afterwards. **Known remaining defect -- SHADOWS
+  MISBEHAVING ON OUTER EDGES -- shelved by the user 2026-09-11:** a shadow still
+  detaches and overlaps an NPC when that NPC walks into roughly the top 5-10% of
+  the expanded view during a cast. The
+  shape/size test is evidently not enough to separate those two sprites there;
+  do not add a third guard without a fresh screenshot of the case.
+- **The sprite-to-character gap is half the sprite's own size, and positions are
+  built per draw rather than stored, 2026-09-11.** Read from the `gsret/goldensun`
+  disassembly (local clone; facts only, no source copied -- `docs/LEGAL.md`: that
+  repo has no licence, so it may be read but not copied).
+  The routine containing our two interception points `0x0800B324`/`0x0800B328` is
+  `Func_b168` at `0x0800B168` (NOT `Func_b074`, which is a separate function
+  ending at `0x0800B168`). It takes a sprite structure pointer, reads two bytes at
+  `+0x20` and `+0x21` and **halves each** -- a centre-to-corner offset derived
+  from the sprite's own size. **So the gap between a character's position and
+  their drawn coordinate is not a constant; it is half the sprite's width and
+  height.** That is why no single dominant gap ever appeared in five rounds of
+  memory searching, and why exact-value matching found nothing: the gap is 4, 8,
+  16 or 32 px depending on the sprite.
+  Its callers (many, across `rom_15000`, `rom_8a000`, `rom_9000`, `rom_a1000`,
+  `rom_c9000`) **compose a temporary block of 32-bit coordinates and pass a
+  pointer to it**, rather than handing over a pointer into a persistent
+  per-character table. One caller also adds `0x01400000` (320.0 px in 16.16) to
+  all three coordinates behind a flag bit. **This is the structural reason every
+  memory search failed: at draw time the coordinates live in a temporary, so
+  there is no stable table to find.** Stop looking for one.
+- **CORRECTED 2026-09-11: `0x02030DD0` is NOT an object position array -- it is a
+  camera mirror.** The raw-sample dump (session `20260911_172656`,
+  `src/object_buffer.cpp`) prints unprocessed values, and at frame `373900` the
+  camera reads `cam_x_raw32=0x0090ED46`, `cam_y_raw32=0x0108FB35` while entry 0
+  at `0x02030DD0` reads **the identical 32-bit values, fractional bits
+  included**, and both change together the next frame (`0x0090A6AB`). It is a
+  copy of the camera 0x20 bytes after it, not a character.
+  This invalidates the entry below, which is kept only so the mistake is not
+  repeated. What the delta search actually found was camera mirrors and
+  camera-derived values -- everything that moves in lockstep with the camera by
+  construction. That is also why no authenticated sprite was ever within 64px of
+  a "Confirmed" entry: the comparison was characters against copies of the
+  camera.
+  **Method lesson, and it cost four build-and-play rounds: print one raw value
+  before building any statistics on a hypothesis.** Three aggregate measurements
+  (exact match, delta correlation, offset histogram) all produced confident,
+  plausible-looking output on top of a premise that a single printed number
+  falsified in seconds.
+  Still true and still useful from that work: the camera at `0x02030DB0` is
+  16.16 with X at `+0x00` and Y at `+0x04` (the dump confirms it directly), and
+  the delta-search technique itself is sound -- it found exactly what it was
+  asked to find. The authenticated sprite positions the record path returns are
+  the signed decode of the raw OAM bytes, wrap resolved (dump: `raw_y=214 ->
+  screen_y=-42`, `raw_y=184 -> screen_y=-72`), which is what makes them worth
+  having.
+- **[SUPERSEDED -- see the correction directly above. Do not act on this entry.]
+  The game's object position array is at `0x02030DD0`, stride `0x30`, X and Y
+  as 16.16 fixed point at `+0x00` and `+0x04`, 2026-09-11.** Found by the delta
+  search in `src/object_probe.cpp` (session `20260911_151431`, 1,431 frames, 543
+  X-evaluated and 583 Y-evaluated frames). The search counts addresses whose
+  frame-to-frame change equals the camera's, on frames where the camera moved.
+  Hit rates, X then Y: `0x02030DD2` 100% / `0x02030DD6` 96.7%; `0x02030E02`
+  98.9% / `0x02030E06` 96.7%; `0x02030E32` 100% / `0x02030E36` 95.5%. Those are
+  three consecutive entries at a `0x30` stride, each with the high half of a
+  16.16 X at `+0x02` and of a 16.16 Y at `+0x06` -- i.e. the fields themselves
+  are at `+0x00` and `+0x04`. **The camera at `0x02030DB0` has exactly the same
+  shape and sits `0x20` before the array**, which is corroboration rather than
+  coincidence: `0x02030DB2` also read 100% and is the camera's own X.
+  Entries 0-2 track the camera near-perfectly because the party follows the
+  player exactly. Entries 5 and 6 (`0x02030EC6`, `0x02030EF6`) hit at 58% and
+  57%, which is what an independently-moving NPC looks like. **The array's
+  length and which entry maps to which sprite are NOT yet measured.**
+  Method note, worth reusing: the exact-value search failed twice (best
+  candidate 1.0%, then a flat 38-46% plateau across unrelated addresses) while
+  the delta search resolved it immediately. Matching a stored value requires
+  guessing the game's origin and encoding; matching a *change* requires
+  neither. Reach for the delta form first next time.
+- **"Which reading puts the sprite in view" cannot resolve the OAM wrap, and
+  testing the sprite's full extent makes it worse, 2026-09-11.** Tried and
+  reverted the same day. User-reported artefacts, with screenshots: an NPC
+  standing north of the camera drawn at the BOTTOM of the screen during a Move
+  cast, and shadows detached from their owners at the top edge -- in ordinary
+  standing-around play, not only during effects.
+  The flaw is structural, not arithmetic. **A character who is genuinely out of
+  sight is a legitimate answer.** When the true reading puts a sprite off
+  screen, the only reading that looks visible is the false one, so a rule of
+  the form "exactly one candidate is visible, take it" selects the false one by
+  construction. Switching from the sprite's origin to its full extent widens
+  the window in which a false reading looks plausible and produced both
+  artefacts above.
+  Reverted to the band rule: Y resolves only for raw `0..159` (native rows) and
+  `208..255` (top margin), and refuses `160..207`. The accepted cost is that a
+  character genuinely standing in the bottom stripe is not drawn there while an
+  effect is running. **Do not attempt a third local rule here.** Three have now
+  failed in the same way, and the ambiguity is real: the Y candidates are 256px
+  apart while the expanded view is 240px tall. The position has to come from
+  somewhere other than the hardware's 8-bit shorthand.
+- **The reconstruction fallback works, and the Y axis cannot be resolved by a
+  viewport test, 2026-09-11.** User-confirmed: with the fallback in place,
+  sprites stay whole in the expanded view during and after a Move cast, which
+  was the reported defect. One regression came with it, also user-confirmed
+  (session `20260911_110213`): **an NPC standing north of the camera appeared at
+  the bottom of the screen during the cast and returned to its real position
+  when the cast ended.**
+  The cause is structural, not a tuning error. The two candidate readings of an
+  OAM Y byte are 256px apart while the expanded view is 240px tall, so the
+  bottom margin and the region just above the view **alias onto the same byte**.
+  For the NPC above the view only the WRONG candidate fell inside the viewport,
+  so a both-candidates-qualify test saw nothing ambiguous. Any window-based rule
+  on this axis has the same hole; widening or narrowing the slack cannot close
+  it. This is the same exposure the sprite recorder's summary already reported
+  as "vertical-wrap exposure, OAM Y byte in 152..199".
+  Y is therefore resolved only in the bands where the byte can mean one thing:
+  `0..159` (native rows), `208..255` (top margin), and `160..207` is refused.
+  A refusal leaves the sprite in the native rectangle, i.e. the behaviour that
+  existed before the fallback. **The known cost: the fallback cannot rescue a
+  sprite genuinely in the bottom margin**, so the long-standing "objects cull
+  too early at the bottom" defect is untouched by this work and still needs the
+  game's own object list to fix properly. X is unaffected -- its candidates are
+  512px apart against a 360px view, so the viewport test is sound there.
+- **85% of the sprite table is parked dummies at one sentinel position, and
+  real sprites are nearly all covered, 2026-09-11.** Re-analysis of
+  `logs/objrec_20260911_101026/lifetime.csv` DMA rows joined to
+  `logs/trace_20260911_101026/signals.csv`. Of 22,528 published DMA slots over
+  180 field frames, **19,264 (85.5%) sit at exactly raw
+  `(attr1 & 0x1FF) = 192, (attr0 & 0xFF) = 192`** -- reconstructed `(192, -64)`,
+  above the screen. That is Golden Sun's park position, ~107 of the 128 live OAM
+  entries every frame, and it is a single sentinel rather than a spread.
+  Excluding it, real sprites are only **17-25 per frame in ordinary field play,
+  and the trusted count matches them almost exactly** (24.6 real / 23.2 trusted;
+  17.5 real / 17.5 trusted). **Normal field play is therefore already at
+  effectively full coverage.** The earlier "98.6% untrusted, the provider
+  answers for almost nothing" reading counted parked dummies as real sprites and
+  overstated the defect badly; the renderer's `obj_untrusted` column is
+  dominated by sprites that are invisible by design.
+  The defect is confined to effects. Across a Move cast real sprites rise to
+  `30-35` per frame while trusted falls to `0.7 -> 3.7 -> 0.0` and `attrs_moved`
+  runs at `26-30`. **After the cast, trusted stays at 0 with `attrs_moved` also
+  0** -- every rejection becomes `no_record` and the records do not recover
+  within the remaining ~150 frames of the capture. Commits do not meaningfully
+  resume either (`0.17-0.58` per frame).
+- **The room rectangle does NOT separate parked sprites from real ones,
+  2026-09-11.** Session `20260911_103523`
+  (`logs/trace_20260911_103529/signals.csv`, new `obj_live`/`obj_in_room`/
+  `obj_out_room`/`obj_no_room` columns). On every field frame the census reads
+  **`live=128, in_room=128, out_room=0`**. The test is close to vacuous: the
+  reconstruction places a sprite within about 256px of the camera, while the
+  measured rooms are up to `728x504`, so virtually any reconstructed position
+  falls inside the room. Proposed as a resolution-independent hiding test and
+  **ruled out by measurement before anything was built on it.** The park
+  sentinel above is the discriminator that does work.
+- **Sourcing is not the problem; during Move the commit path stops entirely,
+  2026-09-11.** Session `20260911_101026` (`logs/objrec_20260911_101026/`,
+  `logs/trace_20260911_101026/signals.csv`, 600 signal frames / 334 frames with
+  commits). When the commit path runs it works: **1,652 of 1,742 commits were
+  full precision (94.8%)**, with only 90 `source-unavailable`. The 64%
+  `source-unavailable` of session `20260911_090640` was a menu-heavy capture and
+  is not representative of field play.
+  Commits per frame track the trusted count exactly. Ordinary play runs
+  `4.6-6.3` commits per frame with `tr=17-21`; from frame `373413` commits fall
+  to **0.00** and in the same buckets `tr` collapses to `1.9` then `0.0` while
+  `attrs_moved` rises to `28-30` per frame. The commit path does not merely fail
+  during Move -- it stops being reached.
+  **It is not an unhooked routine.** Comparing writer PCs in
+  `shadow_writes.csv` between the 180 frames before the cast and the 120 during:
+  the same 26 writers appear, **no PC is unique to the Move window**, and total
+  traffic falls from `432` writes per frame to `9.7`. A second staging DMA
+  (`0x03007E58 -> 0x0300347C`, 1,824 bytes, 128 occurrences before) disappears
+  during the cast; only the 708-byte `0x08009BB8 -> 0x0300347C` DMA continues.
+  Meanwhile the OAM upload itself keeps running at the full 128 slots per frame,
+  but its records stop being published: **before, 22,528 published against 512
+  not; during, 128 published against 15,232 not** -- a near-total inversion.
+  So the game keeps putting changed sprites on screen while its staging table
+  goes unrefreshed, and where those positions come from during an effect is the
+  open question. Do not assume a missing hook; the evidence is against it.
+- **The record held during Move is always from an earlier frame, and all three
+  attributes differ, 2026-09-11.** Session `20260911_100636`
+  (`logs/trace_20260911_100642/signals.csv`, 900 frames, field play then Move).
+  Of 13,368 `attrs_moved` rejections, **`attrs_this_frame` is 0 and
+  `attrs_old_frame` is 13,368 -- every single one**. The differing-attribute
+  counts are `attr0 13,317`, `attr1 13,359`, `attr2 12,893`, i.e. essentially
+  every rejected record disagrees on all three at once, position included, not
+  just on the tile/palette an animation would change.
+  This settles the question the columns were added for: **the match rule is not
+  too strict, the record is simply out of date.** Relaxing the attribute
+  comparison would be wrong -- a record whose `attr0`/`attr1` disagree describes
+  the sprite at a different position, so accepting it would place the sprite
+  where it no longer is.
+  The working model is therefore: a slot's record is committed occasionally and
+  then persists; while the sprite is unchanged the old record still matches and
+  the sprite stays trusted; the moment it moves or animates without being
+  re-committed the record is correctly discarded, and it is not trusted again
+  until the game happens to re-commit that slot. Move invalidates a burst of
+  sprites at once, which is why trusted collapses from ~27 to under 2 per frame
+  during a cast (measured `tr=0.3` at the peak) while `no_record` stays flat at
+  98. The remaining question is upstream in the commit path: why the staging
+  writer at `0x030038f0` does not re-commit these slots. That is not yet
+  measured.
+- **Sprite positions are lost two different ways, and only one of them is
+  staleness, 2026-09-11.** Session `20260911_094758`
+  (`logs/trace_20260911_094805/signals.csv`, 2,400 frames of field play ending
+  with two casts of Move). Rejection breakdown over the session: `no_record`
+  **243,648**, `attrs_moved` **14,013**, and `epoch`, `pending`, `identity` and
+  `truncation` all **exactly 0**. 47,197 objects were accepted.
+  Per frame, steady field play is remarkably constant: **101 untrusted, 27
+  trusted, 128 enabled objects total, and `attrs_moved` exactly 0**. Standing
+  still and walking are indistinguishable, which **kills the staleness
+  hypothesis for ordinary movement** -- a record survives the sprite moving.
+  Note the renderer skips disabled objects before the tally
+  (`gba_ppu.cpp`, `!rot_scale && disable_or_double`), so all 128 are live
+  sprites; how many of the 101 are Golden Sun's parked off-screen scratch
+  sprites is NOT measured and must not be assumed to be none.
+  **Move Psynergy is the case the user actually sees.** Across the last four
+  buckets `attrs_moved` rises `0 -> 4.4 -> 16.9 -> 23.5` per frame while trusted
+  collapses `27 -> 6.5` and `no_record` stays flat at ~100. That is exactly the
+  reported symptom: sprites in the expanded view clipped while Move was cast.
+  So an effect that animates a sprite invalidates its record, and defect 2
+  ("objects and sprites are wrong during map effects") is this, not a missing
+  record. `golden_sun_obj_provenance_attrs_match` (`src/widescreen_policy.h:647`)
+  requires **exact equality on all three OAM attributes**, which includes the
+  tile number and palette that an animating sprite changes every frame.
+  Still unmeasured, and it decides the fix: whether the record in hand during
+  Move is from an earlier frame (never re-committed) or from this frame with
+  different attributes.
+- **Almost no sprite has an authenticated position, 2026-09-11.** Session
+  `20260911_090639` (`logs/trace_20260911_090640/signals.csv`, 5,100 frames;
+  `logs/objrec_20260911_090640/`). The expanded renderer placed **9,195 objects
+  trusted against 639,341 untrusted** (98.6% untrusted), and `obj_culled` read
+  **0** for the whole session. On field frames alone it is 9,195 trusted to
+  347,029 untrusted; on non-field frames not one object was trusted. This is not
+  specific to cutscenes or effects, which is what the roadmap assumed: the
+  provider answers for roughly **3 of 128 objects on an ordinary field frame**.
+  It is the single cause behind both "objects and sprites are wrong during map
+  effects" and "objects cull too early at the bottom" -- an untrusted object is
+  confined to the native 240x160 rectangle and cannot enter the margin at all,
+  and `obj_culled` being flat rules out the cull box as a contributor.
+  The funnel per field frame: ~129 OAM slots DMA'd, ~59 with a published shadow
+  record (302,592 published against 357,760 not, of 660,352 DMA events), **1-2
+  reaching the commit path** (2,674 commits over 856 frames, and only 856 of
+  5,100 frames had any commit), and **exact-placement 0 on 705 of those 856
+  frames** (955 full-precision of 2,674 commits, 35.7%). Every commit arrived
+  through one RAM-resident writer at `0x030038f0`, whose largest call site
+  reported `source-unavailable` on 1,584 of 1,996 commits. Whether the loss is
+  records that never existed or records that went stale when the sprite moved is
+  NOT yet measured -- the seven `obj_rej_*` columns added the same day exist to
+  answer exactly that, and the fix depends on the answer.
+- **A menu repoints two of the three map layers, 2026-09-11.** Same session,
+  per-frame `field_sig`/`bg*_base` columns. Field play holds BG1=7, BG2=6, BG3=5
+  and `field_sig=1`. From the first menu frame BG1 goes 7->12->31 and BG2 goes
+  6->7/31/0 while **BG3 (the ground) stays at 5**, and `field_sig` reads 0 for
+  every menu frame (2,295 of 5,100 frames overall), reverting to (7,6,5) the
+  moment the menu closes. Screen base 31 is the top of VRAM, i.e. the menu's own
+  text tilemap -- so during a menu BG1 and BG2 are **not map layers**, and
+  widening the signature to accept them would draw menu text as scenery.
+  **But this is not yet the mechanism behind the garbled margin**: the room
+  buffer's exit report for the same session reads `not-field-signature 0`, so the
+  signature gate never rejected a single sample, and a declined supply already
+  draws black rather than the wrapped ring (`gba_ppu.cpp`, `beyond_native`
+  continue). Something upstream declines first; DISPCNT is not yet logged
+  per frame, which is what would name it.
+- **The automatic overclock's flicker is not about the size of each change,
+  2026-09-11.** The controller was changed from doubling to 1/16x steps on the
+  theory that the jump was too large to hide. User-confirmed result: **heavier**
+  flickering, not lighter. `logs/headroom_20260911_005532.csv`, 2,240 frames
+  (37s) of field play on Auto: 14 factor changes over a range of `1.000x` to
+  `1.875x`, against 3 changes in 4,928 frames in the doubling capture
+  `headroom_20260910_193917.csv`. Roughly seven times the change rate, and worse
+  flicker, with each change sixteen times smaller. Two explanations survive and
+  the capture cannot separate them: every change glitches regardless of size, or
+  the intermediate speeds themselves are bad. Pinned `1x` and pinned `8x` are
+  both confirmed clean; no pinned intermediate factor has been tested, and that
+  test needs no rebuild.
+- **The flicker is gone, but the cause is not isolated, 2026-09-11.**
+  User-confirmed clean on Auto after two changes shipped in the same build, so
+  either one alone may be the fix and neither has been tested without the other:
+  (1) `runtime_set_overclock_factor_q8` no longer zeroes `g_overclock_carry` --
+  that reset discarded already-run, not-yet-charged guest cycles on every rate
+  change, which was a bounded tradeoff at 3 changes a session and a per-frame
+  master-clock discontinuity under a ramp; (2) the ramp step dropped from
+  `1/16x` to `1/256x` per frame, 32x gentler. Before changing either, note that
+  restoring the carry reset is the more likely regression: it is a real
+  discontinuity in the master clock, while the ramp rate only governs how often
+  one occurs. The measured pinned-vs-auto asymmetry that started this
+  (`1x` and `8x` clean, any switching dirty) is consistent with the carry reset
+  being the mechanism, but that was never tested in isolation.
+- **The margin took the game's menu fade on its own, 2026-09-11.** User-reported:
+  opening a menu dimmed only the expanded area while the native 240x160 stayed
+  bright. `render_scanline_wide` sets a backdrop pixel's `target1` from BLDCNT
+  bit 5 (`gba_ppu.cpp`, `top[x].layer = 5`), and Golden Sun names the backdrop
+  as a first target when a menu opens. Every native pixel has a real layer on
+  top and is not a target, so only margin pixels showing backdrop -- the ones
+  where the room had no answer -- were darkened. Fixed by exempting a margin
+  backdrop pixel from both the alpha and brightness stages; reconstructed margin
+  layers remain ordinary blend targets, so a genuine whole-screen fade still
+  fades the margin. Compiled 2026-09-11, not yet verified in play.
+- **Battle margins are outside the room buffer by design, 2026-09-11.** The
+  supply path answers only in Mode 0 field frames (`kNotMode0`), so a battle's
+  extra area is the PPU extrapolating on its own: the affine background stretches
+  sideways, and large Psynergy effects wrap. The wrap is very likely the OAM
+  9-bit X coordinate reaching a margin column on the wrong side -- the same class
+  the field path fixed by refusing wrapped OAM coordinates for margin placement
+  and trusting only an authenticated position. No provider authenticates battle
+  sprite coordinates, so that fix does not cover them. Not investigated further.
+- **The battle screen, measured for the expanded view, 2026-09-11.** From the
+  battle snapshots of `logs/maprec_20260904_211752`, `_214216`,
+  `logs/maprec_20260905_084802`, `_093001`, `_153555` and `_161243`, decoded
+  offline (`tools/decode_snap.py`); 611 battle frames carrying BG1.
+  - **The backdrop is regular layer BG1**, a 256x256 map with wrap. BG0 is the
+    UI layer (party status window, command bar), affine BG2 is the effect
+    surface. Regular layers cannot scale, so the backdrop cannot zoom on
+    hardware -- the zoom seen in play belongs to BG2 (`BG2PA` alternates 256
+    and 128, i.e. 1x and 2x) and to the sprites.
+  - **BG1's vertical scroll is 32 in every one of the 611 frames**: the
+    backdrop never pans vertically. Its horizontal scroll does vary (0..56
+    observed), so the arena pans sideways only.
+  - **`WIN0V` reads 16..136 in most battle frames and 0..136 in the rest;
+    its bottom edge is 136 in all of them.** `WIN0H` is 0..240 everywhere,
+    i.e. the battle windows are full-width horizontal bands, unlike the field's
+    HUD boxes. `WININ` enables BG0/BG1/BG2; `WINOUT` enables only BG0 (+OBJ in
+    some configurations), which is why a margin column taking WINOUT loses the
+    backdrop.
+  - **The measured scene's art spans 144 rows** (map rows 48..191 at scroll 32,
+    i.e. screen rows 16..159) and the full 256 columns. Of those, rows below
+    136 hold only the command icons: 72 opaque pixels per row, the three icon
+    sprites' tiles, everything else transparent. There is no art above or below
+    the 144 rows, so the 240-row expanded canvas cannot be filled by revealing
+    more of the backdrop -- only by zooming it.
+  - Consequence for the expanded view: sideways the backdrop can reach both
+    screen edges by its own wrap, but top and bottom can only be filled by
+    scaling. Confirmed the hard way on 2026-09-12: with nothing magnified,
+    `logs/battle_layers.csv` shows canvas rows 176..200 holding the party over
+    bare backdrop and 201..215 empty -- the strip the game's own command menu
+    covers on a GBA. There is no scenery under the party to reveal, so the
+    arena is magnified 2x, which maps the 120-row band onto the 240-row canvas
+    exactly (see `src/battle_view.h`).
+- **Nothing in a battle frame is animated per scanline, 2026-09-12.** Measured
+  over the whole traced battle of `session_20260912_103331` (1272 Mode 1
+  frames, `logs/battle_frames.csv`): `rows_vary_bg1hofs`, `rows_vary_bg2pa` and
+  `rows_vary_bg2x` are 0 in every one of them. BG2Y advancing by PD each row is
+  the hardware's own affine reference walk, not the game writing it. So the
+  2026-09-11 striping theory -- a register latched fresh per scanline -- does
+  not describe this battle, and the renderer fix built for it had nothing to
+  act on. A battle screen's registers can be read from row 0 alone.
+- **The battle arena is drawn on two different layers, 2026-09-11.** Found
+  after the first build of the zoom: the flat backdrop fix filled the command
+  screen (user screenshots 20:31:32 and 20:31:38) while the attack/message
+  screen stayed letterboxed (20:31:46).
+  - `snap_00318_periodic` (`logs/maprec_20260904_214216`) is that message
+    screen: `DISPCNT=0x1541`, i.e. **BG1 off**, affine BG2 on at `BG2PA=256`
+    (1x). So while the game is playing out a turn the arena lives on the affine
+    layer, and the flat layer is not even enabled.
+  - `BG2PA` is 256 or 128 in 451 of 473 battle frames with BG2 on, with
+    143/166/171/179/196 in the remainder: the game animates the affine layer
+    between 1x and 2x, which is the camera push-in seen in play.
+  - The affine layer cannot be extended into the margins either. Lifting its
+    vertical window clip over the expanded canvas tiles the art and exposes the
+    pattern stored below it (rendered offline from `snap_00045` at PA 128 and
+    `snap_00071` at PA 143). Its letterbox is baked into the art, not imposed
+    by a window.
+  - Both arena layers must end up at the same apparent SIZE and share the same
+    ANCHOR; their factors differ, because the game is already magnifying one of
+    them. Giving them different factors with different anchors is what left a
+    third of the screen black in play on 2026-09-11. Corrected 2026-09-12: the
+    flat layer takes the full 2x, the affine one takes 2*PA/256 (the remainder
+    of the game's own push-in), and both hang from the band's bottom edge, so
+    the parts of the arena they each carry line up whatever the camera does.
+  - **The arena is 120 of the authentic screen's 160 rows**, the other 40 being
+    the menu strips the game draws above and below it. So a zoom that fills the
+    canvas exactly is 2/1, not the 3/2 the canvas's own ratio suggests; at 3/2
+    the arena covers 180 rows and the remaining 60 belong to the menu strips,
+    which have to move out to the canvas edges for the screen to read as full.
+    That is why the battle path moves the menus rather than only zooming.
+- **The expanded view draws the authentic rows AS THE EMULATOR PRODUCES THEM,
+  2026-09-11.** `GbaPpu::render_scanline` composites each row into
+  `latched_fb_` the moment that scanline is emulated, using that row's live
+  registers; only the top and bottom margin rows are drawn later, at VBlank,
+  from the latched snapshot (`render_vertical_margin_rows`). `GbaPpu::render`,
+  which draws a whole frame at once, is NOT the path play uses -- proved by a
+  diagnostic placed in it that never fired in a traced battle
+  (session_20260911_222940 wrote `logs/battle_rule.csv` from the game side but
+  no `battle_rows.csv` from the renderer).
+  This is why two correct fixes for the battle striping changed nothing: a
+  magnified layer needs a row the emulator has not reached yet, so no amount of
+  care about which row's registers to use can help while the drawing is
+  streamed. Battle frames are now deferred to VBlank as a whole
+  (`g_ws_defer_native_rows`); field frames keep streaming, untouched.
+- **The game's own battle zoom compounds with ours, 2026-09-11.** Measured off
+  a play screenshot rather than inferred: in the command screen the arena's
+  pixels were 9 host pixels wide against the UI's 3, i.e. the arena was on
+  screen at 3x while our factor was 3/2. The game had the camera pushed in
+  (BG2PA 128 = 2x) and the two multiply. So the affine layer's factor must be
+  the REMAINDER of ours, not ours. The rest of that entry -- "once the game is
+  at or past our zoom the layer wants leaving alone entirely, since it then
+  fills the canvas by its own extrapolation" -- was measured FALSE on
+  2026-09-12: the game's zoom changes how big the scenery looks, not how many
+  canvas rows the layer covers, and leaving the layer alone left the party
+  standing in black (`logs/battle_layers.csv`, canvas rows 176..215). A layer
+  at the game's own 2x still needs our anchor, just not our factor. Run-length
+  measurement is the cheap way to read a zoom off a screenshot: uniform layers
+  print blocks of exactly the scale factor.
+- **A magnified layer needs the SOURCE row's registers, not the output row's,
+  2026-09-11.** The rule stands; its stated cause did not. It was written as
+  "Golden Sun's battle arenas animate per scanline", which the 2026-09-12
+  capture disproves (see the per-scanline entry above: nothing varies within a
+  battle frame). A remapped sample that reads row A's pixel while using row B's
+  scroll or transform is still wrong wherever a game DOES move a register
+  mid-frame, so the renderer keeps taking the source row's registers. Both halves are
+  now taken from the source row -- the latched affine reference and parameters,
+  and the regular layer's scroll registers (`gba_ppu.cpp`, `affine_line_refs`
+  and `line_io_table`). Any future per-layer remap has the same requirement.
+- **The battle's affine arena latches a fresh transform every scanline,
+  2026-09-11 -- SUPERSEDED 2026-09-12.** The title claim is wrong: the traced
+  battle of session_20260912_103331 has identical registers on all 160 rows of
+  every frame. What follows was the reasoning at the time, and the renderer
+  change it produced is still correct for any game that does move a register
+  mid-frame; it simply was not the cause of the striping. Seen in play at the
+  second build: magnifying that layer tore the top of the arena into
+  horizontally offset bands, and in the "monster appeared" screen (where the
+  flat layer is off) left the arena covering 136 of the canvas's 240 rows
+  instead of 180. The reasoning was: a magnified layer draws one output row from ANOTHER
+  source row, and the affine reference the PPU hands the renderer belongs to
+  the output row. Extrapolating it across the gap is only valid when the game
+  leaves the reference alone all frame, which Golden Sun's battle does not.
+  Fixed by passing every authentic row's latched reference into
+  `render_scanline_wide` and having a remapped affine sample take the SOURCE
+  row's own (`gba_ppu.cpp`, `affine_line_refs`). Any future per-layer remap
+  has the same requirement.
+- **Caution: the map recorder's snapshots are not always consistent with their
+  own PNG, 2026-09-11.** `snap_00124` and `snap_00431` of
+  `logs/maprec_20260905_084802` render an arena in their recorded PNG while
+  every enabled BG map in the same snapshot's VRAM is empty, and
+  `snap_00318_periodic` composites to black for the same reason. Snapshots
+  tagged `modechange` are the worst offenders. Do not conclude "layer X is
+  empty in this scene" from a single snapshot; cross-check against a `periodic`
+  one whose composite matches its PNG (`snap_00041` of
+  `logs/maprec_20260905_084802` does).
 - **BLDY (brightness) is a dead signal.** Constant at 16 for 2,614 of 2,700
   logged frames, 0 for the rest. It does not fade. 2026-09-04.
 - **Room transitions are window-register driven and animate for 17-18 frames.**

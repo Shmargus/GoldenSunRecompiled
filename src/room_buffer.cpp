@@ -37,6 +37,7 @@ constexpr std::uint32_t kAtlas = 0x02020000u;      // 8 bytes per metatile id
 
 constexpr std::size_t kGridSide = 128;
 constexpr std::size_t kCellPixels = 16;            // one grid cell is a 2x2 metatile
+constexpr std::size_t kTilePixels = 8;             // one tilemap entry
 constexpr std::size_t kRingCells = 16;             // 256px screenblock / 16px cell
 constexpr std::size_t kScreenblockBytes = 0x800;
 constexpr std::size_t kEntriesPerRow = 32;         // text screenblock is 32x32 entries
@@ -143,20 +144,29 @@ void note_rect(const Rect& r) {
 // writer-argument capture in map_recorder.cpp is what established the layout
 // and stays as evidence.
 //
-// Returns false if a register is mid-update and not a whole number of cells,
+// Measured in TILES (8px), not cells (16px). Goma Cave, session
+// 20260911_005648: the room is 496x464 -- a whole number of cells -- BG3 and
+// BG1 matched 99.32% and 99.81%, and BG2 refused every one of the 298 checked
+// frames with an offset of exactly 0,8 px. Half a cell. A whole-cell offset
+// cannot express that, so the layer declined all session and the margin fell
+// back to the hardware's wrapped ring. The atlas record already holds four 8px
+// tiles per cell, so tile granularity costs nothing and a whole-cell offset
+// still resolves to exactly the tiles it did before.
+//
+// Returns false if a register is mid-update and not a whole number of tiles,
 // rather than drawing a half-shifted row.
 bool layer_offset(const std::uint8_t* io, unsigned layer, std::int32_t cam_x,
-                  std::int32_t cam_y, std::int32_t& dx, std::int32_t& dy) {
+                  std::int32_t cam_y, std::int32_t& tdx, std::int32_t& tdy) {
     const std::int32_t hofs = static_cast<std::int32_t>(io_u16(io, 0x10u + layer * 4u));
     const std::int32_t vofs = static_cast<std::int32_t>(io_u16(io, 0x12u + layer * 4u));
     const std::int32_t rx = hofs - cam_x;
     const std::int32_t ry = vofs - cam_y;
-    if (rx % static_cast<std::int32_t>(kCellPixels) != 0 ||
-        ry % static_cast<std::int32_t>(kCellPixels) != 0) {
+    if (rx % static_cast<std::int32_t>(kTilePixels) != 0 ||
+        ry % static_cast<std::int32_t>(kTilePixels) != 0) {
         return false;
     }
-    dx = rx / static_cast<std::int32_t>(kCellPixels);
-    dy = ry / static_cast<std::int32_t>(kCellPixels);
+    tdx = rx / static_cast<std::int32_t>(kTilePixels);
+    tdy = ry / static_cast<std::int32_t>(kTilePixels);
     return true;
 }
 
@@ -168,6 +178,66 @@ bool is_field_signature(const std::uint8_t* io) {
     return ((io_u16(io, 0x0Eu) >> 8) & 0x1Fu) == 5u &&
            ((io_u16(io, 0x0Cu) >> 8) & 0x1Fu) == 6u &&
            ((io_u16(io, 0x0Au) >> 8) & 0x1Fu) == 7u;
+}
+
+// ---- why a room fails ---------------------------------------------------
+//
+// layer_offset() refuses whenever a layer does not sit a whole number of 16px
+// cells from the camera, and the refusal alone cannot say whether the layer is
+// half a cell out (fixable: the atlas record already holds four 8px tiles) or
+// scrolling at its own rate (not fixable by an offset at all). Goma Cave is
+// the measured failure (FACTS.md, 2026-09-10: BG2 never resolved in 951
+// frames), so record the remainder itself.
+//
+// Both tables are bounded, hold one row per distinct tuple, and are filled
+// once per frame per layer from the self-check -- never from the per-pixel
+// render path.
+struct OffsetRemainder {
+    unsigned layer;
+    std::int32_t rx_mod, ry_mod;
+    std::int32_t sample_rx, sample_ry;
+    std::uint64_t frames;
+};
+OffsetRemainder g_remainder[24] = {};
+std::size_t g_remainder_used = 0;
+
+void note_bad_offset(unsigned layer, std::int32_t rx, std::int32_t ry) {
+    const std::int32_t cell = static_cast<std::int32_t>(kCellPixels);
+    const std::int32_t rx_mod = ((rx % cell) + cell) % cell;
+    const std::int32_t ry_mod = ((ry % cell) + cell) % cell;
+    for (std::size_t i = 0; i < g_remainder_used; ++i) {
+        if (g_remainder[i].layer == layer && g_remainder[i].rx_mod == rx_mod &&
+            g_remainder[i].ry_mod == ry_mod) {
+            ++g_remainder[i].frames;
+            return;
+        }
+    }
+    if (g_remainder_used >= 24) return;
+    g_remainder[g_remainder_used] = {layer, rx_mod, ry_mod, rx, ry, 1};
+    ++g_remainder_used;
+}
+
+// The draw path takes BG3's scroll register AS the camera (see
+// room_buffer_supply). That is measured true in the rooms that work; if it is
+// false in Goma the room test is being applied in the wrong space, which is
+// what "outside-room" would then be counting. One row per distinct delta.
+struct CameraDelta {
+    std::int32_t dx, dy;
+    std::uint64_t frames;
+};
+CameraDelta g_camera_delta[16] = {};
+std::size_t g_camera_delta_used = 0;
+
+void note_camera_delta(std::int32_t dx, std::int32_t dy) {
+    for (std::size_t i = 0; i < g_camera_delta_used; ++i) {
+        if (g_camera_delta[i].dx == dx && g_camera_delta[i].dy == dy) {
+            ++g_camera_delta[i].frames;
+            return;
+        }
+    }
+    if (g_camera_delta_used >= 16) return;
+    g_camera_delta[g_camera_delta_used] = {dx, dy, 1};
+    ++g_camera_delta_used;
 }
 
 // ---- the buffer ---------------------------------------------------------
@@ -192,14 +262,13 @@ bool entry_for_tile(const gba::GbaBus& bus, const std::uint8_t* io,
                     unsigned layer, std::int32_t tile_x, std::int32_t tile_y,
                     std::int32_t cam_x, std::int32_t cam_y, const Rect& rect,
                     std::uint16_t& out) {
-    std::int32_t dx = 0, dy = 0;
-    if (!layer_offset(io, layer, cam_x, cam_y, dx, dy)) {
+    std::int32_t tdx = 0, tdy = 0;
+    if (!layer_offset(io, layer, cam_x, cam_y, tdx, tdy)) {
         ++g_refuse[kBadOffset];
         return false;
     }
 
-    // Two tiles per cell in each axis; the low bit selects which of the four
-    // entries in the cell's atlas record.
+    // The room test is in room space: two tiles per cell in each axis.
     const std::int32_t gx = tile_x >> 1;
     const std::int32_t gy = tile_y >> 1;
     const std::int32_t lo_gx = rect.min_x / static_cast<int>(kCellPixels);
@@ -210,9 +279,16 @@ bool entry_for_tile(const gba::GbaBus& bus, const std::uint8_t* io,
         ++g_refuse[kOutsideRoom];
         return false;
     }
-    const std::int32_t sx = gx + dx;
-    const std::int32_t sy = gy + dy;
-    if (sx < 0 || sy < 0 || sx >= static_cast<std::int32_t>(kGridSide) ||
+    // Into this layer's own space, in tiles, and only then back to a grid cell
+    // plus which of the four entries in that cell's atlas record. A whole-cell
+    // offset gives exactly the old answer; a half-cell offset takes the two
+    // tile rows of a room cell from two different grid cells, which is what
+    // Goma Cave's BG2 needs.
+    const std::int32_t lx = tile_x + tdx;
+    const std::int32_t ly = tile_y + tdy;
+    const std::int32_t sx = lx >> 1;
+    const std::int32_t sy = ly >> 1;
+    if (lx < 0 || ly < 0 || sx >= static_cast<std::int32_t>(kGridSide) ||
         sy >= static_cast<std::int32_t>(kGridSide)) {
         ++g_refuse[kOffGrid];
         return false;
@@ -221,8 +297,8 @@ bool entry_for_tile(const gba::GbaBus& bus, const std::uint8_t* io,
         read_u32(bus, kIdGrid + (static_cast<std::uint32_t>(sy) * kGridSide +
                                  static_cast<std::uint32_t>(sx)) * 4u);
     const std::uint32_t id = word & 0xFFFu;
-    const std::uint32_t sub = static_cast<std::uint32_t>((tile_y & 1) * 2 +
-                                                         (tile_x & 1));
+    const std::uint32_t sub = static_cast<std::uint32_t>((ly & 1) * 2 +
+                                                         (lx & 1));
     out = read_u16(bus, kAtlas + id * 8u + sub * 2u);
     return true;
 }
@@ -262,9 +338,15 @@ void check_layer(const gba::GbaBus& bus, const std::uint8_t* io, unsigned layer,
     // the offsets happen to equal the room's own dimensions.
     const std::int32_t cam_cx = static_cast<std::int32_t>(io_u16(io, 0x1Cu));
     const std::int32_t cam_cy = static_cast<std::int32_t>(io_u16(io, 0x1Eu));
-    std::int32_t cell_dx = 0, cell_dy = 0;
-    if (!layer_offset(io, layer, cam_cx, cam_cy, cell_dx, cell_dy)) {
+    note_camera_delta(cam_cx - static_cast<std::int32_t>(cam_x),
+                      cam_cy - static_cast<std::int32_t>(cam_y));
+    std::int32_t tile_dx = 0, tile_dy = 0;
+    if (!layer_offset(io, layer, cam_cx, cam_cy, tile_dx, tile_dy)) {
         ++g_counts[layer].skipped_frames;
+        note_bad_offset(
+            layer,
+            static_cast<std::int32_t>(io_u16(io, 0x10u + layer * 4u)) - cam_cx,
+            static_cast<std::int32_t>(io_u16(io, 0x12u + layer * 4u)) - cam_cy);
         return;
     }
 
@@ -291,15 +373,19 @@ void check_layer(const gba::GbaBus& bus, const std::uint8_t* io, unsigned layer,
             if (gx < 0 || gy < 0 || gx >= room_cells_x || gy >= room_cells_y) {
                 continue;  // outside the room: ring edge, legitimately stale
             }
-            const std::int32_t sx = gx + cell_dx;
-            const std::int32_t sy = gy + cell_dy;
-            if (sx < 0 || sy < 0 ||
-                sx >= static_cast<std::int32_t>(kGridSide) ||
-                sy >= static_cast<std::int32_t>(kGridSide)) {
+            // This layer's own top-left tile for that room cell. A whole-cell
+            // offset keeps all four tiles inside one grid cell; a half-cell
+            // offset straddles two, which is the whole reason the offset is
+            // carried in tiles.
+            const std::int32_t lx0 = gx * 2 + tile_dx;
+            const std::int32_t ly0 = gy * 2 + tile_dy;
+            if (lx0 < 0 || ly0 < 0 ||
+                lx0 + 1 >= static_cast<std::int32_t>(kGridSide) * 2 ||
+                ly0 + 1 >= static_cast<std::int32_t>(kGridSide) * 2) {
                 continue;  // this layer's region leaves the grid
             }
-            // Ring position wraps every 16 cells, and it comes from THIS
-            // layer's own grid cell, not the ground layer's. The writer places
+            // Ring position wraps every 32 tile entries per axis, and it comes
+            // from THIS layer's own tile, not the ground layer's. The writer places
             // the cell it was given at (its col mod 16, its row mod 16), so a
             // layer whose region offset is not a multiple of 16 sits at a
             // different ring position from the ground layer. Offsets of 32
@@ -308,11 +394,6 @@ void check_layer(const gba::GbaBus& bus, const std::uint8_t* io, unsigned layer,
             // where the player stood. Using the layer's own cell lifts BG2
             // from 66.9% to 93.9% and BG1 from 62.0% to 95.3% when re-run
             // offline over session_20260905_125143.
-            const std::uint32_t ring_x = static_cast<std::uint32_t>(sx) % kRingCells;
-            const std::uint32_t ring_y = static_cast<std::uint32_t>(sy) % kRingCells;
-            const std::uint32_t entry0 =
-                (ring_y * 2u * kEntriesPerRow + ring_x * 2u) * 2u;
-
             bool cell_ok = true;
             for (unsigned row = 0; row < 2u; ++row) {
                 for (unsigned col = 0; col < 2u; ++col) {
@@ -328,8 +409,14 @@ void check_layer(const gba::GbaBus& bus, const std::uint8_t* io, unsigned layer,
                         cell_ok = false;
                         break;
                     }
+                    const std::uint32_t ring_tx =
+                        static_cast<std::uint32_t>(lx0 + static_cast<int>(col)) %
+                        kEntriesPerRow;
+                    const std::uint32_t ring_ty =
+                        static_cast<std::uint32_t>(ly0 + static_cast<int>(row)) %
+                        kEntriesPerRow;
                     const std::uint32_t off =
-                        screen_base + entry0 + row * kEntriesPerRow * 2u + col * 2u;
+                        screen_base + (ring_ty * kEntriesPerRow + ring_tx) * 2u;
                     if (off + 1 >= 0x18000u) { cell_ok = false; break; }
                     const std::uint16_t actual =
                         static_cast<std::uint16_t>(vram[off] | (vram[off + 1] << 8));
@@ -427,9 +514,16 @@ void report_at_exit() {
     // black margin gets explained.
     if (!g_enabled && !g_rendering) return;
     std::fprintf(stderr,
+                 // g_ws_expanded_diag[2] counts objects with an authenticated
+                 // position that fell outside the EXPANDED bounds, which is not
+                 // the same thing as a parked sprite -- an untrusted sprite is
+                 // confined to the native rectangle inside emit_obj and never
+                 // reaches this counter. The old "skipped as parked" wording
+                 // made a reading of 0 look like the parked-sprite guard was
+                 // dead when it simply counts something else.
                  "[room-buffer] expanded view: %llu wide scanlines, %llu "
-                 "entries supplied, %llu objects skipped as parked, %llu "
-                 "margin samples blanked\n",
+                 "entries supplied, %llu placed objects culled outside the "
+                 "expanded bounds, %llu margin samples blanked\n",
                  g_ws_expanded_diag[0], g_ws_expanded_diag[1],
                  g_ws_expanded_diag[2], g_ws_expanded_diag[3]);
     std::fprintf(stderr,
@@ -442,6 +536,44 @@ void report_at_exit() {
                  static_cast<unsigned long long>(g_refuse[kBadOffset]),
                  static_cast<unsigned long long>(g_refuse[kOutsideRoom]),
                  static_cast<unsigned long long>(g_refuse[kOffGrid]));
+    // The rects are the input everything else depends on; the comment on
+    // note_rect has always claimed these were printed, and they were not.
+    for (std::size_t i = 0; i < g_seen_used; ++i) {
+        const Rect& r = g_seen[i].r;
+        std::fprintf(stderr,
+                     "[room-buffer] room rect x %u..%u (%u px, %s), "
+                     "y %u..%u (%u px, %s), %llu frames\n",
+                     r.min_x, r.max_x,
+                     static_cast<unsigned>(r.max_x - r.min_x),
+                     ((r.max_x - r.min_x) % kCellPixels) ? "NOT a whole cell"
+                                                         : "whole cells",
+                     r.min_y, r.max_y,
+                     static_cast<unsigned>(r.max_y - r.min_y),
+                     ((r.max_y - r.min_y) % kCellPixels) ? "NOT a whole cell"
+                                                         : "whole cells",
+                     static_cast<unsigned long long>(g_seen[i].frames));
+    }
+    for (std::size_t i = 0; i < g_camera_delta_used; ++i) {
+        std::fprintf(stderr,
+                     "[room-buffer] BG3 scroll minus camera: %d,%d "
+                     "(%llu frames)%s\n",
+                     g_camera_delta[i].dx, g_camera_delta[i].dy,
+                     static_cast<unsigned long long>(g_camera_delta[i].frames),
+                     (g_camera_delta[i].dx == 0 && g_camera_delta[i].dy == 0)
+                         ? "" : "  <-- BG3 is NOT the camera here");
+    }
+    for (std::size_t i = 0; i < g_remainder_used; ++i) {
+        const OffsetRemainder& o = g_remainder[i];
+        std::fprintf(stderr,
+                     "[room-buffer] BG%u refused: off by %d,%d px within the "
+                     "16px cell (raw %d,%d), %llu frames%s\n",
+                     o.layer, o.rx_mod, o.ry_mod, o.sample_rx, o.sample_ry,
+                     static_cast<unsigned long long>(o.frames),
+                     ((o.rx_mod % static_cast<std::int32_t>(kTilePixels)) == 0 &&
+                      (o.ry_mod % static_cast<std::int32_t>(kTilePixels)) == 0)
+                         ? "  <-- whole tiles; should no longer refuse"
+                         : "  <-- not a tile boundary, needs its own answer");
+    }
     for (unsigned layer : kLayers) {
         const Counters& c = g_counts[layer];
         if (c.checked == 0) {

@@ -153,7 +153,11 @@ MAKE=C:/msys64/mingw64/bin/mingw32-make.exe cmake --build build/gs011_opt --targ
 Without it the LTO link runs single-threaded and takes hours instead of
 minutes. LTO is ON by default (`GSR_ENABLE_LTO`).
 
-A full link is 15-20 minutes, so batch changes and ask before rebuilding.
+A full link is 15-20 minutes, so batch changes and ask before rebuilding. The
+compile step is already incremental; the time is the LTO link, which redoes
+whole-program optimization over the recompiled corpus however small the change,
+so there is no quick re-link to reach for.
+
 Compile-check single files while iterating:
 
 ```

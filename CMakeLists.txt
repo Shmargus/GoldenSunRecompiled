@@ -547,6 +547,8 @@ if(GSR_BUILD_LOCAL_RUNNER)
         src/map_recorder.cpp
         src/obj_recorder.cpp
         src/room_buffer.cpp
+        src/object_probe.cpp
+        src/object_buffer.cpp
         ${GSR_GENERATED_SOURCES}
         ${GSR_TRANSIENT_FUNC2D5C_SOURCES}
         ${GSR_TRANSIENT_FUNCA37C_SOURCES}

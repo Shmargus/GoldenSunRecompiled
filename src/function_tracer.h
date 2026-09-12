@@ -68,4 +68,23 @@ void function_tracer_init();
 // cached-flag branch and nothing else.
 void function_tracer_on_entry(std::uint32_t entry_pc);
 
+// Text-delay store diagnostics. The runner observes the game-owned halfword
+// store; the tracer owns the current labeled window and writes the bounded
+// per-window ledger beside text_speed.csv.
+void text_trace_window_opened(std::uint32_t window_index,
+                              std::uint64_t start_frame);
+void text_trace_window_closed(std::uint32_t window_index, const char* label,
+                              std::uint64_t start_frame,
+                              std::uint64_t end_frame);
+void text_trace_delay_store(std::uint32_t table_index,
+                            std::uint32_t base_byte,
+                            std::uint32_t delay,
+                            std::uint32_t context);
+
+// Dialogue-budget writes observed at the three generated stores that seed
+// and consume the processor's per-call stack counter. Diagnostic only; the
+// observer never changes the guest value.
+void text_trace_budget_store(std::uint32_t pc, std::uint32_t address,
+                             std::uint32_t value, std::uint32_t context);
+
 }  // namespace gsr

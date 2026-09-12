@@ -55,8 +55,11 @@ bool g_test_map_record = k_launcher_test_defaults.map_record;
 bool g_test_obj_record = k_launcher_test_defaults.obj_record;
 bool g_test_function_tracer = k_launcher_test_defaults.function_tracer;
 bool g_test_text_record = k_launcher_test_defaults.text_record;
+bool g_test_headroom_probe = k_launcher_test_defaults.headroom_probe;
 bool g_test_vram_trace = k_launcher_test_defaults.vram_map_trace;
 bool g_test_room_buffer = k_launcher_test_defaults.room_buffer;
+bool g_test_object_probe = k_launcher_test_defaults.object_probe;
+bool g_test_object_buffer = k_launcher_test_defaults.object_buffer;
 bool g_test_swi_log = k_launcher_test_defaults.swi_log;
 bool g_test_bios_pc_log = k_launcher_test_defaults.bios_pc_log;
 
@@ -65,6 +68,7 @@ struct LauncherAudioSettings {
     bool turbo_decoupled = false;
     bool copy_session_id_to_clipboard = false;
     bool enhanced_options = false;
+    bool instant_text = false;
 };
 
 // Root-launcher settings live outside config/local.json: that file contains
@@ -113,6 +117,8 @@ LauncherAudioSettings load_launcher_audio_settings(const fs::path& root) {
             settings.copy_session_id_to_clipboard = value;
         } else if (in_launcher && key == "EnhancedOptions") {
             settings.enhanced_options = value;
+        } else if (in_launcher && key == "InstantText") {
+            settings.instant_text = value;
         }
     }
     if (!settings.native_mp2k) settings.turbo_decoupled = false;
@@ -162,6 +168,9 @@ void save_launcher_audio_settings(const fs::path& root,
            << "\n"
            << "EnhancedOptions="
            << (settings.enhanced_options ? "true" : "false")
+           << "\n"
+           << "InstantText="
+           << (settings.instant_text ? "true" : "false")
            << "\n";
 }
 
@@ -865,16 +874,26 @@ int run_game(const fs::path& root, const std::wstring& rom,
         {L"GSR_MAP_RECORD", g_test_map_record},
         {L"GSR_OBJ_RECORD", g_test_obj_record},
         {L"GSR_TEXT_RECORD", g_test_text_record},
+        {L"GBARECOMP_HEADROOM_PROBE", g_test_headroom_probe},
         {L"GBARECOMP_FN_TRACER",
          g_test_function_tracer || g_test_text_record},
         {L"GBARECOMP_VRAM_MAP_TRACE", g_test_vram_trace},
         {L"GSR_ROOM_BUFFER", g_test_room_buffer},
+        {L"GSR_OBJECT_PROBE", g_test_object_probe},
+        {L"GSR_OBJECT_BUFFER", g_test_object_buffer},
     };
+    // Record what actually reached the child. Three capture sessions in a row
+    // came back missing a diagnostic with no way to tell whether the checkbox
+    // never set the variable or the game never acted on it; this line settles
+    // that from the session log alone.
+    std::string enabled_list;
     for (const TestEnvironmentVariable& variable : test_environment_variables) {
         const bool self_heal =
             std::wcscmp(variable.name, L"GBARECOMP_SELFHEAL_RAM") == 0;
         if (gsr::launcher_test_variable_enabled(g_test_variables, self_heal,
                                                 variable.enabled)) {
+            if (!enabled_list.empty()) enabled_list += ",";
+            enabled_list += wide_to_utf8(variable.name);
             child_environment.set(variable.name, L"1");
         } else if (std::wcscmp(variable.name, L"GSR_BLITTER_SHADOW") == 0) {
             // This probe falls back to the config UI's Additional debug
@@ -884,6 +903,16 @@ int run_game(const fs::path& root, const std::wstring& rom,
         } else {
             child_environment.unset(variable.name);
         }
+    }
+    if (logging) {
+        const std::string line =
+            std::string("[launcher] test_variables=") +
+            (g_test_variables ? "ON" : "OFF") + " set=" +
+            (enabled_list.empty() ? "(none)" : enabled_list) + "\n";
+        DWORD written = 0;
+        WriteFile(log_file, line.data(), static_cast<DWORD>(line.size()),
+                  &written, nullptr);
+        FlushFileBuffers(log_file);
     }
 
     // Enhanced Options combines the existing expanded-sprite/shadow safety
@@ -896,6 +925,13 @@ int run_game(const fs::path& root, const std::wstring& rom,
     child_environment.unset(L"GSR_ROOM_BUFFER_RENDER");
     if (g_audio_settings.enhanced_options)
         child_environment.set(L"GSR_ROOM_BUFFER_RENDER", L"1");
+
+    // Instant text is a normal launcher setting like Enhanced Options, not a
+    // session diagnostic: it changes how the game plays, so it persists and is
+    // not gated behind "Test variables". It acts only while the in-game
+    // Message speed is Fast, so that option still selects Slow/Normal/Instant.
+    child_environment.set(L"GSR_INSTANT_TEXT",
+                          g_audio_settings.instant_text ? L"1" : L"0");
 
     // BIOS inventory logs are session-only diagnostics. Remove inherited
     // values first, then add the launcher-owned paths only when their
@@ -1054,6 +1090,10 @@ constexpr int kSwiLogButton = 1025;
 constexpr int kBiosPcLogButton = 1026;
 constexpr int kEnhancedOptionsButton = 1027;
 constexpr int kTextRecordButton = 1028;
+constexpr int kHeadroomProbeButton = 1029;
+constexpr int kInstantTextButton = 1030;
+constexpr int kObjectProbeButton = 1031;
+constexpr int kObjectBufferButton = 1032;
 
 fs::path g_launcher_root;
 std::wstring g_launcher_bios;
@@ -1106,6 +1146,7 @@ void layout_buttons(HWND window) {
     HWND audio_help = GetDlgItem(window, kAudioHelpText);
     HWND copy_session_id = GetDlgItem(window, kCopySessionIdButton);
     HWND enhanced_options = GetDlgItem(window, kEnhancedOptionsButton);
+    HWND instant_text = GetDlgItem(window, kInstantTextButton);
     HWND test_variables = GetDlgItem(window, kTestVariablesButton);
 
     // The help text wraps to as many lines as its content needs at the
@@ -1139,6 +1180,8 @@ void layout_buttons(HWND window) {
     // Enhanced Options is a normal launcher setting, separate from the
     // session-only diagnostic controls below.
     const int enhanced_options_y = cursor;
+    cursor += kRowHeight + kRowGap;
+    const int instant_text_y = cursor;
     cursor += kRowHeight + kGroupGap;
 
     // Test variables group. The children stack below the master checkbox,
@@ -1148,11 +1191,35 @@ void layout_buttons(HWND window) {
     const int test_variables_y = cursor;
     cursor += kRowHeight;
     const int children_top = cursor + kRowGap;
-    constexpr int kChildCount = 16;
+
+    // Row order for the diagnostic sub-toggles. Several ids here are
+    // deliberately not created (see the commented-out entries in children[]
+    // under WM_CREATE), so this list is longer than the visible list -- and
+    // rows are therefore packed by how many controls EXIST, not by position
+    // in this array. Indexing by array position instead left a blank row for
+    // every uncreated id: ten checkboxes spread over seventeen row slots,
+    // which pushed the last one off the bottom of the panel and under the
+    // action buttons, where it could not be clicked at all. That is how the
+    // CPU headroom capture came back empty from three sessions in a row.
+    const int child_ids[] = {
+        kSelfHealRamButton,    kFunctionTracerButton, kTextRecordButton,
+        kHeadroomProbeButton,  kMapRecordButton,      kObjRecordButton,
+        kVramMapTraceButton,   kRoomBufferButton,     kObjectProbeButton,
+        kObjectBufferButton,   kSwiLogButton,
+        kBiosPcLogButton,      kCostProbeButton,      kPresentCadenceButton,
+        kBlitterShadowButton,  kRecursionProbeButton, kRamChurnProbeButton,
+        kOamShadowTraceButton, kObjParkCensusButton,
+    };
+    const int child_count = static_cast<int>(std::size(child_ids));
+    int visible_children = 0;
+    for (int i = 0; i < child_count; ++i) {
+        if (GetDlgItem(window, child_ids[i])) ++visible_children;
+    }
+
     const int child_width = kContentWidth - kIndent;
-    if (g_test_variables) {
-        cursor = children_top +
-                 kChildCount * kRowHeight + (kChildCount - 1) * kRowGap;
+    if (g_test_variables && visible_children > 0) {
+        cursor = children_top + visible_children * kRowHeight +
+                 (visible_children - 1) * kRowGap;
     }
     cursor += kPanelPaddingY;
 
@@ -1190,27 +1257,26 @@ void layout_buttons(HWND window) {
                    panel_top + enhanced_options_y, kContentWidth, kRowHeight,
                    TRUE);
     }
+    if (instant_text) {
+        MoveWindow(instant_text, content_x, panel_top + instant_text_y,
+                   kContentWidth, kRowHeight, TRUE);
+    }
     if (test_variables) {
         MoveWindow(test_variables, content_x, panel_top + test_variables_y,
                    kContentWidth, kRowHeight, TRUE);
     }
 
-    const int child_ids[kChildCount] = {
-        kSelfHealRamButton,    kCostProbeButton,      kPresentCadenceButton,
-        kBlitterShadowButton,  kRecursionProbeButton, kRamChurnProbeButton,
-        kOamShadowTraceButton, kObjParkCensusButton,
-        kMapRecordButton,      kFunctionTracerButton, kVramMapTraceButton,
-        kRoomBufferButton,     kObjRecordButton,
-        kSwiLogButton,         kBiosPcLogButton, kTextRecordButton,
-    };
-    for (int i = 0; i < kChildCount; ++i) {
+    int row = 0;
+    for (int i = 0; i < child_count; ++i) {
         HWND child = GetDlgItem(window, child_ids[i]);
         if (!child) continue;
         // Sub-toggles of "Test variables": indented under the master, and
         // hidden entirely while it is unchecked -- same relationship as
-        // before, just laid out without overlap.
+        // before, just laid out without overlap. `row` advances only for
+        // controls that exist, so an uncreated id leaves no gap.
         const int child_y =
-            panel_top + children_top + i * (kRowHeight + kRowGap);
+            panel_top + children_top + row * (kRowHeight + kRowGap);
+        ++row;
         MoveWindow(child, content_x + kIndent, child_y, child_width,
                    kRowHeight, TRUE);
         ShowWindow(child, g_test_variables ? SW_SHOW : SW_HIDE);
@@ -1310,10 +1376,14 @@ bool* checkbox_state_for_id(int id) {
     case kFunctionTracerButton: return &g_test_function_tracer;
     case kVramMapTraceButton: return &g_test_vram_trace;
     case kRoomBufferButton: return &g_test_room_buffer;
+    case kObjectProbeButton: return &g_test_object_probe;
+    case kObjectBufferButton: return &g_test_object_buffer;
     case kSwiLogButton: return &g_test_swi_log;
     case kBiosPcLogButton: return &g_test_bios_pc_log;
     case kTextRecordButton: return &g_test_text_record;
+    case kHeadroomProbeButton: return &g_test_headroom_probe;
     case kEnhancedOptionsButton: return &g_audio_settings.enhanced_options;
+    case kInstantTextButton: return &g_audio_settings.instant_text;
     case kNativeMp2kButton: return &g_audio_settings.native_mp2k;
     case kTurboAudioButton: return &g_audio_settings.turbo_decoupled;
     case kCopySessionIdButton:
@@ -1381,8 +1451,11 @@ LRESULT CALLBACK launcher_window_proc(HWND window, UINT message,
         g_test_map_record = k_launcher_test_defaults.map_record;
         g_test_function_tracer = k_launcher_test_defaults.function_tracer;
         g_test_text_record = k_launcher_test_defaults.text_record;
+        g_test_headroom_probe = k_launcher_test_defaults.headroom_probe;
         g_test_vram_trace = k_launcher_test_defaults.vram_map_trace;
         g_test_room_buffer = k_launcher_test_defaults.room_buffer;
+        g_test_object_probe = k_launcher_test_defaults.object_probe;
+        g_test_object_buffer = k_launcher_test_defaults.object_buffer;
         g_test_swi_log = k_launcher_test_defaults.swi_log;
         g_test_bios_pc_log = k_launcher_test_defaults.bios_pc_log;
         CreateWindowExW(0, L"BUTTON", L"Pick ROM",
@@ -1412,6 +1485,11 @@ LRESULT CALLBACK launcher_window_proc(HWND window, UINT message,
                         0, 0, 0, 0, window,
                         reinterpret_cast<HMENU>(kEnhancedOptionsButton),
                         GetModuleHandleW(nullptr), nullptr);
+        CreateWindowExW(0, L"BUTTON", L"Instant text (Message speed: Fast)",
+                        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                        0, 0, 0, 0, window,
+                        reinterpret_cast<HMENU>(kInstantTextButton),
+                        GetModuleHandleW(nullptr), nullptr);
         struct TestChildControl {
             int id;
             const wchar_t* label;
@@ -1420,10 +1498,13 @@ LRESULT CALLBACK launcher_window_proc(HWND window, UINT message,
             {kSelfHealRamButton, L"Self-heal RAM"},
             {kFunctionTracerButton, L"Function tracer"},
             {kTextRecordButton, L"Record text progression"},
+            {kHeadroomProbeButton, L"Record CPU headroom"},
             {kMapRecordButton, L"Record map + scene data"},
             {kObjRecordButton, L"Record sprite placement"},
             {kVramMapTraceButton, L"VRAM map write trace"},
             {kRoomBufferButton, L"Room buffer self-check"},
+            {kObjectProbeButton, L"Find object positions in memory"},
+            {kObjectBufferButton, L"Object buffer self-check"},
             {kSwiLogButton, L"Record BIOS SWI calls"},
             {kBiosPcLogButton, L"Record BIOS PC inventory"},
             // Hidden 2026-09-04 to keep the launcher focused on the toggles
@@ -1642,6 +1723,15 @@ int show_launcher(const fs::path& root, const std::wstring& bios) {
     // Tall enough that the panel still clears the logo even in the worst
     // case (Test variables checked, all diagnostic children shown in one
     // column).
+    //
+    // That worst case is arithmetic, not taste. From layout_buttons the panel
+    // needs
+    //   20 padding + help + 6 + 32 + 32 + 44 + 44 + 26 + 6
+    //     + (rows * 26 + (rows - 1) * 6) + 20 padding
+    // and the window needs that plus the 20px panel margin, the 48px buttons
+    // and their 28px bottom inset. At the ten rows actually created that is
+    // 640 + help, leaving room for the help text to wrap to about nine lines
+    // before anything collides. Each further visible row costs 32.
     RECT desired{0, 0, 720, 880};
     AdjustWindowRectEx(&desired, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU |
                                  WS_MINIMIZEBOX, FALSE, WS_EX_APPWINDOW);
